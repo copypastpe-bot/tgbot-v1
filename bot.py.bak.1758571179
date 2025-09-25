@@ -1,0 +1,95 @@
+import asyncio, os, re, logging
+from decimal import Decimal, ROUND_DOWN
+from datetime import date
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from dotenv import load_dotenv
+import asyncpg
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_DSN = os.getenv("DB_DSN")
+if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set")
+if not DB_DSN:    raise RuntimeError("DB_DSN is not set")
+
+# env rules
+MIN_CASH = Decimal(os.getenv("MIN_CASH", "2500"))
+BONUS_RATE = Decimal(os.getenv("BONUS_RATE_PERCENT", "5")) / Decimal(100)
+MAX_BONUS_RATE = Decimal(os.getenv("MAX_BONUS_SPEND_RATE_PERCENT", "50")) / Decimal(100)
+FUEL_PAY = Decimal(os.getenv("FUEL_PAY", "150"))
+MASTER_PER_3000 = Decimal(os.getenv("MASTER_RATE_PER_3000", "1000"))
+UPSELL_PER_3000 = Decimal(os.getenv("UPSELL_RATE_PER_3000", "500"))
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+pool: asyncpg.Pool | None = None
+
+# ===== helpers =====
+def only_digits(s: str) -> str:
+    return re.sub(r"[^0-9]", "", s or "")
+
+def normalize_phone_for_db(s: str) -> str:
+    d = only_digits(s)
+    if len(d) == 10 and d.startswith("9"):
+        return "+7" + d
+    if len(d) == 11 and d.startswith("8"):
+        return "+7" + d[1:]
+    if len(d) == 11 and d.startswith("7"):
+        return "+" + d
+    if d and not s.startswith("+"):
+        return "+" + d
+    return s
+
+def qround_ruble(x: Decimal) -> Decimal:
+    # округление вниз до рубля
+    return (x.quantize(Decimal("1."), rounding=ROUND_DOWN))
+
+async def set_commands():
+    cmds = [
+        BotCommand(command="start", description="Старт"),
+        BotCommand(command="help",  description="Справка"),
+        BotCommand(command="find",  description="Поиск клиента по телефону"),
+    ]
+    await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
+
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="🧾 Я ВЫПОЛНИЛ ЗАКАЗ")]],
+    resize_keyboard=True
+)
+
+@dp.message(CommandStart())
+async def on_start(msg: Message):
+    await msg.answer("Привет! Это внутренний бот.\nНажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или используй /find +7XXXXXXXXXX", reply_markup=main_kb)
+
+@dp.message(Command("help"))
+async def help_cmd(msg: Message):
+    await msg.answer(
+        "Доступно:\n"
+        "• /find +7XXXXXXXXXX — карточка клиента\n"
+        "• Кнопка «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» — пошаговый ввод заказа",
+        reply_markup=main_kb
+    )
+
+# ---- /find ----
+@dp.message(Command("find"))
+async def find_cmd(msg: Message):
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await msg.answer("Формат: /find +7XXXXXXXXXX или 9XXXXXXXXX")
+    phone_in = normalize_phone_for_db(parts[1])
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow(
+            "SELECT full_name, phone, bonus_balance, birthday, status "
+            "FROM clients WHERE regexp_replace(phone,[^0-9]+,,g)="
+            "regexp_replace($1,[^0-9]+,,g)",
+            phone_in
+        )
+    if not rec:
+        return await msg.answer("Не найдено.")
+    bd = rec["birthday"].isoformat() if rec["birthday"] else "—"
+    await msg.answer(
+        f"👤 {rec[full_name] or Без

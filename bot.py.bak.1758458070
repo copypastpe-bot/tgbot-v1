@@ -1,0 +1,24 @@
+import asyncio, os
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message
+from aiogram.filters import CommandStart
+from dotenv import load_dotenv
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+@dp.message(CommandStart())
+async def on_start(msg: Message):
+    await msg.answer("Привет 👋 Я живой! Напиши мне что-нибудь — я повторю.")
+
+@dp.message(F.text)
+async def echo(msg: Message):
+    await msg.answer(f"Ты сказал: {msg.text}")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())

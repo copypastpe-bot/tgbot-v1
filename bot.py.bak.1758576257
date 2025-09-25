@@ -1,0 +1,91 @@
+import os, re, asyncio, logging
+from decimal import Decimal
+import asyncpg
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, BotCommand, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# ---------- конфиг / лог ----------
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_DSN    = os.getenv("DB_DSN")
+if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set")
+if not DB_DSN:    raise RuntimeError("DB_DSN is not set")
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("rcbot")
+
+bot = Bot(BOT_TOKEN)
+dp  = Dispatcher(storage=MemoryStorage())
+pool: asyncpg.Pool | None = None
+
+# ---------- утилиты ----------
+def norm_phone(s: str | None) -> str | None:
+    if not s: return None
+    s = re.sub(r"[^0-9+]", "", s)
+    if s.startswith("8") and len(s)==11: s = "+7"+s[1:]
+    elif s.startswith("7") and len(s)==11: s = "+"+s
+    elif not s.startswith("+"): s = "+7"+s  # если прислали 9XXXXXXXXX
+    return s if re.fullmatch(r"\+\d{7,15}", s) else None
+
+def digits(s: str) -> str:
+    return re.sub(r"[^0-9]", "", s or "")
+
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="🧾 Я ВЫПОЛНИЛ ЗАКАЗ")]],
+    resize_keyboard=True
+)
+
+# ---------- FSM ----------
+class OrderFSM(StatesGroup):
+    phone = State()
+    name  = State()
+    amount = State()
+    upsell = State()
+    bonus_spend = State()
+    payment = State()
+    confirm = State()
+
+# ---------- команды ----------
+@dp.message(CommandStart())
+async def on_start(msg: Message):
+    await msg.answer("Привет! Я тут. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /order", reply_markup=MAIN_KB)
+
+@dp.message(Command("help"))
+async def help_cmd(msg: Message):
+    await msg.answer("Команды:\n/start — старт\n/help — помощь\n/find <телефон> — найти клиента\n/order — оформить заказ")
+
+# быстрый поиск
+@dp.message(Command("find"))
+async def find_cmd(msg: Message):
+    global pool
+    if pool is None:
+        await msg.answer("БД ещё не готова")
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts)<2:
+        await msg.answer("Формат: /find +79XXXXXXXXX (или 9XXXXXXXXX)")
+        return
+    phone_in = norm_phone(parts[1])
+    if not phone_in:
+        await msg.answer("Не понял телефон. Пример: +79061234567 или 9061234567")
+        return
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow(
+            "SELECT id, full_name, phone, bonus_balance, birthday, status "
+            "FROM clients "
+            "WHERE regexp_replace(phone,[^0-9]+,,g) = regexp_replace($1,[^0-9]+,,g) "
+            "LIMIT 1",
+            phone_in
+        )
+    if not rec:
+        await msg.answer("Не найдено.")
+        return
+    await msg.answer(
+        "Клиент:\n"
+        f"👤 {rec[full_name] or Без
