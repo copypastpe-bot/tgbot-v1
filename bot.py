@@ -33,6 +33,37 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 pool: asyncpg.Pool | None = None
 
+# ===== RBAC helpers (DB-driven) =====
+async def get_user_role(conn: asyncpg.Connection, user_id: int) -> str | None:
+    rec = await conn.fetchrow(
+        "SELECT role FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
+        user_id,
+    )
+    return rec["role"] if rec else None
+
+async def has_permission(user_id: int, permission_name: str) -> bool:
+    """Check permission by role via DB tables: permissions, role_permissions.
+    Superadmin implicitly has all permissions.
+    """
+    global pool
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, user_id)
+        if role is None:
+            return False
+        if role == "superadmin":
+            return True
+        rec = await conn.fetchrow(
+            """
+            SELECT 1
+            FROM role_permissions rp
+            JOIN permissions p ON p.id = rp.permission_id
+            WHERE rp.role = $1 AND p.name = $2
+            LIMIT 1
+            """,
+            role, permission_name,
+        )
+        return rec is not None
+
 # ===== helpers =====
 def only_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
@@ -68,8 +99,8 @@ async def set_commands():
 # ===== Admin commands (must be defined after dp is created) =====
 @dp.message(Command("list_masters"))
 async def list_masters(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return await msg.answer("Только для администраторов.")
+    if not await has_permission(msg.from_user.id, "add_master"):
+    return await msg.answer("Только для администраторов.")
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT s.id, s.tg_user_id, s.role, s.is_active FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id")
     if not rows:
@@ -79,8 +110,8 @@ async def list_masters(msg: Message):
 
 @dp.message(Command("add_master"))
 async def add_master(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return await msg.answer("Только для администраторов.")
+    if not await has_permission(msg.from_user.id, "add_master"):
+    return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.answer("Формат: /add_master <tg_user_id>")
@@ -99,8 +130,8 @@ async def add_master(msg: Message):
 
 @dp.message(Command("remove_master"))
 async def remove_master(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return await msg.answer("Только для администраторов.")
+    if not await has_permission(msg.from_user.id, "add_master"):
+    return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.answer("Формат: /remove_master <tg_user_id>")
@@ -115,18 +146,38 @@ async def remove_master(msg: Message):
 
 @dp.message(Command("whoami"))
 async def whoami(msg: Message):
+    global pool
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow("SELECT role, is_active FROM staff WHERE tg_user_id=$1 LIMIT 1", msg.from_user.id)
+        role = rec["role"] if rec else None
+        is_active = bool(rec["is_active"]) if rec else False
+        perms = []
+        if role:
+            rows = await conn.fetch(
+                """
+                SELECT p.name
+                FROM role_permissions rp
+                JOIN permissions p ON p.id = rp.permission_id
+                WHERE rp.role = $1
+                ORDER BY p.name
+                """,
+                role,
+            )
+            perms = [r["name"] for r in rows]
     await msg.answer(
-        f"Ваш id: {msg.from_user.id}\n"
-        f"Админ: {is_admin(msg.from_user.id)}\n"
-        f"ADMIN_TG_IDS={sorted(ADMIN_TG_IDS)}"
+        "\n".join([
+            f"Ваш id: {msg.from_user.id}",
+            f"Роль: {role or '—'}",
+            f"Активен: {'✅' if is_active else '⛔️'}",
+            f"ADMIN_TG_IDS={sorted(ADMIN_TG_IDS)}",
+            ("Права: " + (", ".join(perms) if perms else "—"))
+        ])
     )
-
-
 
 @dp.message(Command("payroll"))
 async def payroll_report(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return await msg.answer("Только для администраторов.")
+    if not await has_permission(msg.from_user.id, "view_salary_reports"):
+    return await msg.answer("Только для администраторов.")
     # формат: /payroll 2025-09
     parts = msg.text.split(maxsplit=1)
     period = (parts[1] if len(parts) > 1 else "").strip()
@@ -161,8 +212,8 @@ async def payroll_report(msg: Message):
 # ===== /expense admin command =====
 @dp.message(Command("expense"))
 async def add_expense(msg: Message, command: CommandObject):
-    if not is_admin(msg.from_user.id):
-        return await msg.answer("Только для администраторов.")
+    if not await has_permission(msg.from_user.id, "record_cashflows"):
+    return await msg.answer("Только для администраторов.")
 
     # command.args — всё после /expense, например: "123 Тест расхода"
     if not command.args:
@@ -195,17 +246,13 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Legacy env-based admin check kept for backward compatibility
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_TG_IDS
 
 async def ensure_master(user_id: int) -> bool:
-    global pool
-    async with pool.acquire() as conn:
-        rec = await conn.fetchrow(
-            "SELECT id FROM staff WHERE tg_user_id=$1 AND role IN ('master','admin') AND is_active",
-            user_id
-        )
-        return rec is not None
+    # Master access is defined by permission to create orders/clients
+    return await has_permission(user_id, "create_orders_clients")
 
 @dp.message(CommandStart())
 async def on_start(msg: Message):
