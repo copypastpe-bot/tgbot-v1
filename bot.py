@@ -100,7 +100,7 @@ async def set_commands():
 @dp.message(Command("list_masters"))
 async def list_masters(msg: Message):
     if not await has_permission(msg.from_user.id, "add_master"):
-    return await msg.answer("Только для администраторов.")
+        return await msg.answer("Только для администраторов.")
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT s.id, s.tg_user_id, s.role, s.is_active FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id")
     if not rows:
@@ -111,7 +111,7 @@ async def list_masters(msg: Message):
 @dp.message(Command("add_master"))
 async def add_master(msg: Message):
     if not await has_permission(msg.from_user.id, "add_master"):
-    return await msg.answer("Только для администраторов.")
+        return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.answer("Формат: /add_master <tg_user_id>")
@@ -131,7 +131,7 @@ async def add_master(msg: Message):
 @dp.message(Command("remove_master"))
 async def remove_master(msg: Message):
     if not await has_permission(msg.from_user.id, "add_master"):
-    return await msg.answer("Только для администраторов.")
+        return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         return await msg.answer("Формат: /remove_master <tg_user_id>")
@@ -177,7 +177,7 @@ async def whoami(msg: Message):
 @dp.message(Command("payroll"))
 async def payroll_report(msg: Message):
     if not await has_permission(msg.from_user.id, "view_salary_reports"):
-    return await msg.answer("Только для администраторов.")
+        return await msg.answer("Только для администраторов.")
     # формат: /payroll 2025-09
     parts = msg.text.split(maxsplit=1)
     period = (parts[1] if len(parts) > 1 else "").strip()
@@ -213,7 +213,7 @@ async def payroll_report(msg: Message):
 @dp.message(Command("expense"))
 async def add_expense(msg: Message, command: CommandObject):
     if not await has_permission(msg.from_user.id, "record_cashflows"):
-    return await msg.answer("Только для администраторов.")
+        return await msg.answer("Только для администраторов.")
 
     # command.args — всё после /expense, например: "123 Тест расхода"
     if not command.args:
