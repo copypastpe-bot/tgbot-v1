@@ -3,17 +3,7 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import date
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.filters import CommandStart, Command
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from dotenv import load_dotenv
-import asyncpg
-import asyncio, os, re, logging
-from decimal import Decimal, ROUND_DOWN
-from datetime import date
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from dotenv import load_dotenv
@@ -24,10 +14,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_DSN = os.getenv("DB_DSN")
 if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set")
 if not DB_DSN:    raise RuntimeError("DB_DSN is not set")
-ADMIN_IDS_ENV = os.getenv("ADMIN_TG_IDS", "")
 ADMIN_TG_IDS: set[int] = set()
-for part in re.split(r"[ ,;]+", ADMIN_IDS_ENV.strip()):
-    if part and part.isdigit():
+_admin_ids_env = os.getenv("ADMIN_TG_IDS", "") or os.getenv("ADMIN_IDS", "")
+for part in re.split(r"[ ,;]+", _admin_ids_env.strip()):
+    if part.isdigit():
         ADMIN_TG_IDS.add(int(part))
 
 # env rules
@@ -106,6 +96,7 @@ async def add_master(msg: Message):
         )
     await msg.answer(f"Пользователь {target_id} назначен мастером и активирован.")
 
+
 @dp.message(Command("remove_master"))
 async def remove_master(msg: Message):
     if not is_admin(msg.from_user.id):
@@ -120,6 +111,17 @@ async def remove_master(msg: Message):
     async with pool.acquire() as conn:
         await conn.execute("UPDATE staff SET is_active=false WHERE tg_user_id=$1 AND role='master'", target_id)
     await msg.answer(f"Пользователь {target_id} деактивирован как мастер.")
+
+
+@dp.message(Command("whoami"))
+async def whoami(msg: Message):
+    await msg.answer(
+        f"Ваш id: {msg.from_user.id}\n"
+        f"Админ: {is_admin(msg.from_user.id)}\n"
+        f"ADMIN_TG_IDS={sorted(ADMIN_TG_IDS)}"
+    )
+
+
 
 @dp.message(Command("payroll"))
 async def payroll_report(msg: Message):
@@ -155,6 +157,38 @@ async def payroll_report(msg: Message):
         for r in rows
     ]
     await msg.answer(f"ЗП за {period}:\n" + "\n".join(lines))
+
+# ===== /expense admin command =====
+@dp.message(Command("expense"))
+async def add_expense(msg: Message, command: CommandObject):
+    if not is_admin(msg.from_user.id):
+        return await msg.answer("Только для администраторов.")
+
+    # command.args — всё после /expense, например: "123 Тест расхода"
+    if not command.args:
+        return await msg.answer("Формат: /expense <сумма> <комментарий>")
+
+    parts = command.args.split(maxsplit=1)
+    if len(parts) < 2:
+        return await msg.answer("Не указан комментарий. Формат: /expense <сумма> <комментарий>")
+
+    amount_str, comment = parts
+
+    try:
+        amount = Decimal(amount_str)
+        if amount <= 0:
+            return await msg.answer("Сумма должна быть положительным числом.")
+    except Exception:
+        return await msg.answer(f"Ошибка: '{amount_str}' не является корректной суммой.")
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO cashbook_entries (kind, method, amount, comment) "
+            "VALUES ('expense', 'прочее', $1, $2)",
+            amount, comment
+        )
+
+    await msg.answer(f"✅ Расход {amount}₽ добавлен: {comment}")
 
 main_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🧾 Я ВЫПОЛНИЛ ЗАКАЗ")]],
@@ -485,9 +519,21 @@ async def commit_order(msg: Message, state: FSMContext):
                     client_id, bonus_earned, order_id
                 )
 
+            # стало: пересчитываем по сумме всех транзакций клиента
             await conn.execute(
-                "UPDATE clients SET bonus_balance = GREATEST(0, bonus_balance - $1 + $2) WHERE id=$3",
-                bonus_spent, bonus_earned, client_id
+                """
+                UPDATE clients c
+                SET bonus_balance = GREATEST(
+                    0,
+                    COALESCE((
+                        SELECT SUM(bt.delta)::integer
+                        FROM bonus_transactions bt
+                        WHERE bt.client_id = c.id
+                    ), 0)
+                )
+                WHERE c.id = $1
+                """,
+                client_id
             )
 
             await conn.execute(
@@ -509,6 +555,9 @@ async def commit_order(msg: Message, state: FSMContext):
 # fallback
 @dp.message(F.text)
 async def unknown(msg: Message):
+    # Не перехватываем команды вида /something
+    if msg.text and msg.text.startswith("/"):
+        return
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=main_kb)
 
 async def main():
