@@ -415,8 +415,6 @@ async def find_cmd(msg: Message):
 
 # ===== FSM: Я ВЫПОЛНИЛ ЗАКАЗ =====
 class OrderFSM(StatesGroup):
-    waiting_phone = State()
-    waiting_salary_period = State()
     phone = State()
     name = State()
     amount = State()
@@ -426,6 +424,11 @@ class OrderFSM(StatesGroup):
     payment_method = State()
     maybe_bday = State()
     confirm = State()
+
+# ---- Master menu states ----
+class MasterFSM(StatesGroup):
+    waiting_phone = State()
+    waiting_salary_period = State()
 
 @dp.message(F.text.in_(["🧾 Я ВЫПОЛНИЛ ЗАКАЗ", "🧾 Заказ"]))
 async def start_order(msg: Message, state: FSMContext):
@@ -710,7 +713,9 @@ async def commit_order(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("Готово ✅ Заказ сохранён.\nСпасибо!", reply_markup=main_kb)
 
-# fallback
+# ---- Master menu handlers ----
+
+# 🔍 Клиент — поиск клиента по номеру
 @dp.message(F.text == "🔍 Клиент")
 async def master_find_start(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_own_salary"):
@@ -729,7 +734,7 @@ async def master_find_phone(msg: Message, state: FSMContext):
         )
     await state.clear()
     if not rec:
-        return await msg.answer("Не найдено.")
+        return await msg.answer("Не найдено.", reply_markup=master_kb)
     bd = rec["birthday"].isoformat() if rec["birthday"] else "—"
     await msg.answer(
         f"👤 {rec['full_name'] or 'Без имени'}\n"
@@ -740,6 +745,7 @@ async def master_find_phone(msg: Message, state: FSMContext):
         reply_markup=master_kb
     )
 
+# 💼 Зарплата — запрос периода
 @dp.message(F.text == "💼 Зарплата")
 async def master_salary_prompt(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_own_salary"):
@@ -752,7 +758,6 @@ async def master_salary_calc(msg: Message, state: FSMContext):
     period = msg.text.strip().lower()
     if period not in ["day", "week", "month", "year"]:
         return await msg.answer("Период должен быть day, week, month или year.")
-    # повторяем логику функции /mysalary:
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
             f"""
@@ -783,6 +788,7 @@ async def master_salary_calc(msg: Message, state: FSMContext):
         reply_markup=master_kb
     )
 
+# 💰 Приход — выручка за сегодня
 @dp.message(F.text == "💰 Приход")
 async def master_income(msg: Message):
     if not await has_permission(msg.from_user.id, "view_own_income"):
@@ -805,6 +811,8 @@ async def master_income(msg: Message):
         return await msg.answer("Нет данных за сегодня.", reply_markup=master_kb)
     lines = [f"{row['method']}: {row['total']}₽" for row in rows]
     await msg.answer("Сегодняшний приход по типам оплаты:\n" + "\n".join(lines), reply_markup=master_kb)
+
+# fallback
 
 @dp.message(F.text)
 async def unknown(msg: Message):
