@@ -315,8 +315,11 @@ async def my_income(msg: Message):
     lines = [f"{row['method']}: {row['total']}₽" for row in rows]
     await msg.answer("Сегодняшний приход по типам оплаты:\n" + "\n".join(lines))
 
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="🧾 Я ВЫПОЛНИЛ ЗАКАЗ")]],
+master_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🧾 Заказ"), KeyboardButton(text="🔍 Клиент")],
+        [KeyboardButton(text="💼 Зарплата"), KeyboardButton(text="💰 Приход")],
+    ],
     resize_keyboard=True
 )
 
@@ -330,7 +333,18 @@ async def ensure_master(user_id: int) -> bool:
 
 @dp.message(CommandStart())
 async def on_start(msg: Message):
-    await msg.answer("Привет! Это внутренний бот.\nНажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или используй /find +7XXXXXXXXXX", reply_markup=main_kb)
+    # автоматическая регистрация админа остаётся без изменений…
+    # выбираем клавиатуру
+    if await has_permission(msg.from_user.id, "add_master"):
+        kb = main_kb  # админы видят стандартную клавиатуру
+    elif await has_permission(msg.from_user.id, "view_own_salary"):
+        kb = master_kb  # мастера видят мастер‑меню
+    else:
+        kb = main_kb  # на всякий случай
+    await msg.answer(
+        "Привет! Это внутренний бот.\nНажми нужную кнопку или воспользуйся командой /find.",
+        reply_markup=kb
+    )
     # авто-регистрация админа как активного сотрудника
     if is_admin(msg.from_user.id):
         async with pool.acquire() as conn:
@@ -401,6 +415,8 @@ async def find_cmd(msg: Message):
 
 # ===== FSM: Я ВЫПОЛНИЛ ЗАКАЗ =====
 class OrderFSM(StatesGroup):
+    waiting_phone = State()
+    waiting_salary_period = State()
     phone = State()
     name = State()
     amount = State()
@@ -411,7 +427,7 @@ class OrderFSM(StatesGroup):
     maybe_bday = State()
     confirm = State()
 
-@dp.message(F.text == "🧾 Я ВЫПОЛНИЛ ЗАКАЗ")
+@dp.message(F.text.in_(["🧾 Я ВЫПОЛНИЛ ЗАКАЗ", "🧾 Заказ"]))
 async def start_order(msg: Message, state: FSMContext):
     if not await ensure_master(msg.from_user.id):
         return await msg.answer("У вас нет прав мастера. Обратитесь к администратору.")
@@ -695,6 +711,101 @@ async def commit_order(msg: Message, state: FSMContext):
     await msg.answer("Готово ✅ Заказ сохранён.\nСпасибо!", reply_markup=main_kb)
 
 # fallback
+@dp.message(F.text == "🔍 Клиент")
+async def master_find_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_own_salary"):
+        return await msg.answer("Доступно только мастерам.")
+    await state.set_state(MasterFSM.waiting_phone)
+    await msg.answer("Введите номер телефона клиента:")
+
+@dp.message(MasterFSM.waiting_phone, F.text)
+async def master_find_phone(msg: Message, state: FSMContext):
+    phone_in = normalize_phone_for_db(msg.text.strip())
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow(
+            "SELECT full_name, phone, bonus_balance, birthday, status "
+            "FROM clients WHERE regexp_replace(phone,'[^0-9]+','','g')=regexp_replace($1,'[^0-9]+','','g')",
+            phone_in
+        )
+    await state.clear()
+    if not rec:
+        return await msg.answer("Не найдено.")
+    bd = rec["birthday"].isoformat() if rec["birthday"] else "—"
+    await msg.answer(
+        f"👤 {rec['full_name'] or 'Без имени'}\n"
+        f"📞 {rec['phone']}\n"
+        f"💳 {rec['bonus_balance']}\n"
+        f"🎂 {bd}\n"
+        f"🏷️ {rec['status'] or '—'}",
+        reply_markup=master_kb
+    )
+
+@dp.message(F.text == "💼 Зарплата")
+async def master_salary_prompt(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_own_salary"):
+        return await msg.answer("Доступно только мастерам.")
+    await state.set_state(MasterFSM.waiting_salary_period)
+    await msg.answer("Введите период (day, week, month, year):")
+
+@dp.message(MasterFSM.waiting_salary_period, F.text)
+async def master_salary_calc(msg: Message, state: FSMContext):
+    period = msg.text.strip().lower()
+    if period not in ["day", "week", "month", "year"]:
+        return await msg.answer("Период должен быть day, week, month или year.")
+    # повторяем логику функции /mysalary:
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow(
+            f"""
+            SELECT
+                COALESCE(SUM(pi.base_pay),0) AS base_pay,
+                COALESCE(SUM(pi.fuel_pay),0) AS fuel_pay,
+                COALESCE(SUM(pi.upsell_pay),0) AS upsell_pay,
+                COALESCE(SUM(pi.total_pay),0) AS total_pay
+            FROM payroll_items pi
+            JOIN orders o ON o.id = pi.order_id
+            WHERE pi.master_id = (
+                SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1
+            )
+              AND o.created_at >= date_trunc('{period}', NOW())
+            """,
+            msg.from_user.id
+        )
+    await state.clear()
+    if not rec:
+        return await msg.answer("Нет данных для указанного периода.", reply_markup=master_kb)
+    base_pay, fuel_pay, upsell_pay, total_pay = rec["base_pay"], rec["fuel_pay"], rec["upsell_pay"], rec["total_pay"]
+    await msg.answer(
+        f"Зарплата за {period}:\n"
+        f"Базовая оплата: {base_pay}₽\n"
+        f"Оплата за бензин: {fuel_pay}₽\n"
+        f"Оплата за доп. продажи: {upsell_pay}₽\n"
+        f"Итого: {total_pay}₽",
+        reply_markup=master_kb
+    )
+
+@dp.message(F.text == "💰 Приход")
+async def master_income(msg: Message):
+    if not await has_permission(msg.from_user.id, "view_own_income"):
+        return await msg.answer("Доступно только мастерам.")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT o.payment_method AS method,
+                   SUM(o.amount_cash) AS total
+            FROM orders o
+            WHERE o.master_id = (
+                SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1
+            )
+              AND date_trunc('day', o.created_at) = date_trunc('day', NOW())
+            GROUP BY o.payment_method
+            """,
+            msg.from_user.id,
+        )
+    if not rows:
+        return await msg.answer("Нет данных за сегодня.", reply_markup=master_kb)
+    lines = [f"{row['method']}: {row['total']}₽" for row in rows]
+    await msg.answer("Сегодняшний приход по типам оплаты:\n" + "\n".join(lines), reply_markup=master_kb)
+
 @dp.message(F.text)
 async def unknown(msg: Message):
     # Не перехватываем команды вида /something
