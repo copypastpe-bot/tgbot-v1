@@ -243,13 +243,11 @@ async def add_expense(msg: Message, command: CommandObject):
 
 @dp.message(Command("mysalary"))
 async def my_salary(msg: Message):
-    # доступ только для мастеров (разрешение view_own_salary)
+    # доступ только для мастеров
     if not await has_permission(msg.from_user.id, "view_own_salary"):
         return await msg.answer("Доступно только мастерам.")
     parts = msg.text.split(maxsplit=1)
-    period = "month"
-    if len(parts) > 1:
-        period = parts[1].strip().lower()
+    period = parts[1].strip().lower() if len(parts) > 1 else "month"
     period_map = {
         "day": "day",
         "week": "week",
@@ -258,11 +256,10 @@ async def my_salary(msg: Message):
     }
     if period not in period_map:
         return await msg.answer("Формат: /mysalary [day|week|month|year]")
-    # формируем начало периода для выборки (текущий день, неделя, месяц, год)
-    start_expr = f"DATE_TRUNC('{period_map[period]}', NOW())"
+    period_key = period_map[period]
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
-            f\"\"\"
+            f"""
             SELECT
                 COALESCE(SUM(pi.base_pay), 0) AS base_pay,
                 COALESCE(SUM(pi.fuel_pay), 0) AS fuel_pay,
@@ -270,21 +267,53 @@ async def my_salary(msg: Message):
                 COALESCE(SUM(pi.total_pay), 0) AS total_pay
             FROM payroll_items pi
             JOIN orders o ON o.id = pi.order_id
-            WHERE pi.master_id = (SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1)
-              AND o.created_at >= {start_expr}
-            \"\"\",\n            msg.from_user.id\n        )\n    if not rec:\n        return await msg.answer(\"Нет данных для указанного периода.\")\n    base_pay, fuel_pay, upsell_pay, total_pay = rec[\"base_pay\"], rec[\"fuel_pay\"], rec[\"upsell_pay\"], rec[\"total_pay\"]\n    await msg.answer(\n        f\"Зарплата за {period} (с {period_map[period]}):\\n\"\n        f\"Базовая оплата: {base_pay}₽\\n\"\n        f\"Оплата за бензин: {fuel_pay}₽\\n\"\n        f\"Оплата за доп. продажи: {upsell_pay}₽\\n\"\n        f\"Итого: {total_pay}₽\"\n    )\n```
+            WHERE pi.master_id = (
+                SELECT id FROM staff WHERE tg_user_id = $1 AND is_active LIMIT 1
+            )
+              AND o.created_at >= date_trunc('{period_key}', NOW())
+            """,
+            msg.from_user.id,
+        )
+    if not rec:
+        return await msg.answer("Нет данных для указанного периода.")
+    base_pay = rec["base_pay"]
+    fuel_pay = rec["fuel_pay"]
+    upsell_pay = rec["upsell_pay"]
+    total_pay = rec["total_pay"]
+    text = (
+        f"Зарплата за {period}:\n"
+        f"Базовая оплата: {base_pay}₽\n"
+        f"Оплата за бензин: {fuel_pay}₽\n"
+        f"Оплата за доп. продажи: {upsell_pay}₽\n"
+        f"Итого: {total_pay}₽"
+    )
+    await msg.answer(text)
 
 ### 2. Добавить обработчик `/myincome` (дневная выручка по типу оплаты)
 
-```python
 @dp.message(Command("myincome"))
 async def my_income(msg: Message):
-    # доступ только для мастеров (разрешение view_own_income)
+    # доступ только для мастеров
     if not await has_permission(msg.from_user.id, "view_own_income"):
         return await msg.answer("Доступно только мастерам.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            \"\"\"\n            SELECT o.payment_method AS method,\n                   SUM(o.amount_cash) AS total\n            FROM orders o\n            WHERE o.master_id = (\n                SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1\n            )\n              AND DATE_TRUNC('day', o.created_at) = DATE_TRUNC('day', NOW())\n            GROUP BY o.payment_method\n            \"\"\",\n            msg.from_user.id\n        )\n    if not rows:\n        return await msg.answer(\"Нет данных за сегодня.\")\n    lines = [f\"{row['method']}: {row['total']}₽\" for row in rows]\n    await msg.answer(\"Сегодняшний приход по типам оплаты:\\n\" + \"\\n\".join(lines))\n```
+            """
+            SELECT o.payment_method AS method,
+                   SUM(o.amount_cash) AS total
+            FROM orders o
+            WHERE o.master_id = (
+                SELECT id FROM staff WHERE tg_user_id = $1 AND is_active LIMIT 1
+            )
+              AND date_trunc('day', o.created_at) = date_trunc('day', NOW())
+            GROUP BY o.payment_method
+            """,
+            msg.from_user.id,
+        )
+    if not rows:
+        return await msg.answer("Нет данных за сегодня.")
+    lines = [f"{row['method']}: {row['total']}₽" for row in rows]
+    await msg.answer("Сегодняшний приход по типам оплаты:\n" + "\n".join(lines))
 
 main_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🧾 Я ВЫПОЛНИЛ ЗАКАЗ")]],
