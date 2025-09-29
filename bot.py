@@ -322,6 +322,13 @@ master_kb = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+salary_period_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="День"), KeyboardButton(text="Неделя")],
+        [KeyboardButton(text="Месяц"), KeyboardButton(text="Год")],
+    ],
+    resize_keyboard=True
+)
 
 # Legacy env-based admin check kept for backward compatibility
 def is_admin(user_id: int) -> bool:
@@ -751,13 +758,26 @@ async def master_salary_prompt(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_own_salary"):
         return await msg.answer("Доступно только мастерам.")
     await state.set_state(MasterFSM.waiting_salary_period)
-    await msg.answer("Введите период (day, week, month, year):")
+    await msg.answer(
+        "Выберите период:",
+        reply_markup=salary_period_kb
+    )
 
 @dp.message(MasterFSM.waiting_salary_period, F.text)
 async def master_salary_calc(msg: Message, state: FSMContext):
-    period = msg.text.strip().lower()
-    if period not in ["day", "week", "month", "year"]:
-        return await msg.answer("Период должен быть day, week, month или year.")
+    mapping = {
+        "День": "day",
+        "Неделя": "week",
+        "Месяц": "month",
+        "Год": "year",
+    }
+    period_label = msg.text.strip().capitalize()
+    period = mapping.get(period_label)
+    if not period:
+        return await msg.answer(
+            "Период должен быть одним из: День, Неделя, Месяц, Год.",
+            reply_markup=salary_period_kb
+        )
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
             f"""
@@ -780,7 +800,7 @@ async def master_salary_calc(msg: Message, state: FSMContext):
         return await msg.answer("Нет данных для указанного периода.", reply_markup=master_kb)
     base_pay, fuel_pay, upsell_pay, total_pay = rec["base_pay"], rec["fuel_pay"], rec["upsell_pay"], rec["total_pay"]
     await msg.answer(
-        f"Зарплата за {period}:\n"
+        f"Зарплата за {period_label}:\n"
         f"Базовая оплата: {base_pay}₽\n"
         f"Оплата за бензин: {fuel_pay}₽\n"
         f"Оплата за доп. продажи: {upsell_pay}₽\n"
