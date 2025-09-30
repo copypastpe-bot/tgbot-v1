@@ -7,15 +7,16 @@ from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from dotenv import load_dotenv
+
 import asyncpg
 
-import re
-
-PHONE_RE = re.compile(r'^(\\+7\\d{10}|8\\d{10}|9\\d{9})$')
+# Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
+# Разрешаем пробелы, дефисы и скобки в пользовательском вводе
 
 def is_valid_phone_format(s: str) -> bool:
-    """Допустимые форматы: +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX."""
-    return bool(PHONE_RE.fullmatch(s.strip()))
+    d = re.sub(r"[^0-9]", "", s or "")  # оставляем только цифры
+    # 11 цифр и начинается с 7 или 8 — ок; 10 цифр и начинается с 9 — ок
+    return (len(d) == 11 and d[0] in ("7", "8")) or (len(d) == 10 and d[0] == "9")
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
