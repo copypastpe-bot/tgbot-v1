@@ -461,8 +461,8 @@ async def find_cmd(msg: Message):
         f"🏷️ {status}"
     )
     if status == 'lead':
-    text += "\n\nЭто лид. Нажмите «🧾 Заказ», чтобы оформить первый заказ и обновить имя."
-await msg.answer(text, reply_markup=main_kb)
+        text += "\n\nЭто лид. Нажмите «🧾 Заказ», чтобы оформить первый заказ и обновить имя."
+    await msg.answer(text, reply_markup=main_kb)
 
 # ===== FSM: Я ВЫПОЛНИЛ ЗАКАЗ =====
 class OrderFSM(StatesGroup):
@@ -512,12 +512,13 @@ async def got_phone(msg: Message, state: FSMContext):
             )
         )
     # если всё хорошо — нормализуем номер
+    phone_in = normalize_phone_for_db(user_input)
     async with pool.acquire() as conn:
-    client = await conn.fetchrow(
-        "SELECT id, full_name, phone, bonus_balance, birthday, status "
-        "FROM clients WHERE regexp_replace(phone,'[^0-9]+','','g')=regexp_replace($1,'[^0-9]+','','g')",
-        phone_in
-    )
+        client = await conn.fetchrow(
+            "SELECT id, full_name, phone, bonus_balance, birthday, status "
+            "FROM clients WHERE regexp_replace(phone,'[^0-9]+','','g')=regexp_replace($1,'[^0-9]+','','g')",
+            phone_in
+        )
     data = {"phone_in": phone_in}
     if client:
         data["client_id"] = client["id"]
@@ -527,7 +528,7 @@ async def got_phone(msg: Message, state: FSMContext):
         await state.update_data(**data)
 
         # Если имя некорректное ИЛИ запись помечена как lead — попросим мастера исправить
-        if is_bad_name(client["full_name"] or "") or (client.get("status") == "lead"):
+        if is_bad_name(client["full_name"] or "") or (client["status"] == "lead"):
             await state.set_state(OrderFSM.name_fix)
             return await msg.answer(
                 "Найден лид/некорректное имя.\n"
