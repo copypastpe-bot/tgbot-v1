@@ -319,10 +319,13 @@ async def my_income(msg: Message):
     lines = [f"{row['method']}: {row['total']}₽" for row in rows]
     await msg.answer("Сегодняшний приход по типам оплаты:\n" + "\n".join(lines))
 
+MASTER_SALARY_LABEL = "💼 Зарплата"
+MASTER_INCOME_LABEL = "💰 Приход"
+
 master_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🧾 Заказ"), KeyboardButton(text="🔍 Клиент")],
-        [KeyboardButton(text="💼 Зарплата"), KeyboardButton(text="💰 Приход")],
+        [KeyboardButton(text=MASTER_SALARY_LABEL), KeyboardButton(text=MASTER_INCOME_LABEL)],
     ],
     resize_keyboard=True
 )
@@ -385,8 +388,8 @@ async def help_cmd(msg: Message):
             "Доступные кнопки:\n"
             "• 🧾 Заказ — добавить заказ\n"
             "• 🔍 Клиент — найти клиента\n"
-            "• 💼 Зарплата — отчёт по зарплате\n"
-            "• 💰 Приход — отчёт по выручке",
+            f"• {MASTER_SALARY_LABEL} — отчёт по зарплате\n"
+            f"• {MASTER_INCOME_LABEL} — отчёт по выручке",
             reply_markup=main_kb
         )
     elif await has_permission(msg.from_user.id, "view_own_salary"):
@@ -395,8 +398,8 @@ async def help_cmd(msg: Message):
             "Описание кнопок:\n"
             "• 🧾 Заказ — добавить заказ и клиента\n"
             "• 🔍 Клиент — найти клиента по номеру\n"
-            "• 💼 Зарплата — отчёт по вашей зарплате (день, неделя, месяц, год)\n"
-            "• 💰 Приход — выручка за сегодня по типам оплаты",
+            f"• {MASTER_SALARY_LABEL} — отчёт по вашей зарплате (день, неделя, месяц, год)\n"
+            f"• {MASTER_INCOME_LABEL} — выручка за сегодня по типам оплаты",
             reply_markup=master_kb
         )
     else:
@@ -763,14 +766,16 @@ async def master_find_phone(msg: Message, state: FSMContext):
     user_input = msg.text.strip()
     # если формат неправильный — вернуть сообщение об ошибке
     if not is_valid_phone_format(user_input):
-        return await msg.answer(
-            "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
-            reply_markup=ReplyKeyboardMarkup(
+        cancel_kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="Отмена")]],
             resize_keyboard=True
         )
-    )
-    
+        return await msg.answer(
+            "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
+            reply_markup=cancel_kb
+        )
+
+    phone_in = normalize_phone_for_db(user_input)
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
             "SELECT full_name, phone, bonus_balance, birthday, status "
@@ -791,7 +796,7 @@ async def master_find_phone(msg: Message, state: FSMContext):
     )
 
 # 💼 Зарплата — запрос периода
-@dp.message(F.text == "💼 Зарплата")
+@dp.message(F.text == MASTER_SALARY_LABEL)
 async def master_salary_prompt(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_own_salary"):
         return await msg.answer("Доступно только мастерам.")
@@ -847,7 +852,7 @@ async def master_salary_calc(msg: Message, state: FSMContext):
     )
 
 # 💰 Приход — выручка за сегодня
-@dp.message(F.text == "💰 Приход")
+@dp.message(F.text == MASTER_INCOME_LABEL)
 async def master_income(msg: Message):
     if not await has_permission(msg.from_user.id, "view_own_income"):
         return await msg.answer("Доступно только мастерам.")
