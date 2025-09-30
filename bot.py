@@ -400,8 +400,12 @@ async def help_cmd(msg: Message):
 async def find_cmd(msg: Message):
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await msg.answer("Формат: /find +7XXXXXXXXXX или 9XXXXXXXXX")
-    phone_in = normalize_phone_for_db(parts[1])
+        return await msg.answer("Формат: /find +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX")
+    user_input = parts[1].strip()  # берем введённый аргумент
+    # проверяем формат номера
+    if not is_valid_phone_format(user_input):
+        return await msg.answer("Формат: /find +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX")
+    phone_in = normalize_phone_for_db(user_input)  # нормализуем, если формат корректный
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
             "SELECT full_name, phone, bonus_balance, birthday, status "
@@ -452,7 +456,19 @@ async def start_order(msg: Message, state: FSMContext):
 
 @dp.message(OrderFSM.phone, F.text)
 async def got_phone(msg: Message, state: FSMContext):
-    phone_in = normalize_phone_for_db(msg.text.strip())
+    user_input = msg.text.strip()
+    # если формат неправильный — вернуть сообщение об ошибке и сбросить состояние
+    if not is_valid_phone_format(user_input):
+        await state.clear()
+        return await msg.answer(
+            "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="Отмена")]],
+                resize_keyboard=True
+            )
+        )
+    # если всё хорошо — нормализуем номер
+    phone_in = normalize_phone_for_db(user_input)
     async with pool.acquire() as conn:
         client = await conn.fetchrow(
             "SELECT id, full_name, phone, bonus_balance, birthday "
@@ -737,6 +753,19 @@ async def master_find_start(msg: Message, state: FSMContext):
 
 @dp.message(MasterFSM.waiting_phone, F.text)
 async def master_find_phone(msg: Message, state: FSMContext):
+    user_input = msg.text.strip()
+    # если формат неправильный — вернуть сообщение об ошибке
+    if not is_valid_phone_format(user_input):
+        return await msg.answer(
+            "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
+            reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True
+        )
+    )
+
+# если всё хорошо — нормализуем номер
+    phone_in = normalize_phone_for_db(user_input)
     user_input = msg.text.strip()
     # Новая проверка: номер должен быть валидным
     if not is_valid_phone_format(user_input):
