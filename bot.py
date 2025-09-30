@@ -502,7 +502,10 @@ async def got_phone(msg: Message, state: FSMContext):
         data["birthday"] = client["birthday"]
         await state.update_data(**data)
         await state.set_state(OrderFSM.amount)
-        return await msg.answer(f"Клиент найден: {client['full_name'] or 'Без имени'}\nБонусов: {data['bonus_balance']}\nВведите сумму чека (руб):")
+        return await msg.answer(
+            f"Клиент найден: {client['full_name'] or 'Без имени'}\nБонусов: {data['bonus_balance']}\nВведите сумму чека (руб):",
+            reply_markup=cancel_kb
+        )
     else:
         data["client_id"] = None
         data["bonus_balance"] = 0
@@ -529,9 +532,16 @@ async def got_name(msg: Message, state: FSMContext):
 async def got_amount(msg: Message, state: FSMContext):
     amount = parse_money(msg.text)
     if amount is None:
-        return await msg.answer("Нужно число ≥ 0. Введите сумму чека ещё раз:")
+        return await msg.answer(
+            "Нужно число ≥ 0. Введите сумму чека ещё раз:",
+            reply_markup=cancel_kb
+        )
     await state.update_data(amount_total=amount)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Нет")]], resize_keyboard=True)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Нет")],
+                  [KeyboardButton(text="Отмена")]],
+        resize_keyboard=True
+    )
     await state.set_state(OrderFSM.upsell_flag)
     await msg.answer("Была доп. продажа? (Да/Нет)", reply_markup=kb)
 
@@ -539,7 +549,7 @@ async def got_amount(msg: Message, state: FSMContext):
 async def got_upsell_flag(msg: Message, state: FSMContext):
     if msg.text.lower() == "да":
         await state.set_state(OrderFSM.upsell_amount)
-        return await msg.answer("Введите сумму доп. продажи (руб):", reply_markup=ReplyKeyboardRemove())
+        return await msg.answer("Введите сумму доп. продажи (руб):", reply_markup=cancel_kb)
     else:
         await state.update_data(upsell_amount=Decimal("0"))
         return await ask_bonus(msg, state)
@@ -548,7 +558,10 @@ async def got_upsell_flag(msg: Message, state: FSMContext):
 async def got_upsell_amount(msg: Message, state: FSMContext):
     v = parse_money(msg.text)
     if v is None:
-        return await msg.answer("Нужно число ≥ 0. Введите сумму доп. продажи ещё раз:")
+        return await msg.answer(
+            "Нужно число ≥ 0. Введите сумму доп. продажи ещё раз:",
+            reply_markup=cancel_kb
+        )
     await state.update_data(upsell_amount=v)
     return await ask_bonus(msg, state)
 
@@ -567,7 +580,8 @@ async def ask_bonus(msg: Message, state: FSMContext):
         await state.update_data(bonus_max=Decimal("0"), bonus_spent=Decimal("0"), amount_cash=amount)
         await state.set_state(OrderFSM.payment_method)
         kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="нал"), KeyboardButton(text="карта"), KeyboardButton(text="перевод")]],
+            keyboard=[[KeyboardButton(text="нал"), KeyboardButton(text="карта"), KeyboardButton(text="перевод")],
+                      [KeyboardButton(text="Отмена")]],
             resize_keyboard=True
         )
         return await msg.answer(
@@ -579,10 +593,14 @@ async def ask_bonus(msg: Message, state: FSMContext):
     # иначе — задаём выбор списания
     await state.update_data(bonus_max=bonus_max)
     await state.set_state(OrderFSM.bonus_spend)
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Списать 0"), KeyboardButton(text="Списать 50%"), KeyboardButton(text="Списать MAX")],
-        [KeyboardButton(text="Другая сумма")]
-    ], resize_keyboard=True)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Списать 0"), KeyboardButton(text="Списать 50%"), KeyboardButton(text="Списать MAX")],
+            [KeyboardButton(text="Другая сумма")],
+            [KeyboardButton(text="Отмена")]
+        ],
+        resize_keyboard=True
+    )
     return await msg.answer(f"Можно списать до {bonus_max} бонусов.\nВыберите:", reply_markup=kb)
 
 @dp.message(OrderFSM.bonus_spend, F.text)
@@ -608,7 +626,11 @@ async def got_bonus_spend(msg: Message, state: FSMContext):
     if cash_payment < MIN_CASH:
         return await msg.answer(f"Минимальная оплата деньгами {MIN_CASH}. Уменьшите списание бонусов.")
     await state.update_data(bonus_spent=spend, amount_cash=cash_payment)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="нал"), KeyboardButton(text="карта"), KeyboardButton(text="перевод")]], resize_keyboard=True)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="нал"), KeyboardButton(text="карта"), KeyboardButton(text="перевод")],
+                  [KeyboardButton(text="Отмена")]],
+        resize_keyboard=True
+    )
     await state.set_state(OrderFSM.payment_method)
     await msg.answer(f"Оплата деньгами: {cash_payment}\nВыберите способ оплаты:", reply_markup=kb)
 
@@ -621,7 +643,13 @@ async def got_method(msg: Message, state: FSMContext):
         return await show_confirm(msg, state)
     else:
         await state.set_state(OrderFSM.maybe_bday)
-        return await msg.answer("Если знаете ДР клиента, введите ДД.ММ (или '-' чтобы пропустить):", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="-")]], resize_keyboard=True))
+        return await msg.answer(
+            "Если знаете ДР клиента, введите ДД.ММ (или '-' чтобы пропустить):",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="-")], [KeyboardButton(text="Отмена")]],
+                resize_keyboard=True
+            )
+        )
 
 @dp.message(OrderFSM.maybe_bday, F.text)
 async def got_bday(msg: Message, state: FSMContext):
@@ -666,7 +694,7 @@ async def show_confirm(msg: Message, state: FSMContext):
 @dp.message(OrderFSM.confirm, F.text.lower() == "отмена")
 async def cancel_order(msg: Message, state: FSMContext):
     await state.clear()
-    await msg.answer("Отменено.", reply_markup=main_kb)
+    await msg.answer("Отменено.", reply_markup=master_kb)
 
 @dp.message(OrderFSM.confirm, F.text.lower() == "подтвердить")
 async def commit_order(msg: Message, state: FSMContext):
@@ -768,7 +796,7 @@ async def master_find_start(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_own_salary"):
         return await msg.answer("Доступно только мастерам.")
     await state.set_state(MasterFSM.waiting_phone)
-    await msg.answer("Введите номер телефона клиента:")
+    await msg.answer("Введите номер телефона клиента:", reply_markup=cancel_kb)
 
 @dp.message(MasterFSM.waiting_phone, F.text)
 async def master_find_phone(msg: Message, state: FSMContext):
@@ -887,11 +915,17 @@ async def master_income(msg: Message):
 # fallback
 
 @dp.message(F.text)
-async def unknown(msg: Message):
+async def unknown(msg: Message, state: FSMContext):
+    # Если пользователь находится внутри любого сценария FSM — не трогаем клавиатуру и не отвечаем
+    cur = await state.get_state()
+    if cur is not None:
+        return
     # Не перехватываем команды вида /something
     if msg.text and msg.text.startswith("/"):
         return
-    await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=main_kb)
+    # Показываем релевантное меню по роли
+    kb = master_kb if await has_permission(msg.from_user.id, "view_own_salary") else main_kb
+    await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
     global pool
