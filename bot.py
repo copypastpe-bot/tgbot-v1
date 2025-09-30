@@ -89,6 +89,27 @@ def normalize_phone_for_db(s: str) -> str:
         return "+" + d
     return s
 
+# Имя выглядит «плохим», если похоже на пропущенный звонок/метку или содержит телефон
+BAD_NAME_PATTERNS = [
+    r"^пропущенный\b",      # Пропущенный ...
+    r"\bгугл\s*карты\b",  # (.. Гугл Карты)
+    r"\bgoogle\s*maps\b", # на случай англ. подписи
+    r"\d{10,11}",           # длинная числовая последовательность (похожая на телефон)
+]
+
+def is_bad_name(name: str | None) -> bool:
+    if not name:
+        return False
+    low = name.strip().lower()
+    for pat in BAD_NAME_PATTERNS:
+        if re.search(pat, low):
+            return True
+    # если имя целиком похоже на номер телефона — тоже считаем плохим
+    digits = only_digits(low)
+    if digits and (len(digits) in (10, 11)):
+        return True
+    return False
+
 def qround_ruble(x: Decimal) -> Decimal:
     # округление вниз до рубля
     return x.quantize(Decimal("1."), rounding=ROUND_DOWN)
@@ -450,6 +471,7 @@ class OrderFSM(StatesGroup):
     bonus_spend = State()
     payment_method = State()
     maybe_bday = State()
+    name_fix = State()
     confirm = State()
 
 main_kb = ReplyKeyboardMarkup(
@@ -501,9 +523,21 @@ async def got_phone(msg: Message, state: FSMContext):
         data["bonus_balance"] = int(client["bonus_balance"] or 0)
         data["birthday"] = client["birthday"]
         await state.update_data(**data)
+
+        # Если имя выглядит некорректным — попросим мастера исправить
+        if is_bad_name(client["full_name"] or ""):
+            await state.set_state(OrderFSM.name_fix)
+            return await msg.answer(
+                "Клиент найден, но имя выглядит некорректным.\n"
+                "Введите правильное имя клиента (или нажмите ‘Отмена’):",
+                reply_markup=cancel_kb
+            )
+
         await state.set_state(OrderFSM.amount)
         return await msg.answer(
-            f"Клиент найден: {client['full_name'] or 'Без имени'}\nБонусов: {data['bonus_balance']}\nВведите сумму чека (руб):",
+            f"Клиент найден: {client['full_name'] or 'Без имени'}\n"
+            f"Бонусов: {data['bonus_balance']}\n"
+            "Введите сумму чека (руб):",
             reply_markup=cancel_kb
         )
     else:
@@ -512,6 +546,20 @@ async def got_phone(msg: Message, state: FSMContext):
         await state.update_data(**data)
         await state.set_state(OrderFSM.name)
         return await msg.answer("Клиент не найден. Введите имя клиента:", reply_markup=cancel_kb)
+
+
+# Новый обработчик для исправления некорректного имени клиента
+@dp.message(OrderFSM.name_fix, F.text)
+async def fix_name(msg: Message, state: FSMContext):
+    new_name = msg.text.strip()
+    if not new_name:
+        return await msg.answer("Имя не может быть пустым. Введите имя или нажмите ‘Отмена’.", reply_markup=cancel_kb)
+    if is_bad_name(new_name):
+        return await msg.answer("Имя похоже на номер/метку. Введите корректное имя.", reply_markup=cancel_kb)
+
+    await state.update_data(client_name=new_name)
+    await state.set_state(OrderFSM.amount)
+    await msg.answer("Имя обновлено. Введите сумму чека (руб):", reply_markup=cancel_kb)
 
 def parse_money(s: str) -> Decimal | None:
     s = s.replace(",", ".").strip()
@@ -915,17 +963,11 @@ async def master_income(msg: Message):
 # fallback
 
 @dp.message(F.text)
-async def unknown(msg: Message, state: FSMContext):
-    # Если пользователь находится внутри любого сценария FSM — не трогаем клавиатуру и не отвечаем
-    cur = await state.get_state()
-    if cur is not None:
-        return
+async def unknown(msg: Message):
     # Не перехватываем команды вида /something
     if msg.text and msg.text.startswith("/"):
         return
-    # Показываем релевантное меню по роли
-    kb = master_kb if await has_permission(msg.from_user.id, "view_own_salary") else main_kb
-    await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
+    await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=main_kb)
 
 async def main():
     global pool
