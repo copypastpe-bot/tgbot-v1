@@ -452,14 +452,17 @@ async def find_cmd(msg: Message):
     if not rec:
         return await msg.answer("Не найдено.")
     bd = rec["birthday"].isoformat() if rec["birthday"] else "—"
-    await msg.answer(
+    status = rec["status"] or "—"
+    text = (
         f"👤 {rec['full_name'] or 'Без имени'}\n"
         f"📞 {rec['phone']}\n"
         f"💳 {rec['bonus_balance']}\n"
         f"🎂 {bd}\n"
-        f"🏷️ {rec['status'] or '—'}",
-        reply_markup=main_kb
+        f"🏷️ {status}"
     )
+    if status == 'lead':
+    text += "\n\nЭто лид. Нажмите «🧾 Заказ», чтобы оформить первый заказ и обновить имя."
+await msg.answer(text, reply_markup=main_kb)
 
 # ===== FSM: Я ВЫПОЛНИЛ ЗАКАЗ =====
 class OrderFSM(StatesGroup):
@@ -509,13 +512,12 @@ async def got_phone(msg: Message, state: FSMContext):
             )
         )
     # если всё хорошо — нормализуем номер
-    phone_in = normalize_phone_for_db(user_input)
     async with pool.acquire() as conn:
-        client = await conn.fetchrow(
-            "SELECT id, full_name, phone, bonus_balance, birthday "
-            "FROM clients WHERE regexp_replace(phone,'[^0-9]+','','g')=regexp_replace($1,'[^0-9]+','','g')",
-            phone_in
-        )
+    client = await conn.fetchrow(
+        "SELECT id, full_name, phone, bonus_balance, birthday, status "
+        "FROM clients WHERE regexp_replace(phone,'[^0-9]+','','g')=regexp_replace($1,'[^0-9]+','','g')",
+        phone_in
+    )
     data = {"phone_in": phone_in}
     if client:
         data["client_id"] = client["id"]
@@ -524,11 +526,11 @@ async def got_phone(msg: Message, state: FSMContext):
         data["birthday"] = client["birthday"]
         await state.update_data(**data)
 
-        # Если имя выглядит некорректным — попросим мастера исправить
-        if is_bad_name(client["full_name"] or ""):
+        # Если имя некорректное ИЛИ запись помечена как lead — попросим мастера исправить
+        if is_bad_name(client["full_name"] or "") or (client.get("status") == "lead"):
             await state.set_state(OrderFSM.name_fix)
             return await msg.answer(
-                "Клиент найден, но имя выглядит некорректным.\n"
+                "Найден лид/некорректное имя.\n"
                 "Введите правильное имя клиента (или нажмите ‘Отмена’):",
                 reply_markup=cancel_kb
             )
@@ -871,14 +873,17 @@ async def master_find_phone(msg: Message, state: FSMContext):
     if not rec:
         return await msg.answer("Не найдено.", reply_markup=master_kb)
     bd = rec["birthday"].isoformat() if rec["birthday"] else "—"
-    await msg.answer(
+    status = rec["status"] or "—"
+    text = (
         f"👤 {rec['full_name'] or 'Без имени'}\n"
         f"📞 {rec['phone']}\n"
         f"💳 {rec['bonus_balance']}\n"
         f"🎂 {bd}\n"
-        f"🏷️ {rec['status'] or '—'}",
-        reply_markup=master_kb
+        f"🏷️ {status}"
     )
+    if status == 'lead':
+        text += "\n\nЭто лид. Нажмите «🧾 Заказ», чтобы оформить первый заказ и обновить имя."
+    await msg.answer(text, reply_markup=master_kb)
 
 # 💼 Зарплата — запрос периода
 @dp.message(F.text == MASTER_SALARY_LABEL)
@@ -963,11 +968,16 @@ async def master_income(msg: Message):
 # fallback
 
 @dp.message(F.text)
-async def unknown(msg: Message):
+async def unknown(msg: Message, state: FSMContext):
+    # Если пользователь находится в процессе любого сценария — не вмешиваемся
+    cur = await state.get_state()
+    if cur is not None:
+        return
     # Не перехватываем команды вида /something
     if msg.text and msg.text.startswith("/"):
         return
-    await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=main_kb)
+    kb = master_kb if await has_permission(msg.from_user.id, "view_own_salary") else main_kb
+    await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
     global pool
