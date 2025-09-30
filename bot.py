@@ -338,6 +338,11 @@ salary_period_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+cancel_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Отмена")]],
+    resize_keyboard=True
+)
+
 
 @dp.message(F.text.lower() == "отмена")
 async def cancel_any(msg: Message, state: FSMContext):
@@ -463,7 +468,10 @@ async def start_order(msg: Message, state: FSMContext):
         return await msg.answer("У вас нет прав мастера. Обратитесь к администратору.")
     await state.clear()
     await state.set_state(OrderFSM.phone)
-    await msg.answer("Введите номер клиента (9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX):", reply_markup=ReplyKeyboardRemove())
+    await msg.answer(
+    "Введите номер клиента (9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX):",
+    reply_markup=cancel_kb
+)
 
 @dp.message(OrderFSM.phone, F.text)
 async def got_phone(msg: Message, state: FSMContext):
@@ -500,7 +508,7 @@ async def got_phone(msg: Message, state: FSMContext):
         data["bonus_balance"] = 0
         await state.update_data(**data)
         await state.set_state(OrderFSM.name)
-        return await msg.answer("Клиент не найден. Введите имя клиента:")
+        return await msg.answer("Клиент не найден. Введите имя клиента:", reply_markup=cancel_kb)
 
 def parse_money(s: str) -> Decimal | None:
     s = s.replace(",", ".").strip()
@@ -515,7 +523,7 @@ def parse_money(s: str) -> Decimal | None:
 async def got_name(msg: Message, state: FSMContext):
     await state.update_data(client_name=msg.text.strip())
     await state.set_state(OrderFSM.amount)
-    await msg.answer("Введите сумму чека (руб):")
+    await msg.answer("Введите сумму чека (руб):", reply_markup=cancel_kb)
 
 @dp.message(OrderFSM.amount, F.text)
 async def got_amount(msg: Message, state: FSMContext):
