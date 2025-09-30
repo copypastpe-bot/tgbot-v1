@@ -9,6 +9,14 @@ from aiogram.fsm.context import FSMContext
 from dotenv import load_dotenv
 import asyncpg
 
+import re
+
+PHONE_RE = re.compile(r'^(\\+7\\d{10}|8\\d{10}|9\\d{9})$')
+
+def is_valid_phone_format(s: str) -> bool:
+    """Допустимые форматы: +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX."""
+    return bool(PHONE_RE.fullmatch(s.strip()))
+
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_DSN = os.getenv("DB_DSN")
@@ -729,7 +737,18 @@ async def master_find_start(msg: Message, state: FSMContext):
 
 @dp.message(MasterFSM.waiting_phone, F.text)
 async def master_find_phone(msg: Message, state: FSMContext):
-    phone_in = normalize_phone_for_db(msg.text.strip())
+    user_input = msg.text.strip()
+    # Новая проверка: номер должен быть валидным
+    if not is_valid_phone_format(user_input):
+        return await msg.answer(
+            "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="Отмена")]],
+                resize_keyboard=True
+            )
+        )
+    phone_in = normalize_phone_for_db(user_input)
+    
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
             "SELECT full_name, phone, bonus_balance, birthday, status "
