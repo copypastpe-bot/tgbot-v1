@@ -334,6 +334,13 @@ salary_period_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+
+@dp.message(F.text.lower() == "отмена")
+async def cancel_any(msg: Message, state: FSMContext):
+    await state.clear()
+    # возвращаем клавиатуру мастера
+    return await msg.answer("Отменено.", reply_markup=master_kb)
+
 # Legacy env-based admin check kept for backward compatibility
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_TG_IDS
@@ -739,7 +746,7 @@ async def commit_order(msg: Message, state: FSMContext):
             )
 
     await state.clear()
-    await msg.answer("Готово ✅ Заказ сохранён.\nСпасибо!", reply_markup=main_kb)
+    await msg.answer("Готово ✅ Заказ сохранён.\nСпасибо!", reply_markup=master_kb)
 
 # ---- Master menu handlers ----
 
@@ -763,20 +770,6 @@ async def master_find_phone(msg: Message, state: FSMContext):
             resize_keyboard=True
         )
     )
-
-# если всё хорошо — нормализуем номер
-    phone_in = normalize_phone_for_db(user_input)
-    user_input = msg.text.strip()
-    # Новая проверка: номер должен быть валидным
-    if not is_valid_phone_format(user_input):
-        return await msg.answer(
-            "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="Отмена")]],
-                resize_keyboard=True
-            )
-        )
-    phone_in = normalize_phone_for_db(user_input)
     
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
