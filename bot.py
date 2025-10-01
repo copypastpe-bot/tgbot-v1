@@ -296,9 +296,10 @@ async def import_leads_dryrun(msg: Message):
             """
             WITH cleaned AS (
               SELECT NULLIF(trim(full_name),'') AS full_name,
-                     norm_phone_ru(phone)      AS phone,
-                     COALESCE(bonus_balance,0) AS bonus_balance,
-                     birthday
+                     norm_phone_ru(phone)       AS phone,
+                     COALESCE(bonus_balance,0)  AS bonus_balance,
+                     birthday,
+                     NULLIF(trim(address),'')   AS address
               FROM clients_raw
             ),
             valid_no_dedup AS (
@@ -412,7 +413,8 @@ async def import_leads(msg: Message):
                 SELECT NULLIF(trim(full_name),'') AS full_name,
                        norm_phone_ru(phone)       AS phone,
                        COALESCE(bonus_balance,0)  AS bonus_balance,
-                       birthday
+                       birthday,
+                       NULLIF(trim(address),'')   AS address
                 FROM clients_raw;
 
                 CREATE TEMP TABLE tmp_dedup AS
@@ -453,7 +455,17 @@ async def import_leads(msg: Message):
             # Real INSERTs with RETURNING to count actually inserted
             inserted_rows = await conn.fetch("""
                 INSERT INTO clients(full_name, phone, bonus_balance, birthday, status)
-                SELECT d.full_name, d.phone, d.bonus_balance, d.birthday, 'lead'
+                SELECT
+                  d.full_name,
+                  d.phone,
+                  d.bonus_balance,
+                  d.birthday,
+                  CASE
+                    WHEN d.address IS NOT NULL
+                         OR (d.full_name IS NOT NULL AND NOT is_bad_name(d.full_name))
+                      THEN 'client'
+                    ELSE 'lead'
+                  END
                 FROM tmp_dedup d
                 LEFT JOIN clients c ON c.phone=d.phone
                 WHERE c.id IS NULL
@@ -468,9 +480,12 @@ async def import_leads(msg: Message):
                   bonus_balance = COALESCE(d.bonus_balance, c.bonus_balance),
                   birthday      = COALESCE(d.birthday, c.birthday),
                   status        = CASE
-                                     WHEN c.status='client' THEN 'client'
-                                     WHEN is_bad_name(COALESCE(d.full_name,c.full_name)) THEN 'lead'
-                                     ELSE c.status
+                                     WHEN c.status = 'client' THEN 'client'
+                                     WHEN d.address IS NOT NULL
+                                          OR (COALESCE(d.full_name, c.full_name) IS NOT NULL
+                                              AND NOT is_bad_name(COALESCE(d.full_name, c.full_name)))
+                                          THEN 'client'
+                                     ELSE 'lead'
                                   END
                 FROM tmp_dedup d
                 WHERE c.phone = d.phone
