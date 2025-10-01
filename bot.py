@@ -322,7 +322,7 @@ async def import_leads_dryrun(msg: Message):
             upd AS (
               SELECT COUNT(*) AS updated FROM dedup d
               JOIN clients c ON c.phone=d.phone
-              WHERE c.status &lt;&gt; 'client'
+              WHERE c.status <> 'client'
             ),
             skp AS (
               SELECT COUNT(*) AS skipped_existing_clients FROM dedup d
@@ -435,7 +435,7 @@ async def import_leads(msg: Message):
                      would_update AS (
                        SELECT COUNT(*) AS c FROM tmp_dedup d
                        JOIN clients c ON c.phone=d.phone
-                       WHERE c.status &lt;&gt; 'client'
+                       WHERE c.status <> 'client'
                      ),
                      would_skip AS (
                        SELECT COUNT(*) AS c FROM tmp_dedup d
@@ -474,7 +474,7 @@ async def import_leads(msg: Message):
                                   END
                 FROM tmp_dedup d
                 WHERE c.phone = d.phone
-                  AND c.status &lt;&gt; 'client'
+                  AND c.status <> 'client'
                 RETURNING c.phone;
             """)
 
