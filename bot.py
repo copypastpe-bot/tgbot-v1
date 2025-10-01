@@ -200,6 +200,7 @@ async def whoami(msg: Message):
         ])
     )
 
+# ===== /payroll admin command =====
 @dp.message(Command("payroll"))
 async def payroll_report(msg: Message):
     if not await has_permission(msg.from_user.id, "view_salary_reports"):
@@ -234,6 +235,283 @@ async def payroll_report(msg: Message):
         for r in rows
     ]
     await msg.answer(f"ЗП за {period}:\n" + "\n".join(lines))
+
+# ===== Leads import (admin) =====
+@dp.message(Command("import_leads_dryrun"))
+async def import_leads_dryrun(msg: Message):
+    # only admins/superadmins
+    if not await has_permission(msg.from_user.id, "import_leads"):
+        return await msg.answer("Только для администраторов.")
+
+    async with pool.acquire() as conn:
+        # ensure helper functions and staging table exist
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION norm_phone_ru(p text) RETURNS text AS $$
+            DECLARE d text := regexp_replace(COALESCE(p,''), '[^0-9]', '', 'g');
+            BEGIN
+              IF length(d)=10 AND d LIKE '9%' THEN
+                RETURN '+7' || d;
+              ELSIF length(d)=11 AND d LIKE '8%' THEN
+                RETURN '+7' || substr(d,2);
+              ELSIF length(d)=11 AND d LIKE '7%' THEN
+                RETURN '+' || d;
+              ELSIF d<>'' THEN
+                RETURN '+' || d;
+              ELSE
+                RETURN NULL;
+              END IF;
+            END $$ LANGUAGE plpgsql IMMUTABLE;
+            """
+        )
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION is_bad_name(name text) RETURNS boolean AS $$
+            DECLARE low text := lower(coalesce(name,''));
+            DECLARE digits text := regexp_replace(low,'[^0-9]','','g');
+            BEGIN
+              IF name IS NULL OR name = '' THEN RETURN FALSE; END IF;
+              IF low ~ '(^|\\s)пропущенн' THEN RETURN TRUE; END IF;
+              IF low ~ '(^|\\s)входящ' THEN RETURN TRUE; END IF;
+              IF low ~ 'гугл\\s*карты' OR low ~ 'google\\s*maps' THEN RETURN TRUE; END IF;
+              IF low ~ 'яндекс' OR low ~ 'сарафан' THEN RETURN TRUE; END IF;
+              IF length(digits) BETWEEN 10 AND 11 THEN RETURN TRUE; END IF;
+              RETURN FALSE;
+            END $$ LANGUAGE plpgsql IMMUTABLE;
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS clients_raw (
+              full_name     text,
+              phone         text,
+              bonus_balance integer,
+              birthday      date
+            );
+            """
+        )
+
+        # dry-run report (no changes), assumes CSV is already loaded into clients_raw
+        rec = await conn.fetchrow(
+            """
+            WITH cleaned AS (
+              SELECT NULLIF(trim(full_name),'') AS full_name,
+                     norm_phone_ru(phone)      AS phone,
+                     COALESCE(bonus_balance,0) AS bonus_balance,
+                     birthday
+              FROM clients_raw
+            ),
+            dedup AS (
+              SELECT DISTINCT ON (phone) *
+              FROM cleaned
+              WHERE phone IS NOT NULL
+              ORDER BY phone
+            ),
+            src AS (SELECT COUNT(*) AS total FROM clients_raw),
+            ok  AS (SELECT COUNT(*) AS valid FROM cleaned WHERE phone IS NOT NULL),
+            new AS (
+              SELECT COUNT(*) AS inserted FROM dedup d
+              LEFT JOIN clients c ON c.phone=d.phone
+              WHERE c.id IS NULL
+            ),
+            upd AS (
+              SELECT COUNT(*) AS updated FROM dedup d
+              JOIN clients c ON c.phone=d.phone
+              WHERE c.status <> 'client'
+            ),
+            skp AS (
+              SELECT COUNT(*) AS skipped_existing_clients FROM dedup d
+              JOIN clients c ON c.phone=d.phone
+              WHERE c.status='client'
+            )
+            SELECT 
+              (SELECT total FROM src)                        AS src_rows,
+              (SELECT valid FROM ok)                         AS valid_phones,
+              (SELECT inserted FROM new)                     AS would_insert,
+              (SELECT updated FROM upd)                      AS would_update,
+              (SELECT skipped_existing_clients FROM skp)     AS would_skip_clients;
+            """
+        )
+    text = (
+        "DRY-RUN импорт лидов (без изменений):\n"
+        f"Исходных строк: {rec['src_rows']}\n"
+        f"Телефонов валидно: {rec['valid_phones']}\n"
+        f"Будет добавлено (новых lead): {rec['would_insert']}\n"
+        f"Будет обновлено (не-клиенты): {rec['would_update']}\n"
+        f"Будет пропущено (уже clients): {rec['would_skip_clients']}\n"
+        "\nПосле проверки загрузите CSV в clients_raw и выполните /import_leads для применения."
+    )
+    await msg.answer(text)
+
+
+@dp.message(Command("import_leads"))
+async def import_leads(msg: Message):
+    # only admins/superadmins
+    if not await has_permission(msg.from_user.id, "import_leads"):
+        return await msg.answer("Только для администраторов.")
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # ensure helpers exist (same as in dryrun)
+            await conn.execute(
+                """
+                CREATE OR REPLACE FUNCTION norm_phone_ru(p text) RETURNS text AS $$
+                DECLARE d text := regexp_replace(COALESCE(p,''), '[^0-9]', '', 'g');
+                BEGIN
+                  IF length(d)=10 AND d LIKE '9%' THEN
+                    RETURN '+7' || d;
+                  ELSIF length(d)=11 AND d LIKE '8%' THEN
+                    RETURN '+7' || substr(d,2);
+                  ELSIF length(d)=11 AND d LIKE '7%' THEN
+                    RETURN '+' || d;
+                  ELSIF d<>'' THEN
+                    RETURN '+' || d;
+                  ELSE
+                    RETURN NULL;
+                  END IF;
+                END $$ LANGUAGE plpgsql IMMUTABLE;
+                """
+            )
+            await conn.execute(
+                """
+                CREATE OR REPLACE FUNCTION is_bad_name(name text) RETURNS boolean AS $$
+                DECLARE low text := lower(coalesce(name,''));
+                DECLARE digits text := regexp_replace(low,'[^0-9]','','g');
+                BEGIN
+                  IF name IS NULL OR name = '' THEN RETURN FALSE; END IF;
+                  IF low ~ '(^|\\s)пропущенн' THEN RETURN TRUE; END IF;
+                  IF low ~ '(^|\\s)входящ' THEN RETURN TRUE; END IF;
+                  IF low ~ 'гугл\\s*карты' OR low ~ 'google\\s*maps' THEN RETURN TRUE; END IF;
+                  IF low ~ 'яндекс' OR low ~ 'сарафан' THEN RETURN TRUE; END IF;
+                  IF length(digits) BETWEEN 10 AND 11 THEN RETURN TRUE; END IF;
+                  RETURN FALSE;
+                END $$ LANGUAGE plpgsql IMMUTABLE;
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS clients_raw (
+                  full_name     text,
+                  phone         text,
+                  bonus_balance integer,
+                  birthday      date
+                );
+                """
+            )
+
+            # INSERT new leads
+            await conn.execute(
+                """
+                WITH cleaned AS (
+                  SELECT NULLIF(trim(full_name),'') AS full_name,
+                         norm_phone_ru(phone)      AS phone,
+                         COALESCE(bonus_balance,0) AS bonus_balance,
+                         birthday
+                  FROM clients_raw
+                ),
+                dedup AS (
+                  SELECT DISTINCT ON (phone) *
+                  FROM cleaned
+                  WHERE phone IS NOT NULL
+                  ORDER BY phone
+                )
+                INSERT INTO clients(full_name, phone, bonus_balance, birthday, status)
+                SELECT
+                  d.full_name,
+                  d.phone,
+                  d.bonus_balance,
+                  d.birthday,
+                  'lead'  -- все новые из CSV считаем лидами, статус поднимет заказ
+                FROM dedup d
+                LEFT JOIN clients c ON c.phone=d.phone
+                WHERE c.id IS NULL;
+                """
+            )
+
+            # UPDATE existing non-clients
+            await conn.execute(
+                """
+                WITH cleaned AS (
+                  SELECT NULLIF(trim(full_name),'') AS full_name,
+                         norm_phone_ru(phone)      AS phone,
+                         COALESCE(bonus_balance,0) AS bonus_balance,
+                         birthday
+                  FROM clients_raw
+                ),
+                dedup AS (
+                  SELECT DISTINCT ON (phone) *
+                  FROM cleaned
+                  WHERE phone IS NOT NULL
+                  ORDER BY phone
+                )
+                UPDATE clients c
+                SET
+                  full_name     = COALESCE(d.full_name, c.full_name),
+                  bonus_balance = COALESCE(d.bonus_balance, c.bonus_balance),
+                  birthday      = COALESCE(d.birthday, c.birthday),
+                  status        = CASE
+                                     WHEN c.status='client' THEN 'client'
+                                     WHEN is_bad_name(COALESCE(d.full_name,c.full_name)) THEN 'lead'
+                                     ELSE c.status
+                                  END
+                FROM dedup d
+                WHERE c.phone = d.phone
+                  AND c.status <> 'client';
+                """
+            )
+
+            # report after changes
+            rec = await conn.fetchrow(
+                """
+                WITH cleaned AS (
+                  SELECT NULLIF(trim(full_name),'') AS full_name,
+                         norm_phone_ru(phone)      AS phone,
+                         COALESCE(bonus_balance,0) AS bonus_balance,
+                         birthday
+                  FROM clients_raw
+                ),
+                dedup AS (
+                  SELECT DISTINCT ON (phone) *
+                  FROM cleaned
+                  WHERE phone IS NOT NULL
+                  ORDER BY phone
+                ),
+                src AS (SELECT COUNT(*) AS total FROM clients_raw),
+                ok  AS (SELECT COUNT(*) AS valid FROM cleaned WHERE phone IS NOT NULL),
+                new AS (
+                  SELECT COUNT(*) AS inserted FROM dedup d
+                  LEFT JOIN clients c ON c.phone=d.phone
+                  WHERE c.id IS NULL
+                ),
+                upd AS (
+                  SELECT COUNT(*) AS updated FROM dedup d
+                  JOIN clients c ON c.phone=d.phone
+                  WHERE c.status <> 'client'
+                ),
+                skp AS (
+                  SELECT COUNT(*) AS skipped_existing_clients FROM dedup d
+                  JOIN clients c ON c.phone=d.phone
+                  WHERE c.status='client'
+                )
+                SELECT 
+                  (SELECT total FROM src)                        AS src_rows,
+                  (SELECT valid FROM ok)                         AS valid_phones,
+                  (SELECT inserted FROM new)                     AS inserted_leads,
+                  (SELECT updated FROM upd)                      AS updated_non_clients,
+                  (SELECT skipped_existing_clients FROM skp)     AS skipped_existing_clients;
+                """
+            )
+
+    text = (
+        "Импорт лидов выполнен:\n"
+        f"Исходных строк: {rec['src_rows']}\n"
+        f"Телефонов валидно: {rec['valid_phones']}\n"
+        f"Добавлено (новых lead): {rec['inserted_leads']}\n"
+        f"Обновлено (не-клиенты): {rec['updated_non_clients']}\n"
+        f"Пропущено (уже clients): {rec['skipped_existing_clients']}\n"
+        "\nНапоминание: статус автоматически станет 'client' после первого заказа."
+    )
+    await msg.answer(text)
 
 # ===== /expense admin command =====
 @dp.message(Command("expense"))
