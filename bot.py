@@ -301,6 +301,11 @@ async def import_leads_dryrun(msg: Message):
                      birthday
               FROM clients_raw
             ),
+            valid_no_dedup AS (
+              SELECT COUNT(*) AS cnt
+              FROM cleaned
+              WHERE phone IS NOT NULL
+            ),
             dedup AS (
               SELECT DISTINCT ON (phone) *
               FROM cleaned
@@ -308,7 +313,7 @@ async def import_leads_dryrun(msg: Message):
               ORDER BY phone
             ),
             src AS (SELECT COUNT(*) AS total FROM clients_raw),
-            ok  AS (SELECT COUNT(*) AS valid FROM cleaned WHERE phone IS NOT NULL),
+            valid_distinct AS (SELECT COUNT(*) AS cnt FROM dedup),
             new AS (
               SELECT COUNT(*) AS inserted FROM dedup d
               LEFT JOIN clients c ON c.phone=d.phone
@@ -317,7 +322,7 @@ async def import_leads_dryrun(msg: Message):
             upd AS (
               SELECT COUNT(*) AS updated FROM dedup d
               JOIN clients c ON c.phone=d.phone
-              WHERE c.status <> 'client'
+              WHERE c.status &lt;&gt; 'client'
             ),
             skp AS (
               SELECT COUNT(*) AS skipped_existing_clients FROM dedup d
@@ -326,7 +331,8 @@ async def import_leads_dryrun(msg: Message):
             )
             SELECT 
               (SELECT total FROM src)                        AS src_rows,
-              (SELECT valid FROM ok)                         AS valid_phones,
+              (SELECT cnt FROM valid_no_dedup)               AS valid_phones_total,
+              (SELECT cnt FROM valid_distinct)               AS valid_phones_distinct,
               (SELECT inserted FROM new)                     AS would_insert,
               (SELECT updated FROM upd)                      AS would_update,
               (SELECT skipped_existing_clients FROM skp)     AS would_skip_clients;
@@ -335,7 +341,8 @@ async def import_leads_dryrun(msg: Message):
     text = (
         "DRY-RUN импорт лидов (без изменений):\n"
         f"Исходных строк: {rec['src_rows']}\n"
-        f"Телефонов валидно: {rec['valid_phones']}\n"
+        f"Телефонов валидно (всего): {rec['valid_phones_total']}\n"
+        f"Телефонов валидно (уникальных): {rec['valid_phones_distinct']}\n"
         f"Будет добавлено (новых lead): {rec['would_insert']}\n"
         f"Будет обновлено (не-клиенты): {rec['would_update']}\n"
         f"Будет пропущено (уже clients): {rec['would_skip_clients']}\n"
@@ -399,51 +406,62 @@ async def import_leads(msg: Message):
                 """
             )
 
-            # INSERT new leads
-            await conn.execute(
-                """
-                WITH cleaned AS (
-                  SELECT NULLIF(trim(full_name),'') AS full_name,
-                         norm_phone_ru(phone)      AS phone,
-                         COALESCE(bonus_balance,0) AS bonus_balance,
-                         birthday
-                  FROM clients_raw
-                ),
-                dedup AS (
-                  SELECT DISTINCT ON (phone) *
-                  FROM cleaned
-                  WHERE phone IS NOT NULL
-                  ORDER BY phone
-                )
-                INSERT INTO clients(full_name, phone, bonus_balance, birthday, status)
-                SELECT
-                  d.full_name,
-                  d.phone,
-                  d.bonus_balance,
-                  d.birthday,
-                  'lead'  -- все новые из CSV считаем лидами, статус поднимет заказ
-                FROM dedup d
-                LEFT JOIN clients c ON c.phone=d.phone
-                WHERE c.id IS NULL;
-                """
-            )
+            # Prepare cleaned and deduplicated datasets
+            await conn.execute("""
+                CREATE TEMP TABLE tmp_cleaned AS
+                SELECT NULLIF(trim(full_name),'') AS full_name,
+                       norm_phone_ru(phone)       AS phone,
+                       COALESCE(bonus_balance,0)  AS bonus_balance,
+                       birthday
+                FROM clients_raw;
 
-            # UPDATE existing non-clients
-            await conn.execute(
-                """
-                WITH cleaned AS (
-                  SELECT NULLIF(trim(full_name),'') AS full_name,
-                         norm_phone_ru(phone)      AS phone,
-                         COALESCE(bonus_balance,0) AS bonus_balance,
-                         birthday
-                  FROM clients_raw
-                ),
-                dedup AS (
-                  SELECT DISTINCT ON (phone) *
-                  FROM cleaned
-                  WHERE phone IS NOT NULL
-                  ORDER BY phone
-                )
+                CREATE TEMP TABLE tmp_dedup AS
+                SELECT DISTINCT ON (phone) *
+                FROM tmp_cleaned
+                WHERE phone IS NOT NULL
+                ORDER BY phone;
+            """)
+
+            # Pre-change stats (to report skipped clients and valid counts)
+            pre = await conn.fetchrow("""
+                WITH src AS (SELECT COUNT(*) AS total FROM clients_raw),
+                     valid_no_dedup AS (SELECT COUNT(*) AS cnt FROM tmp_cleaned WHERE phone IS NOT NULL),
+                     valid_distinct AS (SELECT COUNT(*) AS cnt FROM tmp_dedup),
+                     would_insert AS (
+                       SELECT COUNT(*) AS c FROM tmp_dedup d
+                       LEFT JOIN clients c ON c.phone=d.phone
+                       WHERE c.id IS NULL
+                     ),
+                     would_update AS (
+                       SELECT COUNT(*) AS c FROM tmp_dedup d
+                       JOIN clients c ON c.phone=d.phone
+                       WHERE c.status &lt;&gt; 'client'
+                     ),
+                     would_skip AS (
+                       SELECT COUNT(*) AS c FROM tmp_dedup d
+                       JOIN clients c ON c.phone=d.phone
+                       WHERE c.status = 'client'
+                     )
+                SELECT (SELECT total FROM src)              AS src_rows,
+                       (SELECT cnt FROM valid_no_dedup)     AS valid_phones_total,
+                       (SELECT cnt FROM valid_distinct)     AS valid_phones_distinct,
+                       (SELECT c FROM would_insert)         AS would_insert,
+                       (SELECT c FROM would_update)         AS would_update,
+                       (SELECT c FROM would_skip)           AS would_skip_clients;
+            """)
+
+            # Real INSERTs with RETURNING to count actually inserted
+            inserted_rows = await conn.fetch("""
+                INSERT INTO clients(full_name, phone, bonus_balance, birthday, status)
+                SELECT d.full_name, d.phone, d.bonus_balance, d.birthday, 'lead'
+                FROM tmp_dedup d
+                LEFT JOIN clients c ON c.phone=d.phone
+                WHERE c.id IS NULL
+                RETURNING phone;
+            """)
+
+            # Real UPDATEs for non-clients with RETURNING to count actually updated
+            updated_rows = await conn.fetch("""
                 UPDATE clients c
                 SET
                   full_name     = COALESCE(d.full_name, c.full_name),
@@ -454,64 +472,26 @@ async def import_leads(msg: Message):
                                      WHEN is_bad_name(COALESCE(d.full_name,c.full_name)) THEN 'lead'
                                      ELSE c.status
                                   END
-                FROM dedup d
+                FROM tmp_dedup d
                 WHERE c.phone = d.phone
-                  AND c.status <> 'client';
-                """
-            )
+                  AND c.status &lt;&gt; 'client'
+                RETURNING c.phone;
+            """)
 
-            # report after changes
-            rec = await conn.fetchrow(
-                """
-                WITH cleaned AS (
-                  SELECT NULLIF(trim(full_name),'') AS full_name,
-                         norm_phone_ru(phone)      AS phone,
-                         COALESCE(bonus_balance,0) AS bonus_balance,
-                         birthday
-                  FROM clients_raw
-                ),
-                dedup AS (
-                  SELECT DISTINCT ON (phone) *
-                  FROM cleaned
-                  WHERE phone IS NOT NULL
-                  ORDER BY phone
-                ),
-                src AS (SELECT COUNT(*) AS total FROM clients_raw),
-                ok  AS (SELECT COUNT(*) AS valid FROM cleaned WHERE phone IS NOT NULL),
-                new AS (
-                  SELECT COUNT(*) AS inserted FROM dedup d
-                  LEFT JOIN clients c ON c.phone=d.phone
-                  WHERE c.id IS NULL
-                ),
-                upd AS (
-                  SELECT COUNT(*) AS updated FROM dedup d
-                  JOIN clients c ON c.phone=d.phone
-                  WHERE c.status <> 'client'
-                ),
-                skp AS (
-                  SELECT COUNT(*) AS skipped_existing_clients FROM dedup d
-                  JOIN clients c ON c.phone=d.phone
-                  WHERE c.status='client'
-                )
-                SELECT 
-                  (SELECT total FROM src)                        AS src_rows,
-                  (SELECT valid FROM ok)                         AS valid_phones,
-                  (SELECT inserted FROM new)                     AS inserted_leads,
-                  (SELECT updated FROM upd)                      AS updated_non_clients,
-                  (SELECT skipped_existing_clients FROM skp)     AS skipped_existing_clients;
-                """
-            )
+            inserted_count = len(inserted_rows)
+            updated_count  = len(updated_rows)
 
-    text = (
-        "Импорт лидов выполнен:\n"
-        f"Исходных строк: {rec['src_rows']}\n"
-        f"Телефонов валидно: {rec['valid_phones']}\n"
-        f"Добавлено (новых lead): {rec['inserted_leads']}\n"
-        f"Обновлено (не-клиенты): {rec['updated_non_clients']}\n"
-        f"Пропущено (уже clients): {rec['skipped_existing_clients']}\n"
-        "\nНапоминание: статус автоматически станет 'client' после первого заказа."
-    )
-    await msg.answer(text)
+        text = (
+            "Импорт лидов выполнен:\n"
+            f"Исходных строк: {pre['src_rows']}\n"
+            f"Телефонов валидно (всего): {pre['valid_phones_total']}\n"
+            f"Телефонов валидно (уникальных): {pre['valid_phones_distinct']}\n"
+            f"Добавлено (новых lead): {inserted_count}\n"
+            f"Обновлено (не-клиенты): {updated_count}\n"
+            f"Пропущено (уже clients): {pre['would_skip_clients']}\n"
+            "\nНапоминание: статус автоматически станет 'client' после первого заказа."
+        )
+        await msg.answer(text)
 
 # ===== /expense admin command =====
 @dp.message(Command("expense"))
