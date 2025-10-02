@@ -583,30 +583,49 @@ async def upload_clients_file(msg: Message, state: FSMContext):
     except Exception:
         await state.clear()
         return await msg.answer("Ошибка: файл должен быть в кодировке UTF-8.")
-    # Parse CSV
-    # Accept both comma and semicolon delimiters
-    sniffer = csv.Sniffer()
-    try:
-        dialect = sniffer.sniff(text.splitlines()[0])
-    except Exception:
-        # fallback to comma
-        dialect = csv.get_dialect("excel")
-    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    # Parse CSV (robust: handle BOM, CRLF, and ; or , delimiter)
+    first_line = text.splitlines()[0] if text else ""
+    # strip UTF-8 BOM if present
+    if first_line.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
+        first_line = first_line.lstrip("\ufeff")
+    delimiter = ";" if (";" in first_line and first_line.count(";") >= first_line.count(",")) else ","
+    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+
+    # normalize headers: strip, lower, drop BOM
+    def _norm(h: str) -> str:
+        return (h or "").strip().lstrip("\ufeff").lower()
+
     required = {"full_name", "phone", "bonus_balance", "birthday", "address"}
-    missing = required - set([h.strip() for h in reader.fieldnames or []])
+    headers = [_norm(h) for h in (reader.fieldnames or [])]
+    # map normalized -> original header name for safe access
+    header_map = {_norm(orig): orig for orig in (reader.fieldnames or [])}
+
+    missing = required - set(headers)
     if missing:
         await state.clear()
         return await msg.answer(f"В CSV отсутствуют колонки: {', '.join(sorted(missing))}")
+
     rows = []
     for row in reader:
-        bday_raw = (row.get("birthday") or "").strip()
-        bday_iso = parse_birthday_str(bday_raw)
+        # access by normalized keys via header_map
+        def getv(key: str) -> str:
+            orig = header_map.get(key, "")
+            return (row.get(orig) or "").strip()
+
+        bday_iso = parse_birthday_str(getv("birthday"))
+        bb_raw = getv("bonus_balance")
+        try:
+            bb = int(bb_raw) if bb_raw != "" else 0
+        except Exception:
+            bb = 0
+
         rows.append({
-            "full_name": (row.get("full_name") or "").strip() or None,
-            "phone": (row.get("phone") or "").strip() or None,
-            "bonus_balance": int((row.get("bonus_balance") or 0) or 0),
+            "full_name": getv("full_name") or None,
+            "phone": getv("phone") or None,
+            "bonus_balance": bb,
             "birthday": bday_iso,
-            "address": (row.get("address") or "").strip() or None,
+            "address": getv("address") or None,
         })
     if not rows:
         await state.clear()
