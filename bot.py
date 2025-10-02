@@ -79,15 +79,49 @@ def only_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
 
 def normalize_phone_for_db(s: str) -> str:
-    d = only_digits(s)
-    if len(d) == 10 and d.startswith("9"):
-        return "+7" + d
-    if len(d) == 11 and d.startswith("8"):
-        return "+7" + d[1:]
-    if len(d) == 11 and d.startswith("7"):
-        return "+" + d
-    if d and not s.startswith("+"):
-        return "+" + d
+    """Extract first valid RU phone subsequence from mixed text and normalize to +7XXXXXXXXXX.
+    Rules:
+    - If the first collected digit is '7' or '8' → take exactly 11 digits.
+    - If it's '9' → take exactly 10 digits.
+    - Stop as soon as enough digits are collected; ignore everything after.
+    - Return +7XXXXXXXXXX for 8XXXXXXXXXX/7XXXXXXXXXX/9XXXXXXXXX.
+    """
+    if not s:
+        return s
+    first = None
+    buf = []
+    for ch in s:
+        if ch.isdigit():
+            if first is None:
+                # start only on 7/8/9 as per our formats
+                if ch in ('7', '8', '9'):
+                    first = ch
+                    buf.append(ch)
+            else:
+                buf.append(ch)
+            if first in ('7', '8') and len(buf) == 11:
+                break
+            if first == '9' and len(buf) == 10:
+                break
+    if not buf:
+        return s
+    d = ''.join(buf)
+    if len(d) == 10 and d.startswith('9'):
+        return '+7' + d
+    if len(d) == 11 and d.startswith('8'):
+        return '+7' + d[1:]
+    if len(d) == 11 and d.startswith('7'):
+        return '+' + d
+    # fallback to previous behavior if nothing matched cleanly
+    digits_all = re.sub(r"[^0-9]", "", s)
+    if len(digits_all) == 10 and digits_all.startswith('9'):
+        return '+7' + digits_all
+    if len(digits_all) == 11 and digits_all.startswith('8'):
+        return '+7' + digits_all[1:]
+    if len(digits_all) == 11 and digits_all.startswith('7'):
+        return '+' + digits_all
+    if digits_all and not s.startswith('+'):
+        return '+' + digits_all
     return s
 
 # Имя выглядит «плохим», если похоже на пропущенный звонок/метку или содержит телефон
@@ -271,15 +305,38 @@ async def import_leads_dryrun(msg: Message):
         await conn.execute(
             """
             CREATE OR REPLACE FUNCTION norm_phone_ru(p text) RETURNS text AS $$
-            DECLARE d text := regexp_replace(COALESCE(p,''), '[^0-9]', '', 'g');
+            DECLARE s text := COALESCE(p, '');
+            DECLARE m text;  -- first valid subsequence of digits
+            DECLARE ch text;
+            DECLARE d text := '';
+            DECLARE first text := NULL;
             BEGIN
+              -- scan left-to-right, collect the first valid phone subsequence only
+              FOR i IN 1..char_length(s) LOOP
+                ch := substr(s, i, 1);
+                IF ch ~ '\\d' THEN
+                  IF first IS NULL THEN
+                    IF ch IN ('7','8','9') THEN
+                      first := ch;
+                      d := d || ch;
+                    END IF;
+                  ELSE
+                    d := d || ch;
+                  END IF;
+                  IF first IN ('7','8') AND length(d) = 11 THEN EXIT; END IF;
+                  IF first = '9' AND length(d) = 10 THEN EXIT; END IF;
+                END IF;
+              END LOOP;
+
+              IF d = '' THEN
+                RETURN NULL;
+              END IF;
+
               IF length(d)=10 AND d LIKE '9%' THEN
                 RETURN '+7' || d;
               ELSIF length(d)=11 AND d LIKE '8%' THEN
                 RETURN '+7' || substr(d,2);
               ELSIF length(d)=11 AND d LIKE '7%' THEN
-                RETURN '+' || d;
-              ELSIF d<>'' THEN
                 RETURN '+' || d;
               ELSE
                 RETURN NULL;
@@ -393,15 +450,38 @@ async def import_leads(msg: Message):
             await conn.execute(
                 """
                 CREATE OR REPLACE FUNCTION norm_phone_ru(p text) RETURNS text AS $$
-                DECLARE d text := regexp_replace(COALESCE(p,''), '[^0-9]', '', 'g');
+                DECLARE s text := COALESCE(p, '');
+                DECLARE m text;  -- first valid subsequence of digits
+                DECLARE ch text;
+                DECLARE d text := '';
+                DECLARE first text := NULL;
                 BEGIN
+                  -- scan left-to-right, collect the first valid phone subsequence only
+                  FOR i IN 1..char_length(s) LOOP
+                    ch := substr(s, i, 1);
+                    IF ch ~ '\\d' THEN
+                      IF first IS NULL THEN
+                        IF ch IN ('7','8','9') THEN
+                          first := ch;
+                          d := d || ch;
+                        END IF;
+                      ELSE
+                        d := d || ch;
+                      END IF;
+                      IF first IN ('7','8') AND length(d) = 11 THEN EXIT; END IF;
+                      IF first = '9' AND length(d) = 10 THEN EXIT; END IF;
+                    END IF;
+                  END LOOP;
+
+                  IF d = '' THEN
+                    RETURN NULL;
+                  END IF;
+
                   IF length(d)=10 AND d LIKE '9%' THEN
                     RETURN '+7' || d;
                   ELSIF length(d)=11 AND d LIKE '8%' THEN
                     RETURN '+7' || substr(d,2);
                   ELSIF length(d)=11 AND d LIKE '7%' THEN
-                    RETURN '+' || d;
-                  ELSIF d<>'' THEN
                     RETURN '+' || d;
                   ELSE
                     RETURN NULL;
