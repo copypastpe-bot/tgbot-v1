@@ -1,4 +1,5 @@
 import asyncio, os, re, logging
+import csv, io
 from decimal import Decimal, ROUND_DOWN
 from datetime import date
 from aiogram import Bot, Dispatcher, F
@@ -286,9 +287,13 @@ async def import_leads_dryrun(msg: Message):
               full_name     text,
               phone         text,
               bonus_balance integer,
-              birthday      date
+              birthday      date,
+              address       text
             );
             """
+        )
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_clients_phone_digits ON clients (regexp_replace(COALESCE(phone,''),'[^0-9]+','','g'))"
         )
 
         # dry-run report (no changes), assumes CSV is already loaded into clients_raw
@@ -402,9 +407,13 @@ async def import_leads(msg: Message):
                   full_name     text,
                   phone         text,
                   bonus_balance integer,
-                  birthday      date
+                  birthday      date,
+                  address       text
                 );
                 """
+            )
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_clients_phone_digits ON clients (regexp_replace(COALESCE(phone,''),'[^0-9]+','','g'))"
             )
 
             # Prepare cleaned and deduplicated datasets
@@ -507,6 +516,110 @@ async def import_leads(msg: Message):
             "\nНапоминание: статус автоматически станет 'client' после первого заказа."
         )
         await msg.answer(text)
+
+
+# ===== Admin: WIPE TEST DATA =====
+@dp.message(Command("wipe_test_data"))
+async def wipe_test_data(msg: Message):
+    # only admins/superadmins
+    if not await has_permission(msg.from_user.id, "import_leads"):
+        return await msg.answer("Только для администраторов.")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Backup responsibility is external (psql \\copy). Here we just cleanup test data.
+            # 1) Clear staging
+            await conn.execute("TRUNCATE TABLE clients_raw RESTART IDENTITY;")
+            # 2) Clear operational tables (keep RBAC: staff/permissions/role_permissions)
+            for tbl in [
+                "orders",
+                "payroll_items",
+                "order_payroll",
+                "payroll",
+                "cashbook_entries",
+                "bonus_transactions",
+                "cashbook",
+                "clients"
+            ]:
+                await conn.execute(f"TRUNCATE TABLE {tbl} RESTART IDENTITY CASCADE;")
+    await msg.answer("Тестовые данные удалены. RBAC-таблицы сохранены.")
+
+# ===== Admin: UPLOAD CSV TO clients_raw =====
+from aiogram.types import ContentType, FSInputFile
+from aiogram import types
+
+class UploadFSM(StatesGroup):
+    waiting_csv = State()
+
+@dp.message(Command("upload_clients"))
+async def upload_clients_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "import_leads"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(UploadFSM.waiting_csv)
+    return await msg.answer("Отправьте CSV-файл (UTF-8, ; или , разделитель) с колонками: full_name, phone, bonus_balance, birthday, address.", reply_markup=cancel_kb)
+
+@dp.message(UploadFSM.waiting_csv, F.document)
+async def upload_clients_file(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "import_leads"):
+        await state.clear()
+        return await msg.answer("Только для администраторов.")
+    file = await bot.get_file(msg.document.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    data = file_bytes.read()
+    # Try to decode as utf-8
+    try:
+        text = data.decode("utf-8")
+    except Exception:
+        await state.clear()
+        return await msg.answer("Ошибка: файл должен быть в кодировке UTF-8.")
+    # Parse CSV
+    # Accept both comma and semicolon delimiters
+    sniffer = csv.Sniffer()
+    try:
+        dialect = sniffer.sniff(text.splitlines()[0])
+    except Exception:
+        # fallback to comma
+        dialect = csv.get_dialect("excel")
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    required = {"full_name", "phone", "bonus_balance", "birthday", "address"}
+    missing = required - set([h.strip() for h in reader.fieldnames or []])
+    if missing:
+        await state.clear()
+        return await msg.answer(f"В CSV отсутствуют колонки: {', '.join(sorted(missing))}")
+    rows = []
+    for row in reader:
+        rows.append({
+            "full_name": (row.get("full_name") or "").strip() or None,
+            "phone": (row.get("phone") or "").strip() or None,
+            "bonus_balance": int((row.get("bonus_balance") or 0) or 0),
+            "birthday": (row.get("birthday") or "").strip() or None,
+            "address": (row.get("address") or "").strip() or None,
+        })
+    if not rows:
+        await state.clear()
+        return await msg.answer("Файл пуст.")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS clients_raw (
+                    full_name     text,
+                    phone         text,
+                    bonus_balance integer,
+                    birthday      date,
+                    address       text
+                );
+            """)
+            # clear staging before load
+            await conn.execute("TRUNCATE TABLE clients_raw;")
+            # bulk insert
+            insert_sql = """
+                INSERT INTO clients_raw(full_name, phone, bonus_balance, birthday, address)
+                VALUES ($1, $2, $3, NULLIF($4,'')::date, $5)
+            """
+            args = [(r["full_name"], r["phone"], r["bonus_balance"], r["birthday"], r["address"]) for r in rows]
+            # execute many
+            await conn.executemany(insert_sql, args)
+    await state.clear()
+    return await msg.answer(f"Загружено строк в staging (clients_raw): {len(rows)}.\nТеперь выполните /import_leads_dryrun, затем /import_leads.")
 
 # ===== /expense admin command =====
 @dp.message(Command("expense"))
