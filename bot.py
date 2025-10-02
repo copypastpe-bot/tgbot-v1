@@ -321,12 +321,14 @@ async def import_leads_dryrun(msg: Message):
         # dry-run report (no changes), assumes CSV is already loaded into clients_raw
         rec = await conn.fetchrow(
             """
-            WITH cleaned AS (
+            WITH
+            cleaned AS (
               SELECT NULLIF(trim(full_name),'') AS full_name,
                      norm_phone_ru(phone)       AS phone,
                      COALESCE(bonus_balance,0)  AS bonus_balance,
                      birthday,
-                     NULLIF(trim(address),'')   AS address
+                     NULLIF(trim(address),'')   AS address,
+                     row_number() OVER (ORDER BY ctid) AS src_pos
               FROM clients_raw
             ),
             valid_no_dedup AS (
@@ -335,10 +337,10 @@ async def import_leads_dryrun(msg: Message):
               WHERE phone IS NOT NULL
             ),
             dedup AS (
-              SELECT DISTINCT ON (phone) *
+              SELECT DISTINCT ON (phone) full_name, phone, bonus_balance, birthday, address
               FROM cleaned
               WHERE phone IS NOT NULL
-              ORDER BY phone
+              ORDER BY phone, (address IS NULL), src_pos
             ),
             src AS (SELECT COUNT(*) AS total FROM clients_raw),
             valid_distinct AS (SELECT COUNT(*) AS cnt FROM dedup),
@@ -445,14 +447,15 @@ async def import_leads(msg: Message):
                        norm_phone_ru(phone)       AS phone,
                        COALESCE(bonus_balance,0)  AS bonus_balance,
                        birthday,
-                       NULLIF(trim(address),'')   AS address
+                       NULLIF(trim(address),'')   AS address,
+                       row_number() OVER (ORDER BY ctid) AS src_pos
                 FROM clients_raw;
 
                 CREATE TEMP TABLE tmp_dedup AS
-                SELECT DISTINCT ON (phone) *
+                SELECT DISTINCT ON (phone) full_name, phone, bonus_balance, birthday, address
                 FROM tmp_cleaned
                 WHERE phone IS NOT NULL
-                ORDER BY phone;
+                ORDER BY phone, (address IS NULL), src_pos;
             """)
 
             # Pre-change stats (to report skipped clients and valid counts)
