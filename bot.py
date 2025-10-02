@@ -115,6 +115,28 @@ def qround_ruble(x: Decimal) -> Decimal:
     # округление вниз до рубля
     return x.quantize(Decimal("1."), rounding=ROUND_DOWN)
 
+# Birthday parser: accepts DD.MM.YYYY or YYYY-MM-DD, returns ISO or None
+def parse_birthday_str(s: str | None) -> str | None:
+    """
+    Accepts 'DD.MM.YYYY' or 'YYYY-MM-DD' (or empty/None) and returns ISO 'YYYY-MM-DD' or None.
+    Any other format returns None.
+    """
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    # try DD.MM.YYYY
+    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+    if m:
+        dd, mm, yyyy = m.groups()
+        return f"{yyyy}-{mm}-{dd}"
+    # try YYYY-MM-DD
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return s
+    return None
+
 async def set_commands():
     cmds = [
         BotCommand(command="start", description="Старт"),
@@ -349,7 +371,7 @@ async def import_leads_dryrun(msg: Message):
         f"• Исходных строк — {rec['src_rows']} (строк в файле)\n"
         f"• Телефонов валидно — {rec['valid_phones_total']} (подходит для загрузки)\n"
         f"• Уникальных телефонов — {rec['valid_phones_distinct']} (уникальные записи)\n"
-        f"• Будет добавлено (новых лидов) — {rec['would_insert']}\n"
+        f"• Будет добавлено (новых) — {rec['would_insert']}\n"
         f"• Будет обновлено (текущих не-клиентов) — {rec['would_update']}\n"
         f"• Не будет загружено (уже клиенты) — {rec['would_skip_clients']}\n"
         "\nЕсли всё ок: загрузите CSV в clients_raw и выполните /import_leads, чтобы применить изменения."
@@ -470,9 +492,7 @@ async def import_leads(msg: Message):
                   d.bonus_balance,
                   d.birthday,
                   CASE
-                    WHEN d.address IS NOT NULL
-                         OR (d.full_name IS NOT NULL AND NOT is_bad_name(d.full_name))
-                      THEN 'client'
+                    WHEN d.address IS NOT NULL THEN 'client'
                     ELSE 'lead'
                   END
                 FROM tmp_dedup d
@@ -482,25 +502,17 @@ async def import_leads(msg: Message):
             """)
 
             # Real UPDATEs for non-clients with RETURNING to count actually updated
-            updated_rows = await conn.fetch("""
-                UPDATE clients c
-                SET
-                  full_name     = COALESCE(d.full_name, c.full_name),
-                  bonus_balance = COALESCE(d.bonus_balance, c.bonus_balance),
-                  birthday      = COALESCE(d.birthday, c.birthday),
-                  status        = CASE
-                                     WHEN c.status = 'client' THEN 'client'
-                                     WHEN d.address IS NOT NULL
-                                          OR (COALESCE(d.full_name, c.full_name) IS NOT NULL
-                                              AND NOT is_bad_name(COALESCE(d.full_name, c.full_name)))
-                                          THEN 'client'
-                                     ELSE 'lead'
-                                  END
-                FROM tmp_dedup d
-                WHERE c.phone = d.phone
-                  AND c.status <> 'client'
-                RETURNING c.phone;
-            """)
+                updated_rows = await conn.fetch("""
+                    UPDATE clients c
+                    SET
+                      full_name     = COALESCE(d.full_name, c.full_name),
+                      bonus_balance = COALESCE(d.bonus_balance, c.bonus_balance),
+                      birthday      = COALESCE(d.birthday, c.birthday)
+                    FROM tmp_dedup d
+                    WHERE c.phone = d.phone
+                      AND c.status <> 'client'
+                    RETURNING c.phone;
+                """)
 
             inserted_count = len(inserted_rows)
             updated_count  = len(updated_rows)
@@ -510,7 +522,7 @@ async def import_leads(msg: Message):
             f"Исходных строк: {pre['src_rows']}\n"
             f"Телефонов валидно (всего): {pre['valid_phones_total']}\n"
             f"Телефонов валидно (уникальных): {pre['valid_phones_distinct']}\n"
-            f"Добавлено (новых lead): {inserted_count}\n"
+            f"Добавлено (новых): {inserted_count}\n"
             f"Обновлено (не-клиенты): {updated_count}\n"
             f"Пропущено (уже clients): {pre['would_skip_clients']}\n"
             "\nНапоминание: статус автоматически станет 'client' после первого заказа."
@@ -587,11 +599,13 @@ async def upload_clients_file(msg: Message, state: FSMContext):
         return await msg.answer(f"В CSV отсутствуют колонки: {', '.join(sorted(missing))}")
     rows = []
     for row in reader:
+        bday_raw = (row.get("birthday") or "").strip()
+        bday_iso = parse_birthday_str(bday_raw)
         rows.append({
             "full_name": (row.get("full_name") or "").strip() or None,
             "phone": (row.get("phone") or "").strip() or None,
             "bonus_balance": int((row.get("bonus_balance") or 0) or 0),
-            "birthday": (row.get("birthday") or "").strip() or None,
+            "birthday": bday_iso,
             "address": (row.get("address") or "").strip() or None,
         })
     if not rows:
