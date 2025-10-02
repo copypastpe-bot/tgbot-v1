@@ -340,14 +340,14 @@ async def import_leads_dryrun(msg: Message):
             """
         )
     text = (
-        "DRY-RUN импорт лидов (без изменений):\n"
-        f"Исходных строк: {rec['src_rows']}\n"
-        f"Телефонов валидно (всего): {rec['valid_phones_total']}\n"
-        f"Телефонов валидно (уникальных): {rec['valid_phones_distinct']}\n"
-        f"Будет добавлено (новых lead): {rec['would_insert']}\n"
-        f"Будет обновлено (не-клиенты): {rec['would_update']}\n"
-        f"Будет пропущено (уже clients): {rec['would_skip_clients']}\n"
-        "\nПосле проверки загрузите CSV в clients_raw и выполните /import_leads для применения."
+        "Импорт завершён:\n"
+        f"• Исходных строк — {pre['src_rows']} (строк в файле)\n"
+        f"• Телефонов валидно — {pre['valid_phones_total']} (подходит для загрузки)\n"
+        f"• Уникальных телефонов — {pre['valid_phones_distinct']} (уникальные записи)\n"
+        f"• Добавлено (новых лидов) — {inserted_count}\n"
+        f"• Обновлено (текущих не-клиентов) — {updated_count}\n"
+        f"• Не загружено (уже клиенты) — {pre['would_skip_clients']}\n"
+        "\nПримечание: статус присваивается автоматически — 'client', если есть адрес или имя выглядит корректно; иначе 'lead'."
     )
     await msg.answer(text)
 
