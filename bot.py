@@ -501,18 +501,18 @@ async def import_leads(msg: Message):
                 RETURNING phone;
             """)
 
-            # Real UPDATEs for non-clients with RETURNING to count actually updated
-                updated_rows = await conn.fetch("""
-                    UPDATE clients c
-                    SET
-                      full_name     = COALESCE(d.full_name, c.full_name),
-                      bonus_balance = COALESCE(d.bonus_balance, c.bonus_balance),
-                      birthday      = COALESCE(d.birthday, c.birthday)
-                    FROM tmp_dedup d
-                    WHERE c.phone = d.phone
-                      AND c.status <> 'client'
-                    RETURNING c.phone;
-                """)
+            # Real UPDATEs for non-clients (do NOT touch status)
+            updated_rows = await conn.fetch("""
+                UPDATE clients c
+                SET
+                  full_name     = COALESCE(d.full_name, c.full_name),
+                  bonus_balance = COALESCE(d.bonus_balance, c.bonus_balance),
+                  birthday      = COALESCE(d.birthday, c.birthday)
+                FROM tmp_dedup d
+                WHERE c.phone = d.phone
+                  AND c.status <> 'client'
+                RETURNING c.phone;
+            """)
 
             inserted_count = len(inserted_rows)
             updated_count  = len(updated_rows)
