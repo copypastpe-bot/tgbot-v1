@@ -324,13 +324,13 @@ async def cash_report(msg: Message):
         if mday:
             y, m, d = map(int, mday.groups())
             period_label = f"{y:04d}-{m:02d}-{d:02d}"
-            start_sql = f\"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-{d:02d} 00:00:00+00'\"
-            end_sql   = f\"{start_sql} + interval '1 day'\"
+            start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-{d:02d} 00:00:00+00'"
+            end_sql   = f"{start_sql} + interval '1 day'"
         elif mmon:
             y, m = map(int, mmon.groups())
             period_label = f"{y:04d}-{m:02d}"
-            start_sql = f\"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-01 00:00:00+00'\"
-            end_sql   = f\"{start_sql} + interval '1 month'\"
+            start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-01 00:00:00+00'"
+            end_sql   = f"{start_sql} + interval '1 month'"
         else:
             return await msg.answer("Формат: /cash [day|month|year|YYYY-MM|YYYY-MM-DD]")
 
