@@ -819,6 +819,38 @@ async def upload_clients_file(msg: Message, state: FSMContext):
     await state.clear()
     return await msg.answer(f"Загружено строк в staging (clients_raw): {len(rows)}.\nТеперь выполните /import_leads_dryrun, затем /import_leads.")
 
+# ===== /income admin command =====
+@dp.message(Command("income"))
+async def add_income(msg: Message, command: CommandObject):
+    if not await has_permission(msg.from_user.id, "record_cashflows"):
+        return await msg.answer("Только для администраторов.")
+
+    # command.args — всё после /income, например: "1500 Поступление по заказу #123"
+    if not command.args:
+        return await msg.answer("Формат: /income <сумма> <комментарий>")
+
+    parts = command.args.split(maxsplit=1)
+    if len(parts) < 2:
+        return await msg.answer("Не указан комментарий. Формат: /income <сумма> <комментарий>")
+
+    amount_str, comment = parts
+
+    try:
+        amount = Decimal(amount_str)
+        if amount <= 0:
+            return await msg.answer("Сумма должна быть положительным числом.")
+    except Exception:
+        return await msg.answer(f"Ошибка: '{amount_str}' не является корректной суммой.")
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO cashbook_entries (kind, method, amount, comment) "
+            "VALUES ('income', 'прочее', $1, $2)",
+            amount, comment
+        )
+
+    await msg.answer(f"✅ Приход {amount}₽ добавлен: {comment}")
+
 # ===== /expense admin command =====
 @dp.message(Command("expense"))
 async def add_expense(msg: Message, command: CommandObject):
