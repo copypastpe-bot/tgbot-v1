@@ -171,6 +171,24 @@ def parse_birthday_str(s: str | None) -> str | None:
         return s
     return None
 
+# Payment method normalizer (Python side to mirror SQL norm_pay_method)
+def norm_pay_method_py(p: str | None) -> str:
+    if not p:
+        return 'прочее'
+    x = (p or '').strip().lower()
+    # collapse inner spaces
+    while '  ' in x:
+        x = x.replace('  ', ' ')
+    if 'нал' in x:
+        return 'наличные'
+    if x.startswith('карта дима') or x.startswith('дима'):
+        return 'карта дима'
+    if x.startswith('карта женя') or x.startswith('женя'):
+        return 'карта женя'
+    if 'р/с' in x or 'р\с' in x or 'расчет' in x or 'счет' in x:
+        return 'р/с'
+    return x
+
 async def set_commands():
     cmds = [
         BotCommand(command="start", description="Старт"),
@@ -922,15 +940,17 @@ async def add_income(msg: Message, command: CommandObject):
     if not await has_permission(msg.from_user.id, "record_cashflows"):
         return await msg.answer("Только для администраторов.")
 
-    # command.args — всё после /income, например: "1500 Поступление по заказу #123"
+    # command.args — всё после /income, примеры:
+    #   "/income 1500 нал Оплата заказа #123"
+    #   "/income 2200 карта дима Холодильник"
     if not command.args:
-        return await msg.answer("Формат: /income <сумма> <комментарий>")
+        return await msg.answer("Формат: /income <сумма> <метод> <комментарий>\nНапр.: /income 1500 нал Оплата заказа #123")
 
-    parts = command.args.split(maxsplit=1)
-    if len(parts) < 2:
-        return await msg.answer("Не указан комментарий. Формат: /income <сумма> <комментарий>")
+    parts = command.args.split(maxsplit=2)
+    if len(parts) < 3:
+        return await msg.answer("Нужно указать сумму, метод и комментарий.\nФормат: /income <сумма> <метод> <комментарий>")
 
-    amount_str, comment = parts
+    amount_str, method_raw, comment = parts
 
     try:
         amount = Decimal(amount_str)
@@ -939,11 +959,13 @@ async def add_income(msg: Message, command: CommandObject):
     except Exception:
         return await msg.answer(f"Ошибка: '{amount_str}' не является корректной суммой.")
 
+    method = norm_pay_method_py(method_raw)
+
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO cashbook_entries (kind, method, amount, comment) "
-            "VALUES ('income', 'прочее', $1, $2)",
-            amount, comment
+            "VALUES ('income', $1, $2, $3)",
+            method, amount, comment
         )
 
     await msg.answer(f"✅ Приход {amount}₽ добавлен: {comment}")
