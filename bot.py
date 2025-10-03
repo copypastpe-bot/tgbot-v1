@@ -936,21 +936,32 @@ async def upload_clients_file(msg: Message, state: FSMContext):
 
 # ===== /income admin command =====
 @dp.message(Command("income"))
-async def add_income(msg: Message, command: CommandObject):
+async def add_income(msg: Message):
     if not await has_permission(msg.from_user.id, "record_cashflows"):
         return await msg.answer("Только для администраторов.")
 
-    # command.args — всё после /income, примеры:
-    #   "/income 1500 нал Оплата заказа #123"
-    #   "/income 2200 карта дима Холодильник"
-    if not command.args:
+    # Разбор аргументов из текста: /income <сумма> <метод> <комментарий>
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
         return await msg.answer("Формат: /income <сумма> <метод> <комментарий>\nНапр.: /income 1500 нал Оплата заказа #123")
 
-    parts = command.args.split(maxsplit=2)
-    if len(parts) < 3:
-        return await msg.answer("Нужно указать сумму, метод и комментарий.\nФормат: /income <сумма> <метод> <комментарий>")
+    tail = parts[1].strip()
+    # Пытаемся выделить сумму (первый токен), метод (следующий токен или две лексемы для 'карта дима' / 'карта женя'), и комментарий
+    tokens = tail.split()
+    if len(tokens) < 2:
+        return await msg.answer("Нужно указать сумму и метод. Формат: /income <сумма> <метод> <комментарий>")
 
-    amount_str, method_raw, comment = parts
+    amount_str = tokens[0]
+    # метод может быть из двух слов: 'карта дима' / 'карта женя'
+    if len(tokens) >= 3 and (tokens[1].lower() == 'карта' and tokens[2].lower() in ('дима','женя')):
+        method_raw = tokens[1] + ' ' + tokens[2]
+        comment = ' '.join(tokens[3:]) if len(tokens) > 3 else ''
+    else:
+        method_raw = tokens[1]
+        comment = ' '.join(tokens[2:]) if len(tokens) > 2 else ''
+
+    if not comment:
+        return await msg.answer("Не указан комментарий. Формат: /income <сумма> <метод> <комментарий>")
 
     try:
         amount = Decimal(amount_str)
@@ -968,7 +979,7 @@ async def add_income(msg: Message, command: CommandObject):
             method, amount, comment
         )
 
-    await msg.answer(f"✅ Приход {amount}₽ добавлен: {comment}")
+    await msg.answer(f"✅ Приход\nСумма: {amount}₽\nТип оплаты: {method}\nКомментарий: {comment}")
 
 # ===== /expense admin command =====
 @dp.message(Command("expense"))
