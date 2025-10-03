@@ -375,6 +375,103 @@ async def cash_report(msg: Message):
 
     await msg.answer("\n".join(lines))
 
+# ===== /profit admin command =====
+@dp.message(Command("profit"))
+async def profit_report(msg: Message):
+    # доступ только у админа
+    if not await has_permission(msg.from_user.id, "view_profit_reports"):
+        return await msg.answer("Только для администраторов.")
+
+    # Форматы:
+    # /profit                -> за сегодня
+    # /profit day|month|year -> текущий период
+    # /profit 2025-10-03     -> конкретный день
+    # /profit 2025-10        -> конкретный месяц
+    parts = msg.text.split(maxsplit=1)
+    args = parts[1].strip().lower() if len(parts) > 1 else "day"
+
+    def trunc(unit: str) -> str:
+        return f"date_trunc('{unit}', NOW())"
+
+    if args in ("day", "month", "year"):
+        period_label = {"day": "сегодня", "month": "текущий месяц", "year": "текущий год"}[args]
+        unit = args
+        start_sql = trunc(unit)
+        end_sql = f"{trunc(unit)} + interval '1 {unit}'"
+    else:
+        mday = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", args)
+        mmon = re.fullmatch(r"(\d{4})-(\d{2})", args)
+        if mday:
+            y, m, d = map(int, mday.groups())
+            period_label = f"{y:04d}-{m:02d}-{d:02d}"
+            start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-{d:02d} 00:00:00+00'"
+            end_sql   = f"{start_sql} + interval '1 day'"
+        elif mmon:
+            y, m = map(int, mmon.groups())
+            period_label = f"{y:04d}-{m:02d}"
+            start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-01 00:00:00+00'"
+            end_sql   = f"{start_sql} + interval '1 month'"
+        else:
+            return await msg.answer("Формат: /profit [day|month|year|YYYY-MM|YYYY-MM-DD]")
+
+    async with pool.acquire() as conn:
+        # Итого по периоду
+        rev = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(o.amount_cash), 0)::numeric(12,2)
+            FROM orders o
+            WHERE o.created_at >= {start_sql} AND o.created_at < {end_sql}
+            """
+        )
+        exp = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(c.amount), 0)::numeric(12,2)
+            FROM cashbook_entries c
+            WHERE c.kind='expense' AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+            """
+        )
+
+        # Детализация по дням (до 31 строки)
+        rows = await conn.fetch(
+            f"""
+            WITH
+            r AS (
+              SELECT date_trunc('day', o.created_at) AS day, SUM(o.amount_cash) AS revenue
+              FROM orders o
+              WHERE o.created_at >= {start_sql} AND o.created_at < {end_sql}
+              GROUP BY 1
+            ),
+            e AS (
+              SELECT date_trunc('day', c.happened_at) AS day, SUM(c.amount) AS expense
+              FROM cashbook_entries c
+              WHERE c.kind='expense' AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+              GROUP BY 1
+            )
+            SELECT COALESCE(r.day, e.day) AS day,
+                   COALESCE(r.revenue, 0)::numeric(12,2) AS revenue,
+                   COALESCE(e.expense, 0)::numeric(12,2) AS expense,
+                   (COALESCE(r.revenue, 0) - COALESCE(e.expense, 0))::numeric(12,2) AS profit
+            FROM r FULL OUTER JOIN e ON r.day = e.day
+            ORDER BY day DESC
+            LIMIT 31;
+            """
+        )
+
+    profit = (rev or 0) - (exp or 0)
+
+    lines = [
+        f"Прибыль за {period_label}:",
+        f"💰 Выручка: {rev or 0}₽",
+        f"💸 Расходы: {exp or 0}₽",
+        f"= Прибыль: {profit}₽",
+    ]
+    if rows:
+        lines.append("\nПо дням (последние):")
+        for r in rows:
+            lines.append(f"{r['day']:%Y-%m-%d}: выручка {r['revenue']} / расходы {r['expense']} → прибыль {r['profit']}₽")
+
+    await msg.answer("\n".join(lines))
+
 # ===== Leads import (admin) =====
 @dp.message(Command("import_leads_dryrun"))
 async def import_leads_dryrun(msg: Message):
