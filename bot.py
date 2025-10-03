@@ -1,7 +1,7 @@
 import asyncio, os, re, logging
 import csv, io
 from decimal import Decimal, ROUND_DOWN
-from datetime import date
+from datetime import date, datetime, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import CommandStart, Command, CommandObject
@@ -292,6 +292,88 @@ async def payroll_report(msg: Message):
         for r in rows
     ]
     await msg.answer(f"ЗП за {period}:\n" + "\n".join(lines))
+
+# ===== /cash admin command =====
+@dp.message(Command("cash"))
+async def cash_report(msg: Message):
+    # доступ только у админа
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        return await msg.answer("Только для администраторов.")
+
+    # Форматы:
+    # /cash                -> за сегодня
+    # /cash day|month|year -> агрегат за текущий период
+    # /cash 2025-10-03     -> конкретный день
+    # /cash 2025-10        -> конкретный месяц
+    parts = msg.text.split(maxsplit=1)
+    args = parts[1].strip().lower() if len(parts) > 1 else "day"
+
+    # хелпер: строим SQL-границы периода [start, end)
+    def trunc(unit: str) -> str:
+        # оставляем расчёт на стороне БД
+        return f"date_trunc('{unit}', NOW())"
+
+    if args in ("day", "month", "year"):
+        period_label = {"day": "сегодня", "month": "текущий месяц", "year": "текущий год"}[args]
+        unit = args
+        start_sql = trunc(unit)
+        end_sql = f"{trunc(unit)} + interval '1 {unit}'"
+    else:
+        mday = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", args)
+        mmon = re.fullmatch(r"(\d{4})-(\d{2})", args)
+        if mday:
+            y, m, d = map(int, mday.groups())
+            period_label = f"{y:04d}-{m:02d}-{d:02d}"
+            start_sql = f\"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-{d:02d} 00:00:00+00'\"
+            end_sql   = f\"{start_sql} + interval '1 day'\"
+        elif mmon:
+            y, m = map(int, mmon.groups())
+            period_label = f"{y:04d}-{m:02d}"
+            start_sql = f\"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-01 00:00:00+00'\"
+            end_sql   = f\"{start_sql} + interval '1 month'\"
+        else:
+            return await msg.answer("Формат: /cash [day|month|year|YYYY-MM|YYYY-MM-DD]")
+
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow(
+            f"""
+            SELECT
+              COALESCE(SUM(income),  0)::numeric(12,2) AS income,
+              COALESCE(SUM(expense), 0)::numeric(12,2) AS expense,
+              COALESCE(SUM(delta),   0)::numeric(12,2) AS delta
+            FROM v_cash_summary
+            WHERE day >= {start_sql} AND day < {end_sql};
+            """
+        )
+        rows = await conn.fetch(
+            f"""
+            SELECT day::date AS d,
+                   COALESCE(income,0)::numeric(12,2)  AS income,
+                   COALESCE(expense,0)::numeric(12,2) AS expense,
+                   COALESCE(delta,0)::numeric(12,2)   AS delta
+            FROM v_cash_summary
+            WHERE day >= {start_sql} AND day < {end_sql}
+            ORDER BY day DESC
+            LIMIT 31;
+            """
+        )
+
+    income  = rec["income"] or 0
+    expense = rec["expense"] or 0
+    delta   = rec["delta"] or 0
+
+    lines = [
+        f"Касса за {period_label}:",
+        f"➕ Приход: {income}₽",
+        f"➖ Расход: {expense}₽",
+        f"= Дельта: {delta}₽",
+    ]
+    if rows:
+        lines.append("\nДетализация по дням (последние):")
+        for r in rows:
+            lines.append(f"{r['d']}: +{r['income']} / -{r['expense']} = {r['delta']}₽")
+
+    await msg.answer("\n".join(lines))
 
 # ===== Leads import (admin) =====
 @dp.message(Command("import_leads_dryrun"))
