@@ -1647,12 +1647,6 @@ async def commit_order(msg: Message, state: FSMContext):
             )
 
             await conn.execute(
-                "INSERT INTO cashbook_entries (kind, method, amount, comment, order_id) "
-                "VALUES ('income', $1, $2, 'Оплата за заказ', $3)",
-                data["payment_method"], cash_payment, order_id
-            )
-
-            await conn.execute(
                 "INSERT INTO payroll_items (order_id, master_id, base_pay, fuel_pay, upsell_pay, total_pay, calc_info) "
                 "VALUES ($1, (SELECT id FROM staff WHERE tg_user_id=$2), $3, $4, $5, $6, "
                 "        jsonb_build_object('cash_payment', to_jsonb(($7)::numeric), 'rules', '1000/3000 + 150 + 500/3000'))",
