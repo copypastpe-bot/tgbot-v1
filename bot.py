@@ -593,6 +593,43 @@ async def import_leads_dryrun(msg: Message):
         await conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_clients_phone_digits ON clients (regexp_replace(COALESCE(phone,''),'[^0-9]+','','g'))"
         )
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION trg_order_to_cashbook() RETURNS trigger AS $$
+            DECLARE tx_id integer;
+            BEGIN
+              IF
+                NEW.income_tx_id IS NULL
+                AND (
+                  (NEW.amount_cash IS NOT NULL AND NEW.amount_cash > 0)
+                  OR (NEW.payment_method = 'Подарочный сертификат')
+                )
+              THEN
+                INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, happened_at)
+                VALUES (
+                  'income',
+                  COALESCE(NEW.payment_method, 'прочее'),
+                  COALESCE(NEW.amount_cash, 0),
+                  CONCAT('Поступление по заказу #', NEW.id),
+                  NEW.id,
+                  now()
+                )
+                RETURNING id INTO tx_id;
+
+                UPDATE orders SET income_tx_id = tx_id WHERE id = NEW.id;
+              END IF;
+
+              RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            DROP TRIGGER IF EXISTS orders_to_cashbook_ai ON orders;
+            CREATE TRIGGER orders_to_cashbook_ai
+            AFTER INSERT ON orders
+            FOR EACH ROW
+            EXECUTE FUNCTION trg_order_to_cashbook();
+            """
+        )
 
         # dry-run report (no changes), assumes CSV is already loaded into clients_raw
         rec = await conn.fetchrow(
@@ -737,6 +774,43 @@ async def import_leads(msg: Message):
             )
             await conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_clients_phone_digits ON clients (regexp_replace(COALESCE(phone,''),'[^0-9]+','','g'))"
+            )
+            await conn.execute(
+                """
+                CREATE OR REPLACE FUNCTION trg_order_to_cashbook() RETURNS trigger AS $$
+                DECLARE tx_id integer;
+                BEGIN
+                  IF
+                    NEW.income_tx_id IS NULL
+                    AND (
+                      (NEW.amount_cash IS NOT NULL AND NEW.amount_cash > 0)
+                      OR (NEW.payment_method = 'Подарочный сертификат')
+                    )
+                  THEN
+                    INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, happened_at)
+                    VALUES (
+                      'income',
+                      COALESCE(NEW.payment_method, 'прочее'),
+                      COALESCE(NEW.amount_cash, 0),
+                      CONCAT('Поступление по заказу #', NEW.id),
+                      NEW.id,
+                      now()
+                    )
+                    RETURNING id INTO tx_id;
+
+                    UPDATE orders SET income_tx_id = tx_id WHERE id = NEW.id;
+                  END IF;
+
+                  RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                DROP TRIGGER IF EXISTS orders_to_cashbook_ai ON orders;
+                CREATE TRIGGER orders_to_cashbook_ai
+                AFTER INSERT ON orders
+                FOR EACH ROW
+                EXECUTE FUNCTION trg_order_to_cashbook();
+                """
             )
 
             # Prepare cleaned and deduplicated datasets
