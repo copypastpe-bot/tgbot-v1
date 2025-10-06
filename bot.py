@@ -172,21 +172,33 @@ def parse_birthday_str(s: str | None) -> str | None:
     return None
 
 # Payment method normalizer (Python side to mirror SQL norm_pay_method)
+# ==== Payment constants (canonical labels) ====
+PAYMENT_METHODS = ["Карта Женя", "Карта Дима", "Наличные", "р/с"]
+GIFT_CERT_LABEL = "Подарочный сертификат"
+
 def norm_pay_method_py(p: str | None) -> str:
+    """
+    Map user input to canonical labels in PAYMENT_METHODS or GIFT_CERT_LABEL.
+    """
     if not p:
-        return 'прочее'
-    x = (p or '').strip().lower()
-    # collapse inner spaces
-    while '  ' in x:
-        x = x.replace('  ', ' ')
-    if 'нал' in x:
-        return 'наличные'
-    if x.startswith('карта дима') or x.startswith('дима'):
-        return 'карта дима'
-    if x.startswith('карта женя') or x.startswith('женя'):
-        return 'карта женя'
-    if 'р/с' in x or 'р\с' in x or 'расчет' in x or 'счет' in x:
-        return 'р/с'
+        return "прочее"
+    x = (p or "").strip().lower()
+    while "  " in x:
+        x = x.replace("  ", " ")
+    # gift certificate
+    if "подароч" in x:
+        return GIFT_CERT_LABEL
+    # cash
+    if "нал" in x:
+        return "Наличные"
+    # cards
+    if x.startswith("карта дима") or x.startswith("дима"):
+        return "Карта Дима"
+    if x.startswith("карта женя") or x.startswith("женя"):
+        return "Карта Женя"
+    # settlement account
+    if "р/с" in x or "р\с" in x or "расчет" in x or "расчёт" in x or "счет" in x or "счёт" in x:
+        return "р/с"
     return x
 
 async def set_commands():
