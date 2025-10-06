@@ -971,15 +971,38 @@ async def add_income(msg: Message):
         return await msg.answer(f"Ошибка: '{amount_str}' не является корректной суммой.")
 
     method = norm_pay_method_py(method_raw)
+    # попытка извлечь id заказа из комментария: понимаем "#123" или "order:123"
+    order_id = None
+    m = re.search(r"(?:^|\s)(?:order[:#]|#)(\d+)", comment, re.IGNORECASE)
+    if m:
+        try:
+            order_id = int(m.group(1))
+        except Exception:
+            order_id = None
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO cashbook_entries (kind, method, amount, comment) "
-            "VALUES ('income', $1, $2, $3)",
-            method, amount, comment
-        )
+        async with conn.transaction():
+            rec = await conn.fetchrow(
+                "INSERT INTO cashbook_entries (kind, method, amount, comment, order_id) "
+                "VALUES ('income', $1, $2, $3, $4) RETURNING id, happened_at",
+                method, amount, comment, order_id
+            )
+            if order_id is not None:
+                await conn.execute(
+                    "UPDATE orders SET income_tx_id = $1 WHERE id = $2",
+                    rec['id'], order_id
+                )
 
-    await msg.answer(f"✅ Приход\nСумма: {amount}₽\nТип оплаты: {method}\nКомментарий: {comment}")
+    lines = [
+        f"✅ Приход №{rec['id']}",
+        f"Сумма: {amount}₽",
+        f"Тип оплаты: {method}",
+        f"Когда: {rec['happened_at']:%Y-%m-%d %H:%M}",
+        f"Комментарий: {comment}",
+    ]
+    if order_id:
+        lines.insert(1, f"Заказ: #{order_id}")
+    await msg.answer("\n".join(lines))
 
 # ===== /expense admin command =====
 @dp.message(Command("expense"))
@@ -1005,13 +1028,67 @@ async def add_expense(msg: Message, command: CommandObject):
         return await msg.answer(f"Ошибка: '{amount_str}' не является корректной суммой.")
 
     async with pool.acquire() as conn:
-        await conn.execute(
+        rec = await conn.fetchrow(
             "INSERT INTO cashbook_entries (kind, method, amount, comment) "
-            "VALUES ('expense', 'прочее', $1, $2)",
+            "VALUES ('expense', 'прочее', $1, $2) RETURNING id, happened_at",
             amount, comment
         )
+    await msg.answer(
+        "\n".join([
+            f"✅ Расход №{rec['id']}",
+            f"Сумма: {amount}₽",
+            f"Когда: {rec['happened_at']:%Y-%m-%d %H:%M}",
+            f"Комментарий: {comment}",
+        ])
+    )
 
-    await msg.answer(f"✅ Расход {amount}₽ добавлен: {comment}")
+# ===== /tx_last admin command =====
+@dp.message(Command("tx_last"))
+async def tx_last(msg: Message):
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=1)
+    limit = 10
+    if len(parts) > 1 and parts[1].isdigit():
+        limit = max(1, min(50, int(parts[1])))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, kind, method, amount, comment, happened_at, COALESCE(is_deleted,false) AS del, order_id "
+            "FROM cashbook_entries ORDER BY id DESC LIMIT $1",
+            limit
+        )
+    if not rows:
+        return await msg.answer("Нет транзакций.")
+    lines = [
+        f"№{r['id']} | {'❌' if r['del'] else '✅'} | {r['kind']} | {r['amount']}₽ | {r['method'] or '-'} | "
+        f"{r['happened_at']:%Y-%m-%d %H:%M} | order=#{r['order_id']} | {r['comment'] or ''}"
+        for r in rows
+    ]
+    await msg.answer("Последние транзакции:\n" + "\n".join(lines))
+
+# ===== /tx_delete superadmin command =====
+@dp.message(Command("tx_delete"))
+async def tx_delete(msg: Message):
+    # only superadmin can delete transactions
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+    if role != 'superadmin':
+        return await msg.answer("Удаление транзакций доступно только суперадмину.")
+
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        return await msg.answer("Формат: /tx_delete <id>")
+    tx_id = int(parts[1].strip())
+
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow(
+            "UPDATE cashbook_entries SET is_deleted = TRUE, deleted_at = NOW() "
+            "WHERE id = $1 AND COALESCE(is_deleted, FALSE) = FALSE RETURNING id",
+            tx_id
+        )
+    if not rec:
+        return await msg.answer("Транзакция не найдена или уже удалена.")
+    await msg.answer(f"🗑️ Транзакция №{tx_id} помечена как удалённая.")
 
 @dp.message(Command("mysalary"))
 async def my_salary(msg: Message):
