@@ -171,11 +171,21 @@ def parse_birthday_str(s: str | None) -> str | None:
         return s
     return None
 
-# Payment method normalizer (Python side to mirror SQL norm_pay_method)
 # ==== Payment constants (canonical labels) ====
 PAYMENT_METHODS = ["Карта Женя", "Карта Дима", "Наличные", "р/с"]
 GIFT_CERT_LABEL = "Подарочный сертификат"
 
+def payment_method_kb() -> ReplyKeyboardMarkup:
+    btns = [KeyboardButton(text=m) for m in PAYMENT_METHODS + [GIFT_CERT_LABEL]]
+    # разместим в 2-3 ряда
+    rows = [
+        [btns[0], btns[1]],
+        [btns[2], btns[3]],
+        [btns[4]],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+# Payment method normalizer (Python side to mirror SQL norm_pay_method)
 def norm_pay_method_py(p: str | None) -> str:
     """
     Map user input to canonical labels in PAYMENT_METHODS or GIFT_CERT_LABEL.
@@ -1307,7 +1317,7 @@ class OrderFSM(StatesGroup):
     upsell_flag = State()
     upsell_amount = State()
     bonus_spend = State()
-    payment_method = State()
+    waiting_payment_method = State()
     maybe_bday = State()
     name_fix = State()
     confirm = State()
@@ -1464,16 +1474,11 @@ async def ask_bonus(msg: Message, state: FSMContext):
     # === Если бонусов нет к списанию — пропускаем шаг ===
     if balance <= 0 or bonus_max <= 0:
         await state.update_data(bonus_max=Decimal("0"), bonus_spent=Decimal("0"), amount_cash=amount)
-        await state.set_state(OrderFSM.payment_method)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="нал"), KeyboardButton(text="карта"), KeyboardButton(text="перевод")],
-                      [KeyboardButton(text="Отмена")]],
-            resize_keyboard=True
-        )
+        await state.set_state(OrderFSM.waiting_payment_method)
         return await msg.answer(
             "Бонусов нет — пропускаем списание.\n"
             f"Оплата деньгами: {amount}\nВыберите способ оплаты:",
-            reply_markup=kb
+            reply_markup=payment_method_kb()
         )
 
     # иначе — задаём выбор списания
@@ -1512,30 +1517,40 @@ async def got_bonus_spend(msg: Message, state: FSMContext):
     if cash_payment < MIN_CASH:
         return await msg.answer(f"Минимальная оплата деньгами {MIN_CASH}. Уменьшите списание бонусов.")
     await state.update_data(bonus_spent=spend, amount_cash=cash_payment)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="нал"), KeyboardButton(text="карта"), KeyboardButton(text="перевод")],
-                  [KeyboardButton(text="Отмена")]],
-        resize_keyboard=True
+    await state.set_state(OrderFSM.waiting_payment_method)
+    return await msg.answer(
+        f"Оплата деньгами: {cash_payment}\nВыберите способ оплаты:",
+        reply_markup=payment_method_kb()
     )
-    await state.set_state(OrderFSM.payment_method)
-    await msg.answer(f"Оплата деньгами: {cash_payment}\nВыберите способ оплаты:", reply_markup=kb)
 
-@dp.message(OrderFSM.payment_method, F.text.lower().in_(["нал","карта","перевод"]))
-async def got_method(msg: Message, state: FSMContext):
-    await state.update_data(payment_method=msg.text.lower())
+@dp.message(OrderFSM.waiting_payment_method, F.text)
+async def order_pick_method(msg: Message, state: FSMContext):
+    method_raw = (msg.text or "").strip()
+    method = norm_pay_method_py(method_raw)
+    allowed_methods = PAYMENT_METHODS + [GIFT_CERT_LABEL]
+    if method not in allowed_methods:
+        return await msg.answer("Выберите способ оплаты с клавиатуры.")
+
+    updates = {"payment_method": method}
+    if method == GIFT_CERT_LABEL:
+        updates["amount_cash"] = Decimal(0)
+    await state.update_data(**updates)
+
+    await msg.answer("Метод оплаты сохранён.", reply_markup=ReplyKeyboardRemove())
+
     data = await state.get_data()
     if data.get("birthday"):
         await state.set_state(OrderFSM.confirm)
         return await show_confirm(msg, state)
-    else:
-        await state.set_state(OrderFSM.maybe_bday)
-        return await msg.answer(
-            "Если знаете ДР клиента, введите ДД.ММ (или '-' чтобы пропустить):",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="-")], [KeyboardButton(text="Отмена")]],
-                resize_keyboard=True
-            )
+
+    await state.set_state(OrderFSM.maybe_bday)
+    return await msg.answer(
+        "Если знаете ДР клиента, введите ДД.ММ (или '-' чтобы пропустить):",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="-")], [KeyboardButton(text="Отмена")]],
+            resize_keyboard=True
         )
+    )
 
 @dp.message(OrderFSM.maybe_bday, F.text)
 async def got_bday(msg: Message, state: FSMContext):
