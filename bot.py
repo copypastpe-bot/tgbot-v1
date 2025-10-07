@@ -1174,7 +1174,7 @@ async def upload_clients_file(msg: Message, state: FSMContext):
             # bulk insert
             insert_sql = """
                 INSERT INTO clients_raw(full_name, phone, bonus_balance, birthday, address)
-                VALUES ($1, $2, $3, NULLIF($4,'')::date, $5)
+                VALUES ($1, $2, $3, $4, $5)
             """
             args = [(r["full_name"], r["phone"], r["bonus_balance"], r["birthday"], r["address"]) for r in rows]
             # execute many
