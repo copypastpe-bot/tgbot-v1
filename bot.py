@@ -1358,7 +1358,6 @@ class OrderFSM(StatesGroup):
     upsell_amount = State()
     bonus_spend = State()
     waiting_payment_method = State()
-    waiting_order_total = State()
     maybe_bday = State()
     name_fix = State()
     confirm = State()
@@ -1573,23 +1572,33 @@ async def order_pick_method(msg: Message, state: FSMContext):
         return await msg.answer("Выберите способ оплаты с клавиатуры.")
 
     if method == GIFT_CERT_LABEL:
-        await state.update_data(payment_method=method)
-        await state.set_state(OrderFSM.waiting_order_total)
-        return await msg.answer(
-            "Введите сумму чека (номинал сертификата), ₽",
+        data = await state.get_data()
+        amt_cash = data.get("amount_cash")
+        if amt_cash is None:
+            return await msg.answer("Сначала введите сумму чека, затем выберите способ оплаты.")
+        data["amount_total"] = amt_cash
+        data["amount_cash"] = Decimal(0)
+        data["payment_method"] = GIFT_CERT_LABEL
+        await state.update_data(**data)
+        await msg.answer(
+            "Выбран Подарочный сертификат. Сумма чека будет использована как номинал, в кассу поступит 0₽.",
             reply_markup=ReplyKeyboardRemove()
         )
+        return await proceed_order_finalize(msg, state)
 
     data = await state.get_data()
     amount_cash = Decimal(str(data.get("amount_cash", 0)))
-    await state.update_data(payment_method=method, amount_total=amount_cash)
+    if data.get("amount_total") is None and data.get("amount_cash") is not None:
+        data["amount_total"] = data["amount_cash"]
+    data["payment_method"] = method
+    await state.update_data(payment_method=method, amount_total=data.get("amount_total"))
 
     await msg.answer("Метод оплаты сохранён.", reply_markup=ReplyKeyboardRemove())
 
-    return await _proceed_after_payment_method(msg, state)
+    return await proceed_order_finalize(msg, state)
 
 
-async def _proceed_after_payment_method(msg: Message, state: FSMContext):
+async def proceed_order_finalize(msg: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("birthday"):
         await state.set_state(OrderFSM.confirm)
@@ -1604,22 +1613,6 @@ async def _proceed_after_payment_method(msg: Message, state: FSMContext):
         )
     )
 
-
-@dp.message(OrderFSM.waiting_order_total, F.text)
-async def order_enter_total(msg: Message, state: FSMContext):
-    txt = (msg.text or "").strip().replace(",", ".")
-    try:
-        total = Decimal(txt)
-        if total <= 0:
-            return await msg.answer("Сумма должна быть положительной. Введите сумму чека (номинал), ₽")
-    except Exception:
-        return await msg.answer("Не похоже на сумму. Введите сумму числом, ₽")
-
-    await state.update_data(amount_total=total, amount_cash=Decimal(0))
-
-    await msg.answer("Принял номинал сертификата. Продолжаем.")
-
-    return await _proceed_after_payment_method(msg, state)
 
 @dp.message(OrderFSM.maybe_bday, F.text)
 async def got_bday(msg: Message, state: FSMContext):
@@ -1672,10 +1665,15 @@ async def cancel_order(msg: Message, state: FSMContext):
 async def commit_order(msg: Message, state: FSMContext):
     data = await state.get_data()
     phone_in = data["phone_in"]
-    amount = Decimal(str(data["amount_total"]))
+    amount_cash = Decimal(str(data.get("amount_cash") or 0))
+    raw_total = data.get("amount_total")
+    if raw_total is None:
+        raw_total = amount_cash
+    amount_total = Decimal(str(raw_total))
+    payment_method = data.get("payment_method")
     upsell = Decimal(str(data.get("upsell_amount", 0)))
     bonus_spent = int(Decimal(str(data.get("bonus_spent", 0))))
-    cash_payment = Decimal(str(data["amount_cash"]))
+    cash_payment = amount_cash
     bonus_earned = int(Decimal(str(data["bonus_earned"])))
     base_pay = Decimal(str(data["base_pay"]))
     upsell_pay = Decimal(str(data["upsell_pay"]))
@@ -1705,8 +1703,8 @@ async def commit_order(msg: Message, state: FSMContext):
                 "       (SELECT id FROM staff WHERE tg_user_id=$2 AND is_active LIMIT 1), "
                 "       regexp_replace($3,'[^0-9]+','','g'), $4, $5, $6, $7, $8, $9) "
                 "RETURNING id",
-                client_id, msg.from_user.id, phone_in, amount, cash_payment, upsell,
-                bonus_spent, bonus_earned, data["payment_method"]
+                client_id, msg.from_user.id, phone_in, amount_total, cash_payment, upsell,
+                bonus_spent, bonus_earned, payment_method
             )
             order_id = order["id"]
 
