@@ -1955,31 +1955,35 @@ async def on_start(msg: Message):
 
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
+    # определяем роль из БД
+    global pool
+    role = None
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+
+    if role == "admin" or role == "superadmin":
+        lines = [
+            "Доступные команды (админ):",
+            "/reports — отчёты (диалог с кнопками)",
+            "/income <сумма> [тип] [коммент] — внести приход",
+            "/expense <сумма> [коммент] — внести расход",
+            "/withdraw — изъять наличные у мастера (диалог: выбрать мастера → указать сумму → комментарий)",
+            "/add_master <tg_user_id> — добавить мастера",
+            "/list_masters — список мастеров",
+            "/remove_master <tg_user_id> — деактивировать мастера",
+            "/whoami — мои права",
+        ]
+        return await msg.answer("\n".join(lines))
+
+    # по умолчанию — мастер и прочие роли
     lines = [
         "Доступные команды:",
-        "/reports — отчёты (диалог с кнопками)",
-        "/orders [period] [master:<tg>|master_id:<id>] — заказы за период",
-        "/cash [day|month|year|YYYY-MM|YYYY-MM-DD] — отчёт по кассе",
-        "/profit [day|month|year|YYYY-MM|YYYY-MM-DD] — отчёт по прибыли",
-        "/tx_last [N] — последние транзакции",
-        "/income <сумма> [тип] [коммент] — внести приход",
-        "/expense <сумма> [коммент] — внести расход",
-        "/withdraw — изъять наличные у мастера (диалог: выбрать мастера → указать сумму → комментарий)",
-        "/client_info <телефон> — карточка клиента",
-        "/client_set_name <телефон> <новое_имя>",
-        "/client_set_birthday <телефон> <ДД.ММ.ГГГГ|ГГГГ-ММ-ДД>",
-        "/client_set_bonus <телефон> <сумма>",
-        "/client_add_bonus <телефон> <дельта>",
-        "/client_set_phone <старый_телефон> <новый_телефон>",
-        "/add_master <tg_user_id> — добавить мастера",
-        "/list_masters — список мастеров",
-        "/remove_master <tg_user_id> — деактивировать мастера",
         "/whoami — мои права",
         "",
-        "Периоды: day | month | year | YYYY-MM | YYYY-MM-DD",
-        "Кнопка: «Отмена» — прервать текущий диалог.",
+        "Основные действия доступны через кнопки в чате.",
+        "Если что-то не работает — напишите администратору.",
     ]
-    await msg.answer("\n".join(lines))
+    return await msg.answer("\n".join(lines))
 
 # ---- /find ----
 @dp.message(Command("find"))
