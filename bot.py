@@ -231,6 +231,16 @@ def payment_method_kb() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
+
+def reports_root_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="Мастер/Заказы/Оплаты")],
+        [KeyboardButton(text="Мастер/Зарплата")],
+        [KeyboardButton(text="Прибыль"), KeyboardButton(text="Касса")],
+        [KeyboardButton(text="Отчёт по типам оплаты (WIP)")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
 # Payment method normalizer (Python side to mirror SQL norm_pay_method)
 def norm_pay_method_py(p: str | None) -> str:
     """
@@ -876,6 +886,137 @@ async def orders_report(msg: Message):
 
     await msg.answer("\n".join(lines))
 
+
+@dp.message(Command("reports"))
+async def reports_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_report"):
+        return await msg.answer("Только для администраторов.")
+    await msg.answer("Выберите отчёт:", reply_markup=reports_root_kb())
+    await state.set_state(ReportsFSM.waiting_root)
+
+
+@dp.message(ReportsFSM.waiting_root, F.text == "Мастер/Заказы/Оплаты")
+async def rep_master_orders_entry(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        masters = await conn.fetch(
+            "SELECT id, tg_user_id, coalesce(first_name,'') AS fn, coalesce(last_name,'') AS ln "
+            "FROM staff WHERE role IN ('master','admin') AND is_active ORDER BY id LIMIT 10"
+        )
+    if masters:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=f"{r['fn']} {r['ln']} | tg:{r['tg_user_id']}")] for r in masters] +
+                     [[KeyboardButton(text="Ввести tg id вручную")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await msg.answer("Выберите мастера или введите tg id:", reply_markup=kb)
+    else:
+        await msg.answer("Введите tg id мастера:")
+    await state.set_state(ReportsFSM.waiting_pick_master)
+
+
+@dp.message(ReportsFSM.waiting_pick_master)
+async def rep_master_pick(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+    m = re.search(r"tg:(\d+)", txt)
+    tg_id = None
+    if m:
+        tg_id = int(m.group(1))
+    elif txt.isdigit():
+        tg_id = int(txt)
+    if not tg_id:
+        return await msg.answer("Укажи tg id мастера (число).")
+    await state.update_data(master_tg=tg_id)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="день"),   KeyboardButton(text="неделя")],
+            [KeyboardButton(text="месяц"), KeyboardButton(text="год")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Выберите период:", reply_markup=kb)
+    await state.set_state(ReportsFSM.waiting_pick_period)
+
+
+@dp.message(ReportsFSM.waiting_pick_period)
+async def rep_master_period(msg: Message, state: FSMContext):
+    period = (msg.text or "").strip().lower()
+    if period not in ("день", "неделя", "месяц", "год"):
+        return await msg.answer("Выберите один из вариантов: день / неделя / месяц / год")
+
+    if period == "день":
+        start_sql = "date_trunc('day', NOW())"
+        end_sql = "date_trunc('day', NOW()) + interval '1 day'"
+        label = "за сегодня"
+    elif period == "неделя":
+        start_sql = "date_trunc('week', NOW())"
+        end_sql = "date_trunc('week', NOW()) + interval '1 week'"
+        label = "за неделю"
+    elif period == "месяц":
+        start_sql = "date_trunc('month', NOW())"
+        end_sql = "date_trunc('month', NOW()) + interval '1 month'"
+        label = "за месяц"
+    else:
+        start_sql = "date_trunc('year', NOW())"
+        end_sql = "date_trunc('year', NOW()) + interval '1 year'"
+        label = "за год"
+
+    data = await state.get_data()
+    tg_id = int(data["master_tg"])
+
+    async with pool.acquire() as conn:
+        mid = await conn.fetchval("SELECT id FROM staff WHERE tg_user_id=$1", tg_id)
+        if not mid:
+            await state.clear()
+            return await msg.answer("Мастер с таким tg id не найден.")
+
+        rec = await conn.fetchrow(
+            f"""
+            WITH scope AS (
+              SELECT o.*
+              FROM orders o
+              WHERE o.master_id = $1
+                AND o.created_at >= {start_sql}
+                AND o.created_at <  {end_sql}
+            )
+            SELECT
+              COUNT(*) AS cnt,
+              COALESCE(SUM(CASE WHEN payment_method='Наличные'              THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
+              COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
+              COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
+              COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
+              COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total
+            FROM scope;
+            """,
+            mid,
+        )
+
+        fio = await conn.fetchval(
+            "SELECT trim(coalesce(first_name,'')||' '||coalesce(last_name,'')) FROM staff WHERE id=$1",
+            mid,
+        )
+
+    lines = [
+        f"Мастер: {fio or '—'} ({tg_id}) — {label}",
+        f"Заказов выполнено: {rec['cnt']}"
+    ]
+    if rec["s_cash"] > 0:
+        lines.append(f"Оплачено наличными: {rec['s_cash']}₽")
+    if rec["s_card_jenya"] > 0:
+        lines.append(f"Оплачено Карта Женя: {rec['s_card_jenya']}₽")
+    if rec["s_card_dima"] > 0:
+        lines.append(f"Оплачено Карта Дима: {rec['s_card_dima']}₽")
+    if rec["s_rs"] > 0:
+        lines.append(f"Оплачено р/с: {rec['s_rs']}₽")
+    if rec["s_gift_total"] > 0:
+        lines.append(f"Оплачено сертификатом (номинал): {rec['s_gift_total']}₽")
+
+    lines.append(f"Итого на руках наличных (без изъятий): {rec['s_cash']}₽")
+
+    await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
+    await state.clear()
+
 # ===== Leads import (admin) =====
 @dp.message(Command("import_leads_dryrun"))
 async def import_leads_dryrun(msg: Message):
@@ -1264,6 +1405,12 @@ async def wipe_test_data(msg: Message):
 # ===== Admin: UPLOAD CSV TO clients_raw =====
 from aiogram.types import ContentType, FSInputFile
 from aiogram import types
+
+class ReportsFSM(StatesGroup):
+    waiting_root = State()
+    waiting_pick_master = State()
+    waiting_pick_period = State()
+
 
 class AddMasterFSM(StatesGroup):
     waiting_first_name = State()
