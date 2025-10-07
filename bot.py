@@ -191,7 +191,11 @@ async def _find_client_by_phone(conn: asyncpg.Connection, phone_input: str):
         return None
 
     rec = await conn.fetchrow(
-        "SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE phone_digits = ANY($1::text[])",
+        """
+        SELECT id, full_name, phone, birthday, bonus_balance, status
+        FROM clients
+        WHERE regexp_replace(COALESCE(phone,''), '[^0-9]+', '', 'g') = ANY($1::text[])
+        """,
         candidates,
     )
     return rec
