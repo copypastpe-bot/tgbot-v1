@@ -386,23 +386,27 @@ async def client_set_birthday(msg: Message):
         phone_q = parts[1].strip()
         bday_raw = parts[2].strip()
 
-        # 1) нормализация даты
-        bday_iso = parse_birthday_str(bday_raw)
-        if not bday_iso:
+        # 1) нормализация даты → Python date
+        bday_date = parse_birthday_str(bday_raw)
+        if not bday_date:
             return await msg.answer("Не распознал дату. Форматы: DD.MM.YYYY (допускаются 1-2 цифры) или YYYY-MM-DD.")
 
-        # 2) поиск клиента
+        # 2) поиск клиента и обновление
         async with pool.acquire() as conn:
             rec = await _find_client_by_phone(conn, phone_q)
             if not rec:
-                # для диагностики покажем, как разобрался номер
                 norm = normalize_phone_for_db(phone_q)
                 digits = re.sub(r"[^0-9]", "", norm or phone_q)
                 return await msg.answer(f"Клиент не найден по номеру.\nИскали: {phone_q}\nНормализовано: {norm}\nЦифры: {digits}")
 
-            # 3) апдейт
-        await conn.execute("UPDATE clients SET birthday=$1, last_updated=NOW() WHERE id=$2", bday_iso, rec["id"])
-            rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
+            await conn.execute(
+                "UPDATE clients SET birthday=$1, last_updated=NOW() WHERE id=$2",
+                bday_date, rec["id"]
+            )
+            rec2 = await conn.fetchrow(
+                "SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1",
+                rec["id"]
+            )
 
         return await msg.answer("ДР обновлён:\n" + _fmt_client_row(rec2))
 
@@ -471,7 +475,7 @@ async def client_set_phone(msg: Message):
             return await msg.answer("Клиент не найден по этому номеру.")
         try:
             await conn.execute("UPDATE clients SET phone=$1, last_updated=NOW() WHERE id=$2", new_phone_norm, rec["id"])
-        except asyncpg.UniqueViolationError:
+        except asyncpg.exceptions.UniqueViolationError:
             # конфликт по уникальному phone/phone_digits
             other = await conn.fetchrow(
                 "SELECT id, full_name FROM clients WHERE phone_digits = regexp_replace($1,'[^0-9]','','g') AND id <> $2",
