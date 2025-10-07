@@ -152,23 +152,31 @@ def qround_ruble(x: Decimal) -> Decimal:
 # Birthday parser: accepts DD.MM.YYYY or YYYY-MM-DD, returns ISO or None
 def parse_birthday_str(s: str | None) -> str | None:
     """
-    Accepts 'DD.MM.YYYY' or 'YYYY-MM-DD' (or empty/None) and returns ISO 'YYYY-MM-DD' or None.
-    Any other format returns None.
+    Accepts 'DD.MM.YYYY' or 'D.M.YYYY' (1-2 digits for day/month) or 'YYYY-MM-DD'.
+    Returns ISO 'YYYY-MM-DD' or None.
     """
     if not s:
         return None
     s = s.strip()
     if not s:
         return None
-    # try DD.MM.YYYY
-    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+    # try D.M.YYYY or DD.MM.YYYY
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
     if m:
         dd, mm, yyyy = m.groups()
-        return f"{yyyy}-{mm}-{dd}"
+        try:
+            d = date(int(yyyy), int(mm), int(dd))
+            return d.strftime("%Y-%m-%d")
+        except Exception:
+            return None
     # try YYYY-MM-DD
     m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
-        return s
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return d.strftime("%Y-%m-%d")
+        except Exception:
+            return None
     return None
 
 # ===== Client edit helpers =====
@@ -373,21 +381,36 @@ async def client_set_name(msg: Message):
 async def client_set_birthday(msg: Message):
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=2)
-    if len(parts) < 3:
-        return await msg.answer("Формат: /client_set_birthday <телефон> <ДР: DD.MM.YYYY или YYYY-MM-DD>")
-    phone_q = parts[1].strip()
-    bday_raw = parts[2].strip()
-    bday_iso = parse_birthday_str(bday_raw)
-    if not bday_iso:
-        return await msg.answer("Не распознал дату. Форматы: DD.MM.YYYY или YYYY-MM-DD.")
-    async with pool.acquire() as conn:
-        rec = await _find_client_by_phone(conn, phone_q)
-        if not rec:
-            return await msg.answer("Клиент не найден по этому номеру.")
-        await conn.execute("UPDATE clients SET birthday=$1::date, last_updated=NOW() WHERE id=$2", bday_iso, rec["id"])
-        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
-    return await msg.answer("ДР обновлён:\n" + _fmt_client_row(rec2))
+    try:
+        parts = msg.text.split(maxsplit=2)
+        if len(parts) < 3:
+            return await msg.answer("Формат: /client_set_birthday <телефон> <ДР: DD.MM.YYYY или YYYY-MM-DD>")
+        phone_q = parts[1].strip()
+        bday_raw = parts[2].strip()
+
+        # 1) нормализация даты
+        bday_iso = parse_birthday_str(bday_raw)
+        if not bday_iso:
+            return await msg.answer("Не распознал дату. Форматы: DD.MM.YYYY (допускаются 1-2 цифры) или YYYY-MM-DD.")
+
+        # 2) поиск клиента
+        async with pool.acquire() as conn:
+            rec = await _find_client_by_phone(conn, phone_q)
+            if not rec:
+                # для диагностики покажем, как разобрался номер
+                norm = normalize_phone_for_db(phone_q)
+                digits = re.sub(r"[^0-9]", "", norm or phone_q)
+                return await msg.answer(f"Клиент не найден по номеру.\nИскали: {phone_q}\nНормализовано: {norm}\nЦифры: {digits}")
+
+            # 3) апдейт
+            await conn.execute("UPDATE clients SET birthday=$1::date, last_updated=NOW() WHERE id=$2", bday_iso, rec["id"])
+            rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
+
+        return await msg.answer("ДР обновлён:\n" + _fmt_client_row(rec2))
+
+    except Exception as e:
+        logging.exception("client_set_birthday failed")
+        return await msg.answer(f"Ошибка при обновлении ДР: {e}")
 
 @dp.message(Command("client_set_bonus"))
 async def client_set_bonus(msg: Message):
