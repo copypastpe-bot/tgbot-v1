@@ -1719,6 +1719,11 @@ async def withdraw_start(msg: Message, state: FSMContext):
 
 @dp.message(WithdrawFSM.waiting_pick_master)
 async def withdraw_pick_master(msg: Message, state: FSMContext):
+    txt_cancel = (msg.text or "").strip().casefold()
+    if txt_cancel == "отмена":
+        await state.clear()
+        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+
     txt = (msg.text or "").strip()
     m = re.search(r"tg:(\d+)", txt)
     tg_id = None
@@ -1752,6 +1757,11 @@ async def withdraw_pick_master(msg: Message, state: FSMContext):
 
 @dp.message(WithdrawFSM.waiting_amount)
 async def withdraw_amount(msg: Message, state: FSMContext):
+    txt_cancel = (msg.text or "").strip().casefold()
+    if txt_cancel == "отмена":
+        await state.clear()
+        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+
     raw = (msg.text or "").strip().replace(" ", "").replace(",", ".")
     try:
         amount = Decimal(raw)
@@ -1774,6 +1784,11 @@ async def withdraw_amount(msg: Message, state: FSMContext):
 
 @dp.message(WithdrawFSM.waiting_comment)
 async def withdraw_comment(msg: Message, state: FSMContext):
+    txt_cancel = (msg.text or "").strip().casefold()
+    if txt_cancel == "отмена":
+        await state.clear()
+        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+
     comment = (msg.text or "").strip()
     if comment.lower() == "без комментария":
         comment = "Изъятие наличных"
