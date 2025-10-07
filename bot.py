@@ -150,31 +150,29 @@ def qround_ruble(x: Decimal) -> Decimal:
     return x.quantize(Decimal("1."), rounding=ROUND_DOWN)
 
 # Birthday parser: accepts DD.MM.YYYY or YYYY-MM-DD, returns ISO or None
-def parse_birthday_str(s: str | None) -> str | None:
+def parse_birthday_str(s: str | None) -> date | None:
     """
-    Accepts 'DD.MM.YYYY' or 'D.M.YYYY' (1-2 digits for day/month) or 'YYYY-MM-DD'.
-    Returns ISO 'YYYY-MM-DD' or None.
+    Accepts 'DD.MM.YYYY', 'D.M.YYYY' (1–2 digits) or 'YYYY-MM-DD'.
+    Returns Python date or None.
     """
     if not s:
         return None
     s = s.strip()
     if not s:
         return None
-    # try D.M.YYYY or DD.MM.YYYY
-    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
+    # try D.M.YYYY or DD.MM.YYYY (with optional spaces)
+    m = re.fullmatch(r"\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*\.\s*(\d{4})\s*", s)
     if m:
         dd, mm, yyyy = m.groups()
         try:
-            d = date(int(yyyy), int(mm), int(dd))
-            return d.strftime("%Y-%m-%d")
+            return date(int(yyyy), int(mm), int(dd))
         except Exception:
             return None
     # try YYYY-MM-DD
-    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+    m = re.fullmatch(r"\s*(\d{4})-(\d{2})-(\d{2})\s*", s)
     if m:
         try:
-            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            return d.strftime("%Y-%m-%d")
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except Exception:
             return None
     return None
@@ -403,7 +401,7 @@ async def client_set_birthday(msg: Message):
                 return await msg.answer(f"Клиент не найден по номеру.\nИскали: {phone_q}\nНормализовано: {norm}\nЦифры: {digits}")
 
             # 3) апдейт
-            await conn.execute("UPDATE clients SET birthday=$1::date, last_updated=NOW() WHERE id=$2", bday_iso, rec["id"])
+        await conn.execute("UPDATE clients SET birthday=$1, last_updated=NOW() WHERE id=$2", bday_iso, rec["id"])
             rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
 
         return await msg.answer("ДР обновлён:\n" + _fmt_client_row(rec2))
