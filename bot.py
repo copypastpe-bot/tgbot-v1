@@ -173,14 +173,26 @@ def parse_birthday_str(s: str | None) -> str | None:
 
 # ===== Client edit helpers =====
 async def _find_client_by_phone(conn: asyncpg.Connection, phone_input: str):
-    """Lookup client by any phone format using phone_digits unique index."""
-    digits = re.sub(r"[^0-9]", "", phone_input or "")
-    if not digits:
+    """Lookup client by any phone format. Accepts 8XXXXXXXXXX, +7XXXXXXXXXX, 9XXXXXXXXX, mixed text.
+    Uses normalize_phone_for_db first, then falls back to raw digits. Matches by phone_digits.
+    """
+    s = phone_input or ""
+    # normalized to +7XXXXXXXXXX if possible
+    norm = normalize_phone_for_db(s)
+    norm_digits = re.sub(r"[^0-9]", "", norm or "")
+    raw_digits = re.sub(r"[^0-9]", "", s)
+
+    candidates: list[str] = []
+    if norm_digits:
+        candidates.append(norm_digits)
+    if raw_digits and raw_digits != norm_digits:
+        candidates.append(raw_digits)
+    if not candidates:
         return None
-    # phone_digits is unique for non-empty values
+
     rec = await conn.fetchrow(
-        "SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE phone_digits = $1",
-        digits,
+        "SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE phone_digits = ANY($1::text[])",
+        candidates,
     )
     return rec
 
