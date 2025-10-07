@@ -926,6 +926,32 @@ async def rep_master_orders_entry(msg: Message, state: FSMContext):
     await state.set_state(ReportsFSM.waiting_pick_master)
 
 
+@dp.message(ReportsFSM.waiting_root, F.text.casefold() == "мастер/зарплата")
+async def rep_master_salary_entry(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        masters = await conn.fetch(
+            "SELECT id, tg_user_id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+            "FROM staff WHERE role IN ('master','admin') AND is_active ORDER BY id LIMIT 10"
+        )
+    if masters:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=f"{r['fn']} {r['ln']} | tg:{r['tg_user_id']}")] for r in masters] +
+                     [[KeyboardButton(text="Ввести tg id вручную")], [KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await msg.answer("Выберите мастера или введите tg id:", reply_markup=kb)
+    else:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await msg.answer("Введите tg id мастера:", reply_markup=kb)
+    await state.update_data(report_kind="master_salary")
+    await state.set_state(ReportsFSM.waiting_pick_master)
+
+
 @dp.message(ReportsFSM.waiting_root, F.text.casefold() == "типы оплат")
 async def rep_paytypes_entry(msg: Message, state: FSMContext):
     kb = ReplyKeyboardMarkup(
@@ -991,6 +1017,54 @@ async def rep_master_period(msg: Message, state: FSMContext):
 
     data = await state.get_data()
     report_kind = data.get("report_kind", "master_orders")
+
+    if report_kind == "master_salary":
+        tg_id = int(data["master_tg"])
+        async with pool.acquire() as conn:
+            mid = await conn.fetchval("SELECT id FROM staff WHERE tg_user_id=$1", tg_id)
+            if not mid:
+                await state.clear()
+                return await msg.answer("Мастер с таким tg id не найден.")
+
+            rec = await conn.fetchrow(
+                f"""
+                WITH ord AS (
+                  SELECT o.id
+                  FROM orders o
+                  WHERE o.master_id = $1
+                    AND o.created_at >= {start_sql}
+                    AND o.created_at <  {end_sql}
+                )
+                SELECT
+                  COUNT(*)                                   AS orders,
+                  COALESCE(SUM(pi.base_pay),   0)::numeric(12,2) AS base_pay,
+                  COALESCE(SUM(pi.fuel_pay),   0)::numeric(12,2) AS fuel_pay,
+                  COALESCE(SUM(pi.upsell_pay), 0)::numeric(12,2) AS upsell_pay,
+                  COALESCE(SUM(pi.total_pay),  0)::numeric(12,2) AS total_pay
+                FROM payroll_items pi
+                JOIN ord ON ord.id = pi.order_id
+                WHERE pi.master_id = $1;
+                """,
+                mid,
+            )
+            fio = await conn.fetchval(
+                "SELECT trim(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) FROM staff WHERE id=$1",
+                mid,
+            )
+
+        lines = [
+            f"Зарплата мастера: {fio or '—'} (tg:{tg_id}) — {label}",
+            f"Заказов: {rec['orders'] or 0}",
+            f"База: {rec['base_pay'] or 0}₽",
+            f"Бензин: {rec['fuel_pay'] or 0}₽",
+        ]
+        if (rec['upsell_pay'] or 0) > 0:
+            lines.append(f"Доп. услуги: {rec['upsell_pay']}₽")
+        lines.append(f"Итого к выплате: {rec['total_pay'] or 0}₽")
+
+        await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
+        await state.clear()
+        return
 
     if report_kind == "paytypes":
         async with pool.acquire() as conn:
@@ -1419,44 +1493,42 @@ async def db_apply_cash_trigger(msg: Message):
     if role != 'superadmin':
         return await msg.answer("Эта команда доступна только суперадмину.")
     sql = """
-    CREATE OR REPLACE FUNCTION trg_order_to_cashbook() RETURNS trigger AS $$
-    DECLARE tx_id integer;
+    DO $$
     BEGIN
-      IF
-        NEW.income_tx_id IS NULL
-        AND (
-          (NEW.amount_cash IS NOT NULL AND NEW.amount_cash > 0)
-          OR (NEW.payment_method = 'Подарочный сертификат')
-        )
-      THEN
-        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, happened_at)
-        VALUES (
-          'income',
-          COALESCE(NEW.payment_method, 'прочее'),
-          COALESCE(NEW.amount_cash, 0),
-          CONCAT('Поступление по заказу #', NEW.id),
-          NEW.id,
-          now()
-        )
-        RETURNING id INTO tx_id;
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='cashbook_entries' AND column_name='master_id'
+      ) THEN
+        ALTER TABLE cashbook_entries ADD COLUMN master_id integer REFERENCES staff(id);
+        CREATE INDEX IF NOT EXISTS ix_cashbook_master ON cashbook_entries(master_id);
+      END IF;
+    END$$;
 
-        UPDATE orders SET income_tx_id = tx_id WHERE id = NEW.id;
+    CREATE OR REPLACE FUNCTION orders_to_cashbook_ai()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF NEW.payment_method = 'Подарочный сертификат' THEN
+        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+        VALUES ('income', NEW.payment_method, 0, 'Поступление по заказу (сертификат)', NEW.id, NEW.master_id, NEW.created_at);
+        RETURN NEW;
       END IF;
 
+      INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+      VALUES ('income', NEW.payment_method, COALESCE(NEW.amount_cash,0), 'Поступление по заказу', NEW.id, NEW.master_id, NEW.created_at);
       RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
+    END$$;
 
-    DROP TRIGGER IF EXISTS orders_to_cashbook_ai ON orders;
-
-    CREATE TRIGGER orders_to_cashbook_ai
+    DROP TRIGGER IF EXISTS trg_orders_to_cashbook ON orders;
+    CREATE TRIGGER trg_orders_to_cashbook
     AFTER INSERT ON orders
     FOR EACH ROW
-    EXECUTE FUNCTION trg_order_to_cashbook();
+    EXECUTE FUNCTION orders_to_cashbook_ai();
     """
     async with pool.acquire() as conn:
         await conn.execute(sql)
-    await msg.answer("✅ Функция и триггер `orders_to_cashbook_ai` обновлены успешно.")
+    await msg.answer("✅ Колонка master_id, функция и триггер `orders_to_cashbook_ai` обновлены.")
 # ===== Admin: WIPE TEST DATA =====
 @dp.message(Command("wipe_test_data"))
 async def wipe_test_data(msg: Message):
