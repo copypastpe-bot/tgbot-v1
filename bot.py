@@ -7,6 +7,17 @@ from aiogram.types import Message, BotCommand, BotCommandScopeDefault, ReplyKeyb
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+
+# ===== FSM State Groups =====
+class AddMasterFSM(StatesGroup):
+    waiting_first_name = State()
+    waiting_last_name  = State()
+    waiting_phone      = State()
+
+class ReportsFSM(StatesGroup):
+    waiting_root        = State()
+    waiting_pick_master = State()
+    waiting_pick_period = State()
 from dotenv import load_dotenv
 
 import asyncpg
@@ -894,8 +905,7 @@ async def reports_start(msg: Message, state: FSMContext):
     await msg.answer("Выберите отчёт:", reply_markup=reports_root_kb())
     await state.set_state(ReportsFSM.waiting_root)
 
-
-@dp.message(ReportsFSM.waiting_root, F.text == "Мастер/Заказы/Оплаты")
+@dp.message(ReportsFSM.waiting_root, F.text.casefold() == "мастер/заказы/оплаты")
 async def rep_master_orders_entry(msg: Message, state: FSMContext):
     async with pool.acquire() as conn:
         masters = await conn.fetch(
