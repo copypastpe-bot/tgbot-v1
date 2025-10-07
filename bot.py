@@ -702,6 +702,151 @@ async def profit_report(msg: Message):
 
     await msg.answer("\n".join(lines))
 
+
+@dp.message(Command("orders"))
+async def orders_report(msg: Message):
+    if not await has_permission(msg.from_user.id, "view_orders_report"):
+        return await msg.answer("Только для администраторов.")
+
+    # Форматы:
+    # /orders                         -> сегодня
+    # /orders day|month|year          -> текущий период
+    # /orders YYYY-MM                 -> конкретный месяц
+    # /orders YYYY-MM-DD              -> конкретный день
+    # Дополнительно: master:<tg_id>   -> фильтр по мастеру (tg_user_id)
+    #                master_id:<id>   -> фильтр по staff.id
+    # /orders 2025-10 master:123456
+
+    txt = (msg.text or "")
+    parts = txt.split()
+    # parts[0] = '/orders'
+    args = parts[1:] if len(parts) > 1 else []
+
+    # разбор периода
+    period_arg = args[0].lower() if args else "day"
+    mday = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", period_arg)
+    mmon = re.fullmatch(r"(\d{4})-(\d{2})", period_arg)
+
+    def trunc(unit: str) -> str:
+        return f"date_trunc('{unit}', NOW())"
+
+    if period_arg in ("day","month","year"):
+        period_label = {"day":"сегодня", "month":"текущий месяц", "year":"текущий год"}[period_arg]
+        unit = period_arg
+        start_sql = trunc(unit)
+        end_sql   = f"{trunc(unit)} + interval '1 {unit}'"
+        rest_args = args[1:]
+    elif mday:
+        y,m,d = map(int, mday.groups())
+        period_label = f"{y:04d}-{m:02d}-{d:02d}"
+        start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-{d:02d} 00:00:00+00'"
+        end_sql   = f"{start_sql} + interval '1 day'"
+        rest_args = args[1:]
+    elif mmon:
+        y,m = map(int, mmon.groups())
+        period_label = f"{y:04d}-{m:02d}"
+        start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-01 00:00:00+00'"
+        end_sql   = f"{start_sql} + interval '1 month'"
+        rest_args = args[1:]
+    else:
+        # периода нет в начале — считаем, что period=day, а все args — дальше
+        period_label = "сегодня"
+        start_sql = trunc("day")
+        end_sql   = f"{trunc('day')} + interval '1 day'"
+        rest_args = args
+
+    # фильтры по мастеру
+    master_tg = None
+    master_id = None
+    for a in rest_args:
+        a = a.strip()
+        if a.startswith("master:"):
+            try:
+                master_tg = int(a.split(":",1)[1])
+            except Exception:
+                pass
+        elif a.startswith("master_id:"):
+            try:
+                master_id = int(a.split(":",1)[1])
+            except Exception:
+                pass
+
+    where_master = "TRUE"
+    params = []
+    if master_id is not None:
+        where_master = "o.master_id = $1"
+        params.append(master_id)
+    elif master_tg is not None:
+        where_master = "s.tg_user_id = $1"
+        params.append(master_tg)
+
+    # ограничение на список последних заказов
+    limit = 20
+
+    async with pool.acquire() as conn:
+        # итоги по периоду
+        totals = await conn.fetchrow(
+            f"""
+            SELECT
+              COUNT(*)                               AS orders_cnt,
+              COALESCE(SUM(o.amount_cash),  0)::numeric(12,2)  AS money_cash,
+              COALESCE(SUM(o.amount_total), 0)::numeric(12,2)  AS nominal_total
+            FROM orders o
+            LEFT JOIN staff s ON s.id = o.master_id
+            WHERE o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+              AND {where_master};
+            """,
+            *params
+        )
+
+        # последние N заказов
+        rows = await conn.fetch(
+            f"""
+            SELECT
+              o.id,
+              o.created_at AT TIME ZONE 'UTC' AS created_utc,
+              COALESCE(c.full_name,'—') AS client_name,
+              s.tg_user_id               AS master_tg,
+              o.payment_method,
+              o.amount_cash::numeric(12,2)  AS cash,
+              o.amount_total::numeric(12,2) AS total
+            FROM orders o
+            LEFT JOIN clients c ON c.id = o.client_id
+            LEFT JOIN staff   s ON s.id = o.master_id
+            WHERE o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+              AND {where_master}
+            ORDER BY o.created_at DESC
+            LIMIT {limit};
+            """,
+            *params
+        )
+
+    cnt   = totals["orders_cnt"] or 0
+    money = totals["money_cash"] or 0
+    nomin = totals["nominal_total"] or 0
+
+    header = [f"Заказы за {period_label}:"]
+    if master_id is not None:
+        header.append(f"(фильтр: master_id={master_id})")
+    elif master_tg is not None:
+        header.append(f"(фильтр: master={master_tg})")
+    header.append(f"Всего: {cnt} | Деньги: {money}₽ | Номинал: {nomin}₽")
+
+    lines = [" ".join(header)]
+    if rows:
+        lines.append("\nПоследние заказы:")
+        for r in rows:
+            dt = r["created_utc"].strftime("%Y-%m-%d %H:%M")
+            lines.append(
+                f"#{r['id']} | {dt} | {r['client_name']} | m:{r['master_tg']} | {r['payment_method']} | {r['cash']}₽/{r['total']}₽"
+            )
+    else:
+        lines.append("Данных нет.")
+
+    await msg.answer("\n".join(lines))
+
 # ===== Leads import (admin) =====
 @dp.message(Command("import_leads_dryrun"))
 async def import_leads_dryrun(msg: Message):
