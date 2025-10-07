@@ -248,7 +248,7 @@ def reports_root_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Мастер/Заказы/Оплаты")],
         [KeyboardButton(text="Мастер/Зарплата")],
         [KeyboardButton(text="Прибыль"), KeyboardButton(text="Касса")],
-        [KeyboardButton(text="Отчёт по типам оплаты (WIP)")],
+        [KeyboardButton(text="Типы оплат")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
@@ -839,10 +839,9 @@ async def orders_report(msg: Message):
             f"""
             SELECT
               COUNT(*)                               AS orders_cnt,
-              COALESCE(SUM(o.amount_cash),  0)::numeric(12,2)  AS money_cash,
-              COALESCE(SUM(o.amount_total), 0)::numeric(12,2)  AS nominal_total
+              COALESCE(SUM(o.amount_cash),  0)::numeric(12,2) AS money_cash,
+              COALESCE(SUM(CASE WHEN o.payment_method='Подарочный сертификат' THEN o.amount_total ELSE 0 END), 0)::numeric(12,2) AS gift_total
             FROM orders o
-            LEFT JOIN staff s ON s.id = o.master_id
             WHERE o.created_at >= {start_sql}
               AND o.created_at <  {end_sql}
               AND {where_master};
@@ -875,14 +874,16 @@ async def orders_report(msg: Message):
 
     cnt   = totals["orders_cnt"] or 0
     money = totals["money_cash"] or 0
-    nomin = totals["nominal_total"] or 0
+    gift  = totals["gift_total"] or 0
 
     header = [f"Заказы за {period_label}:"]
     if master_id is not None:
         header.append(f"(фильтр: master_id={master_id})")
     elif master_tg is not None:
         header.append(f"(фильтр: master={master_tg})")
-    header.append(f"Всего: {cnt} | Деньги: {money}₽ | Номинал: {nomin}₽")
+    header.append(f"Всего: {cnt} | Деньги: {money}₽")
+    if gift and gift > 0:
+        header.append(f"(сертификатами: {gift}₽)")
 
     lines = [" ".join(header)]
     if rows:
@@ -923,6 +924,22 @@ async def rep_master_orders_entry(msg: Message, state: FSMContext):
     else:
         await msg.answer("Введите tg id мастера:")
     await state.set_state(ReportsFSM.waiting_pick_master)
+
+
+@dp.message(ReportsFSM.waiting_root, F.text.casefold() == "типы оплат")
+async def rep_paytypes_entry(msg: Message, state: FSMContext):
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="день"),   KeyboardButton(text="неделя")],
+            [KeyboardButton(text="месяц"), KeyboardButton(text="год")],
+            [KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await state.update_data(report_kind="paytypes")
+    await msg.answer("Выберите период:", reply_markup=kb)
+    await state.set_state(ReportsFSM.waiting_pick_period)
 
 
 @dp.message(ReportsFSM.waiting_pick_master)
@@ -973,6 +990,48 @@ async def rep_master_period(msg: Message, state: FSMContext):
         label = "за год"
 
     data = await state.get_data()
+    report_kind = data.get("report_kind", "master_orders")
+
+    if report_kind == "paytypes":
+        async with pool.acquire() as conn:
+            rec = await conn.fetchrow(
+                f"""
+                SELECT
+                  COALESCE(SUM(CASE WHEN payment_method='Наличные'     THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
+                  COALESCE(SUM(CASE WHEN payment_method='Карта Женя'   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
+                  COALESCE(SUM(CASE WHEN payment_method='Карта Дима'   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
+                  COALESCE(SUM(CASE WHEN payment_method='р/с'          THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
+                  COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total,
+                  COALESCE(SUM(CASE WHEN payment_method='Наличные'     THEN 1 ELSE 0 END),0) AS c_cash,
+                  COALESCE(SUM(CASE WHEN payment_method='Карта Женя'   THEN 1 ELSE 0 END),0) AS c_card_jenya,
+                  COALESCE(SUM(CASE WHEN payment_method='Карта Дима'   THEN 1 ELSE 0 END),0) AS c_card_dima,
+                  COALESCE(SUM(CASE WHEN payment_method='р/с'          THEN 1 ELSE 0 END),0) AS c_rs,
+                  COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN 1 ELSE 0 END),0) AS c_gift
+                FROM orders
+                WHERE created_at >= {start_sql} AND created_at < {end_sql};
+                """
+            )
+
+        lines = [f"Типы оплат — {label}:"]
+
+        total_money = (rec['s_cash'] or 0) + (rec['s_card_jenya'] or 0) + (rec['s_card_dima'] or 0) + (rec['s_rs'] or 0)
+        if rec['c_cash'] > 0:
+            lines.append(f"Наличные: {rec['s_cash']}₽ ({rec['c_cash']})")
+        if rec['c_card_jenya'] > 0:
+            lines.append(f"Карта Женя: {rec['s_card_jenya']}₽ ({rec['c_card_jenya']})")
+        if rec['c_card_dima'] > 0:
+            lines.append(f"Карта Дима: {rec['s_card_dima']}₽ ({rec['c_card_dima']})")
+        if rec['c_rs'] > 0:
+            lines.append(f"р/с: {rec['s_rs']}₽ ({rec['c_rs']})")
+        if rec['c_gift'] > 0:
+            lines.append(f"Подарочный сертификат: {rec['s_gift_total']}₽ ({rec['c_gift']})")
+
+        lines.append(f"Итого денег: {total_money}₽")
+
+        await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
+        await state.clear()
+        return
+
     tg_id = int(data["master_tg"])
 
     async with pool.acquire() as conn:
@@ -1027,7 +1086,7 @@ async def rep_master_period(msg: Message, state: FSMContext):
     if rec["s_rs"] > 0:
         lines.append(f"Оплачено р/с: {rec['s_rs']}₽")
     if rec["s_gift_total"] > 0:
-        lines.append(f"Оплачено сертификатом (номинал): {rec['s_gift_total']}₽")
+        lines.append(f"Оплачено сертификатом: {rec['s_gift_total']}₽")
 
     withdrawn = rec["withdrawn"] or Decimal(0)
     on_hand = (rec["s_cash"] or Decimal(0)) - withdrawn
