@@ -806,7 +806,7 @@ async def orders_report(msg: Message):
         where_master = "o.master_id = $1"
         params.append(master_id)
     elif master_tg is not None:
-        where_master = "s.tg_user_id = $1"
+        where_master = "o.master_id = (SELECT id FROM staff WHERE tg_user_id = $1)"
         params.append(master_tg)
 
     # ограничение на список последних заказов
