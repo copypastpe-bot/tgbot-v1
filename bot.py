@@ -989,6 +989,12 @@ async def rep_master_period(msg: Message, state: FSMContext):
               WHERE o.master_id = $1
                 AND o.created_at >= {start_sql}
                 AND o.created_at <  {end_sql}
+            ),
+            w AS (
+              SELECT COALESCE(SUM(c.amount),0)::numeric(12,2) AS withdrawn
+              FROM cashbook_entries c
+              WHERE c.kind='expense' AND c.method='Изъятие' AND c.master_id=$1
+                AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
             )
             SELECT
               COUNT(*) AS cnt,
@@ -996,7 +1002,8 @@ async def rep_master_period(msg: Message, state: FSMContext):
               COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
               COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
               COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
-              COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total
+              COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total,
+              (SELECT withdrawn FROM w) AS withdrawn
             FROM scope;
             """,
             mid,
@@ -1022,7 +1029,11 @@ async def rep_master_period(msg: Message, state: FSMContext):
     if rec["s_gift_total"] > 0:
         lines.append(f"Оплачено сертификатом (номинал): {rec['s_gift_total']}₽")
 
-    lines.append(f"Итого на руках наличных (без изъятий): {rec['s_cash']}₽")
+    withdrawn = rec["withdrawn"] or Decimal(0)
+    on_hand = (rec["s_cash"] or Decimal(0)) - withdrawn
+    if withdrawn and withdrawn > 0:
+        lines.append(f"Изъято у мастера: {withdrawn}₽")
+    lines.append(f"Итого на руках наличных: {on_hand}₽")
 
     await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
     await state.clear()
