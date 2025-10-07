@@ -1358,6 +1358,7 @@ class OrderFSM(StatesGroup):
     upsell_amount = State()
     bonus_spend = State()
     waiting_payment_method = State()
+    waiting_order_total = State()
     maybe_bday = State()
     name_fix = State()
     confirm = State()
@@ -1571,13 +1572,24 @@ async def order_pick_method(msg: Message, state: FSMContext):
     if method not in allowed_methods:
         return await msg.answer("Выберите способ оплаты с клавиатуры.")
 
-    updates = {"payment_method": method}
     if method == GIFT_CERT_LABEL:
-        updates["amount_cash"] = Decimal(0)
-    await state.update_data(**updates)
+        await state.update_data(payment_method=method)
+        await state.set_state(OrderFSM.waiting_order_total)
+        return await msg.answer(
+            "Введите сумму чека (номинал сертификата), ₽",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+    data = await state.get_data()
+    amount_cash = Decimal(str(data.get("amount_cash", 0)))
+    await state.update_data(payment_method=method, amount_total=amount_cash)
 
     await msg.answer("Метод оплаты сохранён.", reply_markup=ReplyKeyboardRemove())
 
+    return await _proceed_after_payment_method(msg, state)
+
+
+async def _proceed_after_payment_method(msg: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("birthday"):
         await state.set_state(OrderFSM.confirm)
@@ -1591,6 +1603,23 @@ async def order_pick_method(msg: Message, state: FSMContext):
             resize_keyboard=True
         )
     )
+
+
+@dp.message(OrderFSM.waiting_order_total, F.text)
+async def order_enter_total(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip().replace(",", ".")
+    try:
+        total = Decimal(txt)
+        if total <= 0:
+            return await msg.answer("Сумма должна быть положительной. Введите сумму чека (номинал), ₽")
+    except Exception:
+        return await msg.answer("Не похоже на сумму. Введите сумму числом, ₽")
+
+    await state.update_data(amount_total=total, amount_cash=Decimal(0))
+
+    await msg.answer("Принял номинал сертификата. Продолжаем.")
+
+    return await _proceed_after_payment_method(msg, state)
 
 @dp.message(OrderFSM.maybe_bday, F.text)
 async def got_bday(msg: Message, state: FSMContext):
@@ -1609,8 +1638,10 @@ async def show_confirm(msg: Message, state: FSMContext):
     upsell = Decimal(str(data.get("upsell_amount", 0)))
     bonus_spent = Decimal(str(data.get("bonus_spent", 0)))
     cash_payment = Decimal(str(data["amount_cash"]))
+    payment_method = data.get("payment_method")
+    gross = amount if payment_method == GIFT_CERT_LABEL else cash_payment
     bonus_earned = qround_ruble(cash_payment * BONUS_RATE)
-    base_pay = qround_ruble(cash_payment * (MASTER_PER_3000 / Decimal(3000)))
+    base_pay = qround_ruble(gross * (MASTER_PER_3000 / Decimal(3000)))
     if base_pay < Decimal("1000"):
         base_pay = Decimal("1000")
     upsell_pay = qround_ruble(upsell * (UPSELL_PER_3000 / Decimal(3000)))
