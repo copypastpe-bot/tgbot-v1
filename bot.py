@@ -171,6 +171,30 @@ def parse_birthday_str(s: str | None) -> str | None:
         return s
     return None
 
+# ===== Client edit helpers =====
+async def _find_client_by_phone(conn: asyncpg.Connection, phone_input: str):
+    """Lookup client by any phone format using phone_digits unique index."""
+    digits = re.sub(r"[^0-9]", "", phone_input or "")
+    if not digits:
+        return None
+    # phone_digits is unique for non-empty values
+    rec = await conn.fetchrow(
+        "SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE phone_digits = $1",
+        digits,
+    )
+    return rec
+
+def _fmt_client_row(rec) -> str:
+    bday = rec["birthday"].strftime("%Y-%m-%d") if rec["birthday"] else "—"
+    return "\n".join([
+        f"id: {rec['id']}",
+        f"Имя: {rec['full_name'] or '—'}",
+        f"Телефон: {rec['phone'] or '—'}",
+        f"ДР: {bday}",
+        f"Бонусы: {rec['bonus_balance']}",
+        f"Статус: {rec['status']}",
+    ])
+
 # ==== Payment constants (canonical labels) ====
 PAYMENT_METHODS = ["Карта Женя", "Карта Дима", "Наличные", "р/с"]
 GIFT_CERT_LABEL = "Подарочный сертификат"
@@ -296,6 +320,131 @@ async def whoami(msg: Message):
             ("Права: " + (", ".join(perms) if perms else "—"))
         ])
     )
+
+# ===== Client admin edit commands =====
+@dp.message(Command("client_info"))
+async def client_info(msg: Message):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await msg.answer("Формат: /client_info <телефон>")
+    phone_q = parts[1].strip()
+    async with pool.acquire() as conn:
+        rec = await _find_client_by_phone(conn, phone_q)
+    if not rec:
+        return await msg.answer("Клиент не найден по этому номеру.")
+    return await msg.answer(_fmt_client_row(rec))
+
+@dp.message(Command("client_set_name"))
+async def client_set_name(msg: Message):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await msg.answer("Формат: /client_set_name <телефон> <новое_имя>")
+    phone_q = parts[1].strip()
+    new_name = parts[2].strip()
+    async with pool.acquire() as conn:
+        rec = await _find_client_by_phone(conn, phone_q)
+        if not rec:
+            return await msg.answer("Клиент не найден по этому номеру.")
+        await conn.execute("UPDATE clients SET full_name=$1, last_updated=NOW() WHERE id=$2", new_name, rec["id"])
+        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
+    return await msg.answer("Имя обновлено:\n" + _fmt_client_row(rec2))
+
+@dp.message(Command("client_set_birthday"))
+async def client_set_birthday(msg: Message):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await msg.answer("Формат: /client_set_birthday <телефон> <ДР: DD.MM.YYYY или YYYY-MM-DD>")
+    phone_q = parts[1].strip()
+    bday_raw = parts[2].strip()
+    bday_iso = parse_birthday_str(bday_raw)
+    if not bday_iso:
+        return await msg.answer("Не распознал дату. Форматы: DD.MM.YYYY или YYYY-MM-DD.")
+    async with pool.acquire() as conn:
+        rec = await _find_client_by_phone(conn, phone_q)
+        if not rec:
+            return await msg.answer("Клиент не найден по этому номеру.")
+        await conn.execute("UPDATE clients SET birthday=$1::date, last_updated=NOW() WHERE id=$2", bday_iso, rec["id"])
+        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
+    return await msg.answer("ДР обновлён:\n" + _fmt_client_row(rec2))
+
+@dp.message(Command("client_set_bonus"))
+async def client_set_bonus(msg: Message):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await msg.answer("Формат: /client_set_bonus <телефон> <сумма_баллов>")
+    phone_q = parts[1].strip()
+    try:
+        amount = int(parts[2].strip())
+    except Exception:
+        return await msg.answer("Сумма должна быть целым числом.")
+    async with pool.acquire() as conn:
+        rec = await _find_client_by_phone(conn, phone_q)
+        if not rec:
+            return await msg.answer("Клиент не найден по этому номеру.")
+        await conn.execute("UPDATE clients SET bonus_balance=$1, last_updated=NOW() WHERE id=$2", amount, rec["id"])
+        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
+    return await msg.answer("Бонусы установлены:\n" + _fmt_client_row(rec2))
+
+@dp.message(Command("client_add_bonus"))
+async def client_add_bonus(msg: Message):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await msg.answer("Формат: /client_add_bonus <телефон> <дельта>")
+    phone_q = parts[1].strip()
+    try:
+        delta = int(parts[2].strip())
+    except Exception:
+        return await msg.answer("Дельта должна быть целым числом (можно со знаком -/+).")
+    async with pool.acquire() as conn:
+        rec = await _find_client_by_phone(conn, phone_q)
+        if not rec:
+            return await msg.answer("Клиент не найден по этому номеру.")
+        new_bonus = int(rec["bonus_balance"] or 0) + delta
+        if new_bonus < 0:
+            new_bonus = 0
+        await conn.execute("UPDATE clients SET bonus_balance=$1, last_updated=NOW() WHERE id=$2", new_bonus, rec["id"])
+        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
+    return await msg.answer("Бонусы обновлены:\n" + _fmt_client_row(rec2))
+
+@dp.message(Command("client_set_phone"))
+async def client_set_phone(msg: Message):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await msg.answer("Формат: /client_set_phone <старый_телефон> <новый_телефон>")
+    phone_q = parts[1].strip()
+    new_phone_raw = parts[2].strip()
+    new_phone_norm = normalize_phone_for_db(new_phone_raw)
+    if not new_phone_norm or not new_phone_norm.startswith("+7") or len(re.sub(r"[^0-9]", "", new_phone_norm)) != 11:
+        return await msg.answer("Не распознал новый телефон. Пример: +7XXXXXXXXXX")
+    async with pool.acquire() as conn:
+        rec = await _find_client_by_phone(conn, phone_q)
+        if not rec:
+            return await msg.answer("Клиент не найден по этому номеру.")
+        try:
+            await conn.execute("UPDATE clients SET phone=$1, last_updated=NOW() WHERE id=$2", new_phone_norm, rec["id"])
+        except asyncpg.UniqueViolationError:
+            # конфликт по уникальному phone/phone_digits
+            other = await conn.fetchrow(
+                "SELECT id, full_name FROM clients WHERE phone_digits = regexp_replace($1,'[^0-9]','','g') AND id <> $2",
+                new_phone_norm, rec["id"]
+            )
+            if other:
+                return await msg.answer(f"Номер уже используется клиентом id={other['id']} ({other['full_name'] or '—'}).")
+            return await msg.answer("Номер уже используется другим клиентом.")
+        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
+    return await msg.answer("Телефон обновлён:\n" + _fmt_client_row(rec2))
 
 # ===== /payroll admin command =====
 @dp.message(Command("payroll"))
