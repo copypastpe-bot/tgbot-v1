@@ -278,7 +278,7 @@ async def list_masters(msg: Message):
     await msg.answer("Мастера/админы:\n" + "\n".join(lines))
 
 @dp.message(Command("add_master"))
-async def add_master(msg: Message):
+async def add_master(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
@@ -288,13 +288,42 @@ async def add_master(msg: Message):
         target_id = int(parts[1].lstrip("@"))
     except Exception:
         return await msg.answer("Нужно указать числовой tg_user_id.")
+    await state.clear()
+    await state.update_data(tg_id=target_id)
+    await state.set_state(AddMasterFSM.waiting_first_name)
+    await msg.answer("Имя мастера:")
+
+
+@dp.message(AddMasterFSM.waiting_first_name)
+async def add_master_first(msg: Message, state: FSMContext):
+    await state.update_data(first_name=(msg.text or "").strip())
+    await state.set_state(AddMasterFSM.waiting_last_name)
+    await msg.answer("Фамилия мастера:")
+
+
+@dp.message(AddMasterFSM.waiting_last_name)
+async def add_master_last(msg: Message, state: FSMContext):
+    await state.update_data(last_name=(msg.text or "").strip())
+    await state.set_state(AddMasterFSM.waiting_phone)
+    await msg.answer("Телефон мастера (формат: +7XXXXXXXXXX или 8/9...):")
+
+
+@dp.message(AddMasterFSM.waiting_phone)
+async def add_master_phone(msg: Message, state: FSMContext):
+    phone_norm = normalize_phone_for_db(msg.text)
+    if not phone_norm or not phone_norm.startswith("+7"):
+        return await msg.answer("Не распознал телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
+    data = await state.get_data()
+    tg_id = int(data["tg_id"])
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO staff(tg_user_id, role, is_active) VALUES ($1,'master',true) "
-            "ON CONFLICT (tg_user_id) DO UPDATE SET role='master', is_active=true",
-            target_id
+            "INSERT INTO staff(tg_user_id, role, is_active, first_name, last_name, phone) "
+            "VALUES ($1,'master',true,$2,$3,$4) "
+            "ON CONFLICT (tg_user_id) DO UPDATE SET role='master', is_active=true, first_name=$2, last_name=$3, phone=$4",
+            tg_id, data.get("first_name"), data.get("last_name"), phone_norm
         )
-    await msg.answer(f"Пользователь {target_id} назначен мастером и активирован.")
+    await msg.answer(f"✅ Мастер добавлен: {data.get('first_name','')} {data.get('last_name','')}, tg={tg_id}")
+    await state.clear()
 
 
 @dp.message(Command("remove_master"))
@@ -1235,6 +1264,13 @@ async def wipe_test_data(msg: Message):
 # ===== Admin: UPLOAD CSV TO clients_raw =====
 from aiogram.types import ContentType, FSInputFile
 from aiogram import types
+
+class AddMasterFSM(StatesGroup):
+    waiting_first_name = State()
+    waiting_last_name  = State()
+    waiting_phone      = State()
+    payload_tg         = State()
+
 
 class UploadFSM(StatesGroup):
     waiting_csv = State()
