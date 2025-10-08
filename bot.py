@@ -378,9 +378,14 @@ async def remove_master(msg: Message):
 async def whoami(msg: Message):
     global pool
     async with pool.acquire() as conn:
-        rec = await conn.fetchrow("SELECT role, is_active FROM staff WHERE tg_user_id=$1 LIMIT 1", msg.from_user.id)
+        rec = await conn.fetchrow(
+            "SELECT role, is_active, first_name, last_name FROM staff WHERE tg_user_id=$1 LIMIT 1",
+            msg.from_user.id,
+        )
         role = rec["role"] if rec else None
         is_active = bool(rec["is_active"]) if rec else False
+        first = rec["first_name"] if rec else None
+        last = rec["last_name"] if rec else None
         perms = []
         if role:
             rows = await conn.fetch(
@@ -399,6 +404,7 @@ async def whoami(msg: Message):
             f"Ваш id: {msg.from_user.id}",
             f"Роль: {role or '—'}",
             f"Активен: {'✅' if is_active else '⛔️'}",
+            f"Имя: {((first or '').strip() + (' ' + (last or '').strip() if (last or '').strip() else '')).strip() or '—'}",
             f"ADMIN_TG_IDS={sorted(ADMIN_TG_IDS)}",
             ("Права: " + (", ".join(perms) if perms else "—"))
         ])
