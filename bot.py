@@ -9,10 +9,28 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
 # ===== FSM State Groups =====
+class AdminMenuFSM(StatesGroup):
+    root    = State()
+    masters = State()
+    clients = State()
+
+
+class IncomeFSM(StatesGroup):
+    waiting_method = State()
+    waiting_amount = State()
+    waiting_comment = State()
+
+
+class ExpenseFSM(StatesGroup):
+    waiting_amount = State()
+    waiting_comment = State()
+
+
 class AddMasterFSM(StatesGroup):
     waiting_first_name = State()
     waiting_last_name  = State()
     waiting_phone      = State()
+
 
 class ReportsFSM(StatesGroup):
     waiting_root        = State()
@@ -252,6 +270,60 @@ def reports_root_kb() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
+
+def admin_root_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="Отчёты"), KeyboardButton(text="Касса"), KeyboardButton(text="Прибыль")],
+        [KeyboardButton(text="Приход"), KeyboardButton(text="Расход"), KeyboardButton(text="Изъятие")],
+        [KeyboardButton(text="Мастера"), KeyboardButton(text="Клиенты")],
+        [KeyboardButton(text="Tx последние"), KeyboardButton(text="Кто я")],
+        [KeyboardButton(text="Отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def admin_masters_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="Добавить мастера"), KeyboardButton(text="Список мастеров")],
+        [KeyboardButton(text="Деактивировать мастера")],
+        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def admin_clients_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="Найти клиента"), KeyboardButton(text="Редактировать клиента")],
+        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+async def _record_income(conn: asyncpg.Connection, method: str, amount: Decimal, comment: str):
+    norm = norm_pay_method_py(method)
+    tx = await conn.fetchrow(
+        """
+        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+        VALUES ('income', $1, $2, $3, NULL, NULL, now())
+        RETURNING id, happened_at
+        """,
+        norm, amount, comment or "Приход",
+    )
+    return tx
+
+
+async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: str, method: str = "прочее"):
+    tx = await conn.fetchrow(
+        """
+        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+        VALUES ('expense', $1, $2, $3, NULL, NULL, now())
+        RETURNING id, happened_at
+        """,
+        method, amount, comment or "Расход",
+    )
+    return tx
+
+
 # Payment method normalizer (Python side to mirror SQL norm_pay_method)
 def norm_pay_method_py(p: str | None) -> str:
     """
@@ -372,6 +444,14 @@ async def remove_master(msg: Message):
     async with pool.acquire() as conn:
         await conn.execute("UPDATE staff SET is_active=false WHERE tg_user_id=$1 AND role='master'", target_id)
     await msg.answer(f"Пользователь {target_id} деактивирован как мастер.")
+
+
+@dp.message(Command("admin_menu"))
+async def admin_menu_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_report"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(Command("whoami"))
@@ -983,6 +1063,225 @@ async def rep_paytypes_entry(msg: Message, state: FSMContext):
     await state.update_data(report_kind="paytypes")
     await msg.answer("Выберите период:", reply_markup=kb)
     await state.set_state(ReportsFSM.waiting_pick_period)
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "отчёты")
+async def adm_root_reports(msg: Message, state: FSMContext):
+    await state.clear()
+    return await reports_start(msg, state)
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "касса")
+async def adm_root_cash(msg: Message, state: FSMContext):
+    await msg.answer("Период для кассы: /cash day | /cash month | /cash year", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "прибыль")
+async def adm_root_profit(msg: Message, state: FSMContext):
+    await msg.answer("Период для прибыли: /profit day | /profit month | /profit year", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "tx последние")
+async def adm_root_tx_last(msg: Message, state: FSMContext):
+    await msg.answer("Последние транзакции: /tx_last 10", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "кто я")
+async def adm_root_whoami(msg: Message, state: FSMContext):
+    return await whoami(msg)
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "мастера")
+async def adm_root_masters(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.masters)
+    await msg.answer("Раздел «Мастера»:", reply_markup=admin_masters_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "клиенты")
+async def adm_root_clients(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.clients)
+    await msg.answer("Раздел «Клиенты»:", reply_markup=admin_clients_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "изъятие")
+async def adm_root_withdraw(msg: Message, state: FSMContext):
+    await state.clear()
+    return await withdraw_start(msg, state)
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "приход")
+async def income_wizard_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "record_cashflows"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(IncomeFSM.waiting_method)
+    kb = payment_method_kb()
+    await msg.answer("Выберите тип оплаты:", reply_markup=kb)
+
+
+@dp.message(IncomeFSM.waiting_method)
+async def income_wizard_pick_method(msg: Message, state: FSMContext):
+    if (msg.text or "").strip().casefold() == "отмена":
+        await state.clear()
+        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+    method = norm_pay_method_py(msg.text)
+    await state.update_data(method=method)
+    await state.set_state(IncomeFSM.waiting_amount)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Введите сумму прихода:", reply_markup=kb)
+
+
+@dp.message(IncomeFSM.waiting_amount)
+async def income_wizard_amount(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip().replace(" ", "").replace(",", ".")
+    if txt.casefold() == "отмена":
+        await state.clear()
+        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+    try:
+        amount = Decimal(txt)
+    except Exception:
+        return await msg.answer("Сумма должна быть числом. Повторите ввод или «Отмена».")
+    if amount <= 0:
+        return await msg.answer("Сумма должна быть > 0. Повторите ввод или «Отмена».")
+    await state.update_data(amount=str(amount))
+    await state.set_state(IncomeFSM.waiting_comment)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Без комментария")], [KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Комментарий? (введите текст или нажмите «Без комментария»)", reply_markup=kb)
+
+
+@dp.message(IncomeFSM.waiting_comment)
+async def income_wizard_comment(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+    if txt.casefold() == "отмена":
+        await state.clear()
+        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+    if txt.casefold() == "без комментария":
+        txt = "Приход"
+    data = await state.get_data()
+    method = data.get("method")
+    amount = Decimal(data.get("amount"))
+    async with pool.acquire() as conn:
+        tx = await _record_income(conn, method, amount, txt)
+    when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
+    await msg.answer(
+        f"Приход №{tx['id']}: {amount}₽ | {method} — {when}\nКомментарий: {txt}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.clear()
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "расход")
+async def expense_wizard_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "record_cashflows"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(ExpenseFSM.waiting_amount)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Введите сумму расхода:", reply_markup=kb)
+
+
+@dp.message(ExpenseFSM.waiting_amount)
+async def expense_wizard_amount(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip().replace(" ", "").replace(",", ".")
+    if txt.casefold() == "отмена":
+        await state.clear()
+        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+    try:
+        amount = Decimal(txt)
+    except Exception:
+        return await msg.answer("Сумма должна быть числом. Повторите ввод или «Отмена».")
+    if amount <= 0:
+        return await msg.answer("Сумма должна быть > 0. Повторите ввод или «Отмена».")
+    await state.update_data(amount=str(amount))
+    await state.set_state(ExpenseFSM.waiting_comment)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Без комментария")], [KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer(
+        "Комментарий? (введите текст или нажмите «Без комментария»)",
+        reply_markup=kb,
+    )
+
+
+@dp.message(ExpenseFSM.waiting_comment)
+async def expense_wizard_comment(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+    if txt.casefold() == "отмена":
+        await state.clear()
+        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+    if txt.casefold() == "без комментария":
+        txt = "Расход"
+    data = await state.get_data()
+    amount = Decimal(data.get("amount"))
+    async with pool.acquire() as conn:
+        tx = await _record_expense(conn, amount, txt, method="прочее")
+    when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
+    await msg.answer(
+        f"Расход №{tx['id']}: {amount}₽ — {when}\nКомментарий: {txt}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.clear()
+
+
+@dp.message(AdminMenuFSM.masters, F.text.casefold() == "назад")
+async def masters_back(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.masters, F.text.casefold() == "добавить мастера")
+async def masters_add(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Формат: /add_master <tg_user_id>")
+
+
+@dp.message(AdminMenuFSM.masters, F.text.casefold() == "список мастеров")
+async def masters_list(msg: Message, state: FSMContext):
+    await state.clear()
+    return await list_masters(msg)
+
+
+@dp.message(AdminMenuFSM.masters, F.text.casefold() == "деактивировать мастера")
+async def masters_remove(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Формат: /remove_master <tg_user_id>")
+
+
+@dp.message(AdminMenuFSM.clients, F.text.casefold() == "назад")
+async def clients_back(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.clients, F.text.casefold() == "найти клиента")
+async def clients_find(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Формат: /client_info <телефон>")
+
+
+@dp.message(AdminMenuFSM.clients, F.text.casefold() == "редактировать клиента")
+async def clients_edit(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer(
+        "Команды редактирования:\n"
+        "/client_set_name <телефон> <новое_имя>\n"
+        "/client_set_phone <старый> <новый>\n"
+        "/client_set_birthday <телефон> <ДД.ММ.ГГГГ|ГГГГ-ММ-ДД>\n"
+        "/client_set_bonus <телефон> <сумма>\n"
+        "/client_add_bonus <телефон> <дельта>"
+    )
 
 
 @dp.message(ReportsFSM.waiting_pick_master)
@@ -1726,27 +2025,9 @@ async def add_income(msg: Message):
         return await msg.answer(f"Ошибка: '{amount_str}' не является корректной суммой.")
 
     method = norm_pay_method_py(method_raw)
-    # попытка извлечь id заказа из комментария: понимаем "#123" или "order:123"
-    order_id = None
-    m = re.search(r"(?:^|\s)(?:order[:#]|#)(\d+)", comment, re.IGNORECASE)
-    if m:
-        try:
-            order_id = int(m.group(1))
-        except Exception:
-            order_id = None
 
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            rec = await conn.fetchrow(
-                "INSERT INTO cashbook_entries (kind, method, amount, comment, order_id) "
-                "VALUES ('income', $1, $2, $3, $4) RETURNING id, happened_at",
-                method, amount, comment, order_id
-            )
-            if order_id is not None:
-                await conn.execute(
-                    "UPDATE orders SET income_tx_id = $1 WHERE id = $2",
-                    rec['id'], order_id
-                )
+        rec = await _record_income(conn, method, amount, comment)
 
     lines = [
         f"✅ Приход №{rec['id']}",
@@ -1755,8 +2036,6 @@ async def add_income(msg: Message):
         f"Когда: {rec['happened_at']:%Y-%m-%d %H:%M}",
         f"Комментарий: {comment}",
     ]
-    if order_id:
-        lines.insert(1, f"Заказ: #{order_id}")
     await msg.answer("\n".join(lines))
 
 # ===== /expense admin command =====
@@ -1783,11 +2062,7 @@ async def add_expense(msg: Message, command: CommandObject):
         return await msg.answer(f"Ошибка: '{amount_str}' не является корректной суммой.")
 
     async with pool.acquire() as conn:
-        rec = await conn.fetchrow(
-            "INSERT INTO cashbook_entries (kind, method, amount, comment) "
-            "VALUES ('expense', 'прочее', $1, $2) RETURNING id, happened_at",
-            amount, comment
-        )
+        rec = await _record_expense(conn, amount, comment, method="прочее")
     await msg.answer(
         "\n".join([
             f"✅ Расход №{rec['id']}",
@@ -2095,6 +2370,11 @@ async def cancel_any(msg: Message, state: FSMContext):
     await state.clear()
     # возвращаем клавиатуру мастера
     return await msg.answer("Отменено.", reply_markup=master_kb)
+
+
+@dp.message(AdminMenuFSM.root)
+async def admin_root_fallback(msg: Message, state: FSMContext):
+    await msg.answer("Выберите действие на клавиатуре ниже.", reply_markup=admin_root_kb())
 
 # Legacy env-based admin check kept for backward compatibility
 def is_admin(user_id: int) -> bool:
