@@ -292,10 +292,13 @@ async def list_masters(msg: Message):
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT s.id, s.tg_user_id, s.role, s.is_active FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id")
+        rows = await conn.fetch(
+            "SELECT s.id, s.tg_user_id, s.role, s.is_active, COALESCE(s.first_name,'') AS fn, COALESCE(s.last_name,'') AS ln "
+            "FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id"
+        )
     if not rows:
         return await msg.answer("Список пуст.")
-    lines = [f"#{r['id']} {r['role']} tg={r['tg_user_id']} {'✅' if r['is_active'] else '⛔️'}" for r in rows]
+    lines = [f"#{r['id']} {r['role']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} {'✅' if r['is_active'] else '⛔️'}" for r in rows]
     await msg.answer("Мастера/админы:\n" + "\n".join(lines))
 
 @dp.message(Command("add_master"))
@@ -317,14 +320,20 @@ async def add_master(msg: Message, state: FSMContext):
 
 @dp.message(AddMasterFSM.waiting_first_name)
 async def add_master_first(msg: Message, state: FSMContext):
-    await state.update_data(first_name=(msg.text or "").strip())
+    first = (msg.text or "").strip()
+    if len(first) < 2:
+        return await msg.answer("Имя слишком короткое. Введите корректное имя (>= 2 символов).")
+    await state.update_data(first_name=first)
     await state.set_state(AddMasterFSM.waiting_last_name)
     await msg.answer("Фамилия мастера:")
 
 
 @dp.message(AddMasterFSM.waiting_last_name)
 async def add_master_last(msg: Message, state: FSMContext):
-    await state.update_data(last_name=(msg.text or "").strip())
+    last = (msg.text or "").strip()
+    if len(last) < 2:
+        return await msg.answer("Фамилия слишком короткая. Введите корректную фамилию (>= 2 символов).")
+    await state.update_data(last_name=last)
     await state.set_state(AddMasterFSM.waiting_phone)
     await msg.answer("Телефон мастера (формат: +7XXXXXXXXXX или 8/9...):")
 
@@ -335,6 +344,8 @@ async def add_master_phone(msg: Message, state: FSMContext):
     if not phone_norm or not phone_norm.startswith("+7"):
         return await msg.answer("Не распознал телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
     data = await state.get_data()
+    if len((data.get("first_name") or "").strip()) < 2 or len((data.get("last_name") or "").strip()) < 2:
+        return await msg.answer("Имя/фамилия заданы некорректно. Перезапустите /add_master.")
     tg_id = int(data["tg_id"])
     async with pool.acquire() as conn:
         await conn.execute(
