@@ -448,7 +448,8 @@ async def remove_master(msg: Message):
 
 @dp.message(Command("admin_menu"))
 async def admin_menu_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_orders_report"):
+    # пускаем и супер-админа, и обычного админа (где есть право отчётов по заказам)
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
         return await msg.answer("Только для администраторов.")
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
