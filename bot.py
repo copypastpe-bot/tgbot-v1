@@ -267,6 +267,7 @@ def reports_root_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Мастер/Зарплата")],
         [KeyboardButton(text="Прибыль"), KeyboardButton(text="Касса")],
         [KeyboardButton(text="Типы оплат")],
+        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
@@ -999,7 +1000,7 @@ async def orders_report(msg: Message):
 
 @dp.message(Command("reports"))
 async def reports_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_orders_report"):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
         return await msg.answer("Только для администраторов.")
     await msg.answer("Выберите отчёт:", reply_markup=reports_root_kb())
     await state.set_state(ReportsFSM.waiting_root)
@@ -1014,13 +1015,22 @@ async def rep_master_orders_entry(msg: Message, state: FSMContext):
     if masters:
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text=f"{r['fn']} {r['ln']} | tg:{r['tg_user_id']}")] for r in masters] +
-                     [[KeyboardButton(text="Ввести tg id вручную")]],
+                     [[KeyboardButton(text="Ввести tg id вручную")],
+                      [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
         await msg.answer("Выберите мастера или введите tg id:", reply_markup=kb)
     else:
-        await msg.answer("Введите tg id мастера:")
+        await msg.answer(
+            "Введите tg id мастера:",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+        )
+    await state.update_data(report_kind="master_orders")
     await state.set_state(ReportsFSM.waiting_pick_master)
 
 
@@ -1034,14 +1044,15 @@ async def rep_master_salary_entry(msg: Message, state: FSMContext):
     if masters:
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text=f"{r['fn']} {r['ln']} | tg:{r['tg_user_id']}")] for r in masters] +
-                     [[KeyboardButton(text="Ввести tg id вручную")], [KeyboardButton(text="Отмена")]],
+                     [[KeyboardButton(text="Ввести tg id вручную")],
+                      [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
         await msg.answer("Выберите мастера или введите tg id:", reply_markup=kb)
     else:
         kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Отмена")]],
+            keyboard=[[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
@@ -1056,7 +1067,7 @@ async def rep_paytypes_entry(msg: Message, state: FSMContext):
         keyboard=[
             [KeyboardButton(text="день"),   KeyboardButton(text="неделя")],
             [KeyboardButton(text="месяц"), KeyboardButton(text="год")],
-            [KeyboardButton(text="Отмена")],
+            [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -1064,6 +1075,50 @@ async def rep_paytypes_entry(msg: Message, state: FSMContext):
     await state.update_data(report_kind="paytypes")
     await msg.answer("Выберите период:", reply_markup=kb)
     await state.set_state(ReportsFSM.waiting_pick_period)
+
+
+@dp.message(ReportsFSM.waiting_pick_period, F.text.casefold() == "назад")
+async def rep_period_back(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    report_kind = data.get("report_kind", "master_orders")
+    if report_kind in ("master_orders", "master_salary"):
+        async with pool.acquire() as conn:
+            masters = await conn.fetch(
+                "SELECT id, tg_user_id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+                "FROM staff WHERE role IN ('master','admin') AND is_active ORDER BY id LIMIT 10"
+            )
+        if masters:
+            kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text=f"{r['fn']} {r['ln']} | tg:{r['tg_user_id']}")] for r in masters] +
+                         [[KeyboardButton(text="Ввести tg id вручную")],
+                          [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+            await state.set_state(ReportsFSM.waiting_pick_master)
+            return await msg.answer("Выберите мастера или введите tg id:", reply_markup=kb)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await state.set_state(ReportsFSM.waiting_pick_master)
+        return await msg.answer("Введите tg id мастера:", reply_markup=kb)
+
+    await state.set_state(ReportsFSM.waiting_root)
+    return await msg.answer("Выберите отчёт:", reply_markup=reports_root_kb())
+
+
+@dp.message(ReportsFSM.waiting_pick_master, F.text.casefold() == "назад")
+async def rep_master_back(msg: Message, state: FSMContext):
+    await state.set_state(ReportsFSM.waiting_root)
+    return await msg.answer("Выберите отчёт:", reply_markup=reports_root_kb())
+
+
+@dp.message(ReportsFSM.waiting_root, F.text.casefold() == "назад")
+async def reports_root_back(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(AdminMenuFSM.root, F.text.casefold() == "отчёты")
@@ -1301,6 +1356,7 @@ async def rep_master_pick(msg: Message, state: FSMContext):
         keyboard=[
             [KeyboardButton(text="день"),   KeyboardButton(text="неделя")],
             [KeyboardButton(text="месяц"), KeyboardButton(text="год")],
+            [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
