@@ -559,6 +559,8 @@ async def help_cmd(msg: Message):
             "\n"
             "/profit day — прибыль за день\n"
             "\n"
+            "/payments day — приход по типам оплаты за день\n"
+            "\n"
             "/order — открыть добавление заказа (клавиатура мастера)\n"
         )
     else:
@@ -899,12 +901,17 @@ async def get_cash_report_text(period: str) -> str:
 
 # ===== /cash admin command =====
 @dp.message(Command("cash"))
-async def cash_report(msg: Message):
-    # доступ только у админа
+async def cash_report(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_cash_reports"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
-    period = parts[1].strip().lower() if len(parts) > 1 else "day"
+    if len(parts) == 1:
+        # без аргумента — открыть выбор периода, как по кнопке "Касса"
+        await state.clear()
+        await state.update_data(report_kind="Касса")
+        await state.set_state(ReportsFSM.waiting_pick_period)
+        return await msg.answer("Касса: выбери период.", reply_markup=reports_period_kb())
+    period = parts[1].strip().lower()
     text = await get_cash_report_text(period)
     await msg.answer(text)
 
@@ -1011,15 +1018,100 @@ async def get_profit_report_text(period: str) -> str:
             lines.append(f"{s}: выручка {r['revenue']} / расходы {r['expense']} → прибыль {r['profit']}₽")
     return "\n".join(lines)
 
+
+async def get_payments_by_method_report_text(period: str) -> str:
+    """
+    Суммируем приходы по cashbook_entries.kind='income' с группировкой по method
+    за указанный период. Поддержка period как в других отчётах.
+    """
+    import re
+
+    def trunc(unit: str) -> str:
+        return f"date_trunc('{unit}', NOW())"
+
+    if period in ("day", "month", "year"):
+        period_label = {"day": "сегодня", "month": "текущий месяц", "year": "текущий год"}[period]
+        unit = period
+        start_sql = trunc(unit)
+        end_sql = f"{trunc(unit)} + interval '1 {unit}'"
+    else:
+        mday = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", period or "")
+        mmon = re.fullmatch(r"(\d{4})-(\d{2})", period or "")
+        if mday:
+            y, m, d = map(int, mday.groups())
+            period_label = f"{y:04d}-{m:02d}-{d:02d}"
+            start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-{d:02d} 00:00:00+00'"
+            end_sql = f"{start_sql} + interval '1 day'"
+        elif mmon:
+            y, m = map(int, mmon.groups())
+            period_label = f"{y:04d}-{m:02d}"
+            start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-01 00:00:00+00'"
+            end_sql = f"{start_sql} + interval '1 month'"
+        else:
+            return "Формат: /payments [day|month|year|YYYY-MM|YYYY-MM-DD]"
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT COALESCE(method,'прочее') AS method,
+                   COUNT(*)::int AS cnt,
+                   COALESCE(SUM(amount),0)::numeric(12,2) AS total
+            FROM cashbook_entries
+            WHERE kind='income'
+              AND happened_at >= {start_sql} AND happened_at < {end_sql}
+            GROUP BY 1
+            ORDER BY total DESC, method
+            """
+        )
+        total_income = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(amount),0)::numeric(12,2)
+            FROM cashbook_entries
+            WHERE kind='income'
+              AND happened_at >= {start_sql} AND happened_at < {end_sql}
+            """
+        )
+
+    if not rows:
+        return f"Типы оплат за {period_label}: данных нет."
+
+    lines = [f"Типы оплат за {period_label}: (итого {total_income}₽)"]
+    for r in rows:
+        method = r["method"]
+        lines.append(f"- {method}: {r['total']}₽ ({r['cnt']} шт.)")
+    return "\n".join(lines)
+
+
 # ===== /profit admin command =====
 @dp.message(Command("profit"))
-async def profit_report(msg: Message):
-    # доступ только у админа
+async def profit_report(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_profit_reports"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
-    period = parts[1].strip().lower() if len(parts) > 1 else "day"
+    if len(parts) == 1:
+        # без аргумента — открыть выбор периода, как по кнопке "Прибыль"
+        await state.clear()
+        await state.update_data(report_kind="Прибыль")
+        await state.set_state(ReportsFSM.waiting_pick_period)
+        return await msg.answer("Прибыль: выбери период.", reply_markup=reports_period_kb())
+    period = parts[1].strip().lower()
     text = await get_profit_report_text(period)
+    await msg.answer(text)
+
+
+@dp.message(Command("payments"))
+async def payments_report(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_payments_by_method"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) == 1:
+        # без аргумента — открыть выбор периода, как по кнопке "Типы оплат"
+        await state.clear()
+        await state.update_data(report_kind="Типы оплат")
+        await state.set_state(ReportsFSM.waiting_pick_period)
+        return await msg.answer("Типы оплат: выбери период.", reply_markup=reports_period_kb())
+    period = parts[1].strip().lower()
+    text = await get_payments_by_method_report_text(period)
     await msg.answer(text)
 
 
@@ -3248,7 +3340,7 @@ async def reports_run_period(msg: Message, state: FSMContext):
     elif kind == "Прибыль":
         text = await get_profit_report_text(period)
     elif kind == "Типы оплат":
-        text = "Отчёт по типам оплат: скоро будет доступен в этом меню."
+        text = await get_payments_by_method_report_text(period)
     else:
         text = "Неизвестный тип отчёта."
 
