@@ -261,6 +261,16 @@ def payment_method_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
+def admin_payment_method_kb() -> ReplyKeyboardMarkup:
+    btns = [KeyboardButton(text=m) for m in PAYMENT_METHODS]
+    rows = [
+        [btns[0], btns[1]],
+        [btns[2], btns[3]],
+        [KeyboardButton(text="Отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
 def reports_root_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="Мастер/Заказы/Оплаты")],
@@ -296,6 +306,14 @@ def admin_clients_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="Найти клиента"), KeyboardButton(text="Редактировать клиента")],
         [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def tx_last_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="/tx_last 10"), KeyboardButton(text="/tx_last 30"), KeyboardButton(text="/tx_last 50")],
+        [KeyboardButton(text="Назад"), KeyboardButton(text="Выйти")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
@@ -1189,7 +1207,25 @@ async def adm_root_profit(msg: Message, state: FSMContext):
 
 @dp.message(AdminMenuFSM.root, F.text.casefold() == "tx последние")
 async def adm_root_tx_last(msg: Message, state: FSMContext):
-    await msg.answer("Последние транзакции: /tx_last 10", reply_markup=admin_root_kb())
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        return await msg.answer("Только для администраторов.")
+    await msg.answer("Выберите, сколько показать:", reply_markup=tx_last_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "назад")
+async def admin_root_back(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text.casefold() == "выйти")
+async def admin_root_exit(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(AdminMenuFSM.root, F.text.casefold() == "кто я")
@@ -1220,8 +1256,7 @@ async def income_wizard_start(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "record_cashflows"):
         return await msg.answer("Только для администраторов.")
     await state.set_state(IncomeFSM.waiting_method)
-    kb = payment_method_kb()
-    await msg.answer("Выберите тип оплаты:", reply_markup=kb)
+    await msg.answer("Выберите тип оплаты:", reply_markup=admin_payment_method_kb())
 
 
 @dp.message(IncomeFSM.waiting_method)
@@ -1268,8 +1303,8 @@ async def income_wizard_comment(msg: Message, state: FSMContext):
     if txt.casefold() == "отмена":
         await state.clear()
         return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
-    if txt.casefold() == "без комментария":
-        txt = "Приход"
+    if txt.casefold() == "без комментария" or not txt:
+        txt = "поступление денег в кассу"
     data = await state.get_data()
     method = data.get("method")
     amount = Decimal(data.get("amount"))
@@ -2181,27 +2216,39 @@ async def add_expense(msg: Message, command: CommandObject):
 
 # ===== /tx_last admin command =====
 @dp.message(Command("tx_last"))
-async def tx_last(msg: Message):
+async def tx_last_cmd(msg: Message):
     if not await has_permission(msg.from_user.id, "view_cash_reports"):
         return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=1)
-    limit = 10
-    if len(parts) > 1 and parts[1].isdigit():
-        limit = max(1, min(50, int(parts[1])))
+    parts = msg.text.split()
+    n = 10
+    if len(parts) > 1:
+        try:
+            n = max(1, min(100, int(parts[1])))
+        except Exception:
+            n = 10
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, kind, method, amount, comment, happened_at, COALESCE(is_deleted,false) AS del, order_id "
-            "FROM cashbook_entries ORDER BY id DESC LIMIT $1",
-            limit
+            """
+            SELECT id, kind, method,
+                   amount::numeric(12,2) AS amount,
+                   order_id,
+                   COALESCE(master_id, 0) AS master_id,
+                   to_char(happened_at, 'YYYY-MM-DD HH24:MI') AS ts,
+                   COALESCE(comment,'') AS comment
+            FROM cashbook_entries
+            ORDER BY id DESC
+            LIMIT $1
+            """,
+            n,
         )
     if not rows:
-        return await msg.answer("Нет транзакций.")
-    lines = [
-        f"№{r['id']} | {'❌' if r['del'] else '✅'} | {r['kind']} | {r['amount']}₽ | {r['method'] or '-'} | "
-        f"{r['happened_at']:%Y-%m-%d %H:%M} | order=#{r['order_id']} | {r['comment'] or ''}"
-        for r in rows
-    ]
-    await msg.answer("Последние транзакции:\n" + "\n".join(lines))
+        return await msg.answer("Транзакций нет.")
+    lines = ["Последние транзакции:"]
+    for r in rows:
+        lines.append(
+            f"№{r['id']} | ✅ | {r['kind']} | {r['amount']}₽ | {r['method']} | {r['ts']} | order=#{r['order_id']} | {r['comment']}"
+        )
+    await msg.answer("\n".join(lines))
 
 # ===== /tx_delete superadmin command =====
 @dp.message(Command("tx_delete"))
