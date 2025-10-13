@@ -284,11 +284,10 @@ def reports_root_kb() -> ReplyKeyboardMarkup:
 
 def admin_root_kb() -> ReplyKeyboardMarkup:
     rows = [
-        [KeyboardButton(text="Отчёты"), KeyboardButton(text="Касса"), KeyboardButton(text="Прибыль")],
+        [KeyboardButton(text="Отчёты")],
         [KeyboardButton(text="Приход"), KeyboardButton(text="Расход"), KeyboardButton(text="Изъятие")],
         [KeyboardButton(text="Мастера"), KeyboardButton(text="Клиенты")],
         [KeyboardButton(text="Tx последние"), KeyboardButton(text="Кто я")],
-        [KeyboardButton(text="Отмена")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -485,6 +484,25 @@ async def reports_root(msg: Message, state: FSMContext):
         return await msg.answer("Только для администраторов.")
     await state.set_state(ReportsFSM.waiting_root)
     await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
+
+
+# Shortcuts: pressing "Касса" or "Прибыль" anywhere (admin) opens period picker
+@dp.message(F.text == "Касса")
+async def reports_shortcut_cash(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        return
+    await state.update_data(report_kind="Касса")
+    await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer("Касса: выбери период.", reply_markup=reports_period_kb())
+
+
+@dp.message(F.text == "Прибыль")
+async def reports_shortcut_profit(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_profit_reports"):
+        return
+    await state.update_data(report_kind="Прибыль")
+    await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer("Прибыль: выбери период.", reply_markup=reports_period_kb())
 
 
 @dp.message(Command("help"))
@@ -1183,13 +1201,6 @@ async def rep_master_salary_entry(msg: Message, state: FSMContext):
     await state.set_state(ReportsFSM.waiting_pick_master)
 
 
-@dp.message(ReportsFSM.waiting_root, F.text.casefold() == "типы оплат")
-async def rep_paytypes_entry(msg: Message, state: FSMContext):
-    await state.update_data(report_kind="paytypes")
-    await msg.answer("Выберите период:", reply_markup=reports_period_kb())
-    await state.set_state(ReportsFSM.waiting_pick_period)
-
-
 @dp.message(ReportsFSM.waiting_root, F.text.in_({"Касса", "Прибыль"}))
 async def reports_pick_period(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_orders_reports"):
@@ -1198,6 +1209,16 @@ async def reports_pick_period(msg: Message, state: FSMContext):
     await state.update_data(report_kind=kind)
     await state.set_state(ReportsFSM.waiting_pick_period)
     await msg.answer(f"{kind}: выбери период.", reply_markup=reports_period_kb())
+
+
+# Stub: "Типы оплат" → пока только выбор периода
+@dp.message(ReportsFSM.waiting_root, F.text == "Типы оплат")
+async def reports_payment_methods(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_payments_by_method"):
+        return await msg.answer("Только для администраторов.")
+    await state.update_data(report_kind="Типы оплат")
+    await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer("Типы оплат: выбери период.", reply_markup=reports_period_kb())
 
 
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "Назад")
@@ -3199,6 +3220,12 @@ async def reports_run_period(msg: Message, state: FSMContext):
         text = await get_profit_report_text(period_code)
         await msg.answer(text, reply_markup=reports_period_kb())
         return
+    if report_kind == "Типы оплат":
+        await msg.answer(
+            "Отчёт по типам оплат: скоро будет доступен в этом меню.",
+            reply_markup=reports_period_kb(),
+        )
+        return
 
     return await rep_master_period(msg, state)
 
@@ -3214,6 +3241,9 @@ async def reports_run_period(msg: Message, state: FSMContext):
         text = await get_cash_report_text(period)
     elif kind == "Прибыль":
         text = await get_profit_report_text(period)
+    elif kind == "Типы оплат":
+        # TODO: implement payments-by-method report; for now, provide a stub response
+        text = "Отчёт по типам оплат: скоро будет доступен в этом меню."
     else:
         return await msg.answer("Неизвестный тип отчёта.")
 
