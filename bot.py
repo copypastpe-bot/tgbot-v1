@@ -491,7 +491,9 @@ async def reports_root(msg: Message, state: FSMContext):
 @dp.message(AdminMenuFSM.root, F.text == "Касса")
 async def reports_shortcut_cash(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_cash_reports"):
-        return
+        return await msg.answer("Только для администраторов.")
+    cur_state = await state.get_state()
+    logging.info("reports_shortcut_cash: state=%s text=%s", cur_state, msg.text)
     await state.clear()
     await state.update_data(report_kind="Касса")
     await state.set_state(ReportsFSM.waiting_pick_period)
@@ -503,7 +505,9 @@ async def reports_shortcut_cash(msg: Message, state: FSMContext):
 @dp.message(AdminMenuFSM.root, F.text == "Прибыль")
 async def reports_shortcut_profit(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_profit_reports"):
-        return
+        return await msg.answer("Только для администраторов.")
+    cur_state = await state.get_state()
+    logging.info("reports_shortcut_profit: state=%s text=%s", cur_state, msg.text)
     await state.clear()
     await state.update_data(report_kind="Прибыль")
     await state.set_state(ReportsFSM.waiting_pick_period)
@@ -515,7 +519,9 @@ async def reports_shortcut_profit(msg: Message, state: FSMContext):
 @dp.message(AdminMenuFSM.root, F.text == "Типы оплат")
 async def reports_shortcut_payment_types(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_payments_by_method"):
-        return
+        return await msg.answer("Только для администраторов.")
+    cur_state = await state.get_state()
+    logging.info("reports_shortcut_payment_types: state=%s text=%s", cur_state, msg.text)
     await state.clear()
     await state.update_data(report_kind="Типы оплат")
     await state.set_state(ReportsFSM.waiting_pick_period)
