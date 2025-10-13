@@ -353,10 +353,9 @@ def norm_pay_method_py(p: str | None) -> str:
 
 async def set_commands():
     cmds = [
-        BotCommand(command="start",        description="Старт"),
-        BotCommand(command="help",         description="Помощь"),
-        BotCommand(command="admin_panel",  description="Меню администратора"),
-        BotCommand(command="order",        description="Добавить заказ (мастер-меню)"),
+        BotCommand(command="start", description="Старт"),
+        BotCommand(command="help",  description="Помощь"),
+        BotCommand(command="order", description="Добавить заказ (мастер-меню)"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -475,21 +474,24 @@ async def help_cmd(msg: Message):
     if role in ("admin", "superadmin"):
         text = (
             "Команды администратора:\n"
-            "\n"
             "/admin_panel — открыть меню администратора\n"
-            "/whoami — мои права\n"
-            "/tx_last <N> — последние N транзакций\n"
-            "/cash [day|month|year|YYYY-MM|YYYY-MM-DD]\n"
-            "/profit [day|month|year|YYYY-MM|YYYY-MM-DD]\n"
-            "/orders [period] [master:<tg> | master_id:<id>]\n"
-            "/list_masters, /add_master, /remove_master\n"
-            "/client_info, /client_set_name, /client_set_phone, /client_set_birthday, /client_set_bonus, /client_add_bonus\n"
+            "\n"
+            "/whoami — кто я, мои права\n"
+            "\n"
+            "/tx_last 10 — последние 10 транзакций\n"
+            "\n"
+            "/cash day — касса за день\n"
+            "\n"
+            "/profit day — прибыль за день\n"
+            "\n"
+            "/order — открыть добавление заказа (клавиатура мастера)\n"
         )
     else:
         text = (
             "Команды мастера:\n"
-            "/whoami — мои права\n"
-            "Для оформления заказа — используйте кнопки ниже."
+            "/whoami — кто я, мои права\n"
+            "\n"
+            "Для оформления заказа используйте кнопки внизу."
         )
 
     await msg.answer(text)
@@ -2495,16 +2497,10 @@ async def ensure_master(user_id: int) -> bool:
 
 @dp.message(CommandStart())
 async def start_handler(msg: Message, state: FSMContext):
+    await state.clear()
     global pool
     async with pool.acquire() as conn:
         role = await get_user_role(conn, msg.from_user.id)
-        if role not in ("admin", "superadmin") and is_admin(msg.from_user.id):
-            await conn.execute(
-                "INSERT INTO staff(tg_user_id, role, is_active) VALUES ($1,'admin',true) "
-                "ON CONFLICT (tg_user_id) DO UPDATE SET is_active=true",
-                msg.from_user.id,
-            )
-            role = "admin"
 
     if role in ("admin", "superadmin"):
         await admin_menu_start(msg, state)
@@ -2512,7 +2508,7 @@ async def start_handler(msg: Message, state: FSMContext):
 
     await msg.answer(
         "Привет! Это внутренний бот. Нажми нужную кнопку.",
-        reply_markup=master_kb,
+        reply_markup=master_main_kb()
     )
 
 # ---- /find ----
