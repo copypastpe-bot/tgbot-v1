@@ -282,6 +282,14 @@ def reports_root_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
+def reports_period_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="День"), KeyboardButton(text="Месяц"), KeyboardButton(text="Год")],
+        [KeyboardButton(text="Назад"), KeyboardButton(text="Выйти"), KeyboardButton(text="Отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
 def admin_root_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="Отчёты")],
