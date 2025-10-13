@@ -258,7 +258,7 @@ def payment_method_kb() -> ReplyKeyboardMarkup:
         [btns[2], btns[3]],
         [btns[4]],
     ]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def admin_payment_method_kb() -> ReplyKeyboardMarkup:
@@ -323,6 +323,104 @@ def tx_last_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Назад"), KeyboardButton(text="Выйти")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+@dp.message(F.text == "Отчёты")
+async def reports_root(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(ReportsFSM.waiting_root)
+    await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
+
+
+@dp.message(StateFilter(None), F.text == "Касса")
+@dp.message(ReportsFSM.waiting_root, F.text == "Касса")
+@dp.message(AdminMenuFSM.root, F.text == "Касса")
+async def reports_shortcut_cash(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        return await msg.answer("Только для администраторов.")
+    cur_state = await state.get_state()
+    logging.info("reports_shortcut_cash: state=%s text=%s", cur_state, msg.text)
+    await state.clear()
+    await state.update_data(report_kind="Касса")
+    await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer("Касса: выбери период.", reply_markup=reports_period_kb())
+
+
+@dp.message(StateFilter(None), F.text == "Прибыль")
+@dp.message(ReportsFSM.waiting_root, F.text == "Прибыль")
+@dp.message(AdminMenuFSM.root, F.text == "Прибыль")
+async def reports_shortcut_profit(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_profit_reports"):
+        return await msg.answer("Только для администраторов.")
+    cur_state = await state.get_state()
+    logging.info("reports_shortcut_profit: state=%s text=%s", cur_state, msg.text)
+    await state.clear()
+    await state.update_data(report_kind="Прибыль")
+    await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer("Прибыль: выбери период.", reply_markup=reports_period_kb())
+
+
+@dp.message(StateFilter(None), F.text == "Типы оплат")
+@dp.message(ReportsFSM.waiting_root, F.text == "Типы оплат")
+@dp.message(AdminMenuFSM.root, F.text == "Типы оплат")
+async def reports_shortcut_payment_types(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_payments_by_method"):
+        return await msg.answer("Только для администраторов.")
+    cur_state = await state.get_state()
+    logging.info("reports_shortcut_payment_types: state=%s text=%s", cur_state, msg.text)
+    await state.clear()
+    await state.update_data(report_kind="Типы оплат")
+    await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer("Типы оплат: выбери период.", reply_markup=reports_period_kb())
+
+
+@dp.message(ReportsFSM.waiting_pick_period, F.text == "День")
+async def reports_run_period_day(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    kind = data.get("report_kind")
+    period = "day"
+    if kind == "Касса":
+        text = await get_cash_report_text(period)
+    elif kind == "Прибыль":
+        text = await get_profit_report_text(period)
+    elif kind == "Типы оплат":
+        text = await get_payments_by_method_report_text(period)
+    else:
+        text = "Неизвестный тип отчёта."
+    await msg.answer(text, reply_markup=reports_period_kb())
+
+
+@dp.message(ReportsFSM.waiting_pick_period, F.text == "Месяц")
+async def reports_run_period_month(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    kind = data.get("report_kind")
+    period = "month"
+    if kind == "Касса":
+        text = await get_cash_report_text(period)
+    elif kind == "Прибыль":
+        text = await get_profit_report_text(period)
+    elif kind == "Типы оплат":
+        text = await get_payments_by_method_report_text(period)
+    else:
+        text = "Неизвестный тип отчёта."
+    await msg.answer(text, reply_markup=reports_period_kb())
+
+
+@dp.message(ReportsFSM.waiting_pick_period, F.text == "Год")
+async def reports_run_period_year(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    kind = data.get("report_kind")
+    period = "year"
+    if kind == "Касса":
+        text = await get_cash_report_text(period)
+    elif kind == "Прибыль":
+        text = await get_profit_report_text(period)
+    elif kind == "Типы оплат":
+        text = await get_payments_by_method_report_text(period)
+    else:
+        text = "Неизвестный тип отчёта."
+    await msg.answer(text, reply_markup=reports_period_kb())
 
 
 async def _record_income(conn: asyncpg.Connection, method: str, amount: Decimal, comment: str):
@@ -484,56 +582,6 @@ async def admin_menu_start(msg: Message, state: FSMContext):
 @dp.message(Command("admin_panel"))
 async def admin_panel_alias(msg: Message, state: FSMContext):
     await admin_menu_start(msg, state)
-
-
-@dp.message(F.text == "Отчёты")
-async def reports_root(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_orders_reports"):
-        return await msg.answer("Только для администраторов.")
-    await state.set_state(ReportsFSM.waiting_root)
-    await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
-
-
-@dp.message(StateFilter(None), F.text == "Касса")
-@dp.message(ReportsFSM.waiting_root, F.text == "Касса")
-@dp.message(AdminMenuFSM.root, F.text == "Касса")
-async def reports_shortcut_cash(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_cash_reports"):
-        return await msg.answer("Только для администраторов.")
-    cur_state = await state.get_state()
-    logging.info("reports_shortcut_cash: state=%s text=%s", cur_state, msg.text)
-    await state.clear()
-    await state.update_data(report_kind="Касса")
-    await state.set_state(ReportsFSM.waiting_pick_period)
-    await msg.answer("Касса: выбери период.", reply_markup=reports_period_kb())
-
-
-@dp.message(StateFilter(None), F.text == "Прибыль")
-@dp.message(ReportsFSM.waiting_root, F.text == "Прибыль")
-@dp.message(AdminMenuFSM.root, F.text == "Прибыль")
-async def reports_shortcut_profit(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_profit_reports"):
-        return await msg.answer("Только для администраторов.")
-    cur_state = await state.get_state()
-    logging.info("reports_shortcut_profit: state=%s text=%s", cur_state, msg.text)
-    await state.clear()
-    await state.update_data(report_kind="Прибыль")
-    await state.set_state(ReportsFSM.waiting_pick_period)
-    await msg.answer("Прибыль: выбери период.", reply_markup=reports_period_kb())
-
-
-@dp.message(StateFilter(None), F.text == "Типы оплат")
-@dp.message(ReportsFSM.waiting_root, F.text == "Типы оплат")
-@dp.message(AdminMenuFSM.root, F.text == "Типы оплат")
-async def reports_shortcut_payment_types(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_payments_by_method"):
-        return await msg.answer("Только для администраторов.")
-    cur_state = await state.get_state()
-    logging.info("reports_shortcut_payment_types: state=%s text=%s", cur_state, msg.text)
-    await state.clear()
-    await state.update_data(report_kind="Типы оплат")
-    await state.set_state(ReportsFSM.waiting_pick_period)
-    await msg.answer("Типы оплат: выбери период.", reply_markup=reports_period_kb())
 
 
 @dp.message(Command("help"))
@@ -3327,21 +3375,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
-@dp.message(ReportsFSM.waiting_pick_period, F.text.in_({"День","Месяц","Год"}))
-async def reports_run_period(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    kind = data.get("report_kind")  # "Касса" | "Прибыль" | "Типы оплат"
-    mapping = {"День": "day", "Месяц": "month", "Год": "year"}
-    period = mapping.get(msg.text, "day")
-
-    if kind == "Касса":
-        text = await get_cash_report_text(period)
-    elif kind == "Прибыль":
-        text = await get_profit_report_text(period)
-    elif kind == "Типы оплат":
-        text = await get_payments_by_method_report_text(period)
-    else:
-        text = "Неизвестный тип отчёта."
-
-    await msg.answer(text, reply_markup=reports_period_kb())
