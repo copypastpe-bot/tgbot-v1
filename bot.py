@@ -4,7 +4,7 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
@@ -486,23 +486,34 @@ async def reports_root(msg: Message, state: FSMContext):
     await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
 
 
-# Shortcuts: pressing "Касса" or "Прибыль" anywhere (admin) opens period picker
-@dp.message(F.text == "Касса")
+@dp.message(StateFilter(None), F.text == "Касса")
 async def reports_shortcut_cash(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_cash_reports"):
         return
+    await state.clear()
     await state.update_data(report_kind="Касса")
     await state.set_state(ReportsFSM.waiting_pick_period)
     await msg.answer("Касса: выбери период.", reply_markup=reports_period_kb())
 
 
-@dp.message(F.text == "Прибыль")
+@dp.message(StateFilter(None), F.text == "Прибыль")
 async def reports_shortcut_profit(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_profit_reports"):
         return
+    await state.clear()
     await state.update_data(report_kind="Прибыль")
     await state.set_state(ReportsFSM.waiting_pick_period)
     await msg.answer("Прибыль: выбери период.", reply_markup=reports_period_kb())
+
+
+@dp.message(StateFilter(None), F.text == "Типы оплат")
+async def reports_shortcut_payment_types(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_payments_by_method"):
+        return
+    await state.clear()
+    await state.update_data(report_kind="Типы оплат")
+    await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer("Типы оплат: выбери период.", reply_markup=reports_period_kb())
 
 
 @dp.message(Command("help"))
