@@ -353,9 +353,10 @@ def norm_pay_method_py(p: str | None) -> str:
 
 async def set_commands():
     cmds = [
-        BotCommand(command="start", description="Старт"),
-        BotCommand(command="help",  description="Помощь"),
-        BotCommand(command="admin_panel", description="Меню администратора"),
+        BotCommand(command="start",        description="Старт"),
+        BotCommand(command="help",         description="Помощь"),
+        BotCommand(command="admin_panel",  description="Меню администратора"),
+        BotCommand(command="order",        description="Добавить заказ (мастер-меню)"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -474,6 +475,7 @@ async def help_cmd(msg: Message):
     if role in ("admin", "superadmin"):
         text = (
             "Команды администратора:\n"
+            "\n"
             "/admin_panel — открыть меню администратора\n"
             "/whoami — мои права\n"
             "/tx_last <N> — последние N транзакций\n"
@@ -491,6 +493,15 @@ async def help_cmd(msg: Message):
         )
 
     await msg.answer(text)
+
+
+@dp.message(Command("order"))
+async def order_open_master_flow(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer(
+        "Мастер: оформление заказа.\nНажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» и следуй шагам.",
+        reply_markup=master_main_kb()
+    )
 
 
 @dp.message(Command("whoami"))
@@ -2445,6 +2456,10 @@ master_kb = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+
+
+def master_main_kb() -> ReplyKeyboardMarkup:
+    return master_kb
 salary_period_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="День"), KeyboardButton(text="Неделя")],
