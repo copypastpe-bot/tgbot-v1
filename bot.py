@@ -479,6 +479,14 @@ async def admin_panel_alias(msg: Message, state: FSMContext):
     await admin_menu_start(msg, state)
 
 
+@dp.message(F.text == "Отчёты")
+async def reports_root(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(ReportsFSM.waiting_root)
+    await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
+
+
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
     global pool
@@ -1131,50 +1139,31 @@ async def rep_master_salary_entry(msg: Message, state: FSMContext):
 
 @dp.message(ReportsFSM.waiting_root, F.text.casefold() == "типы оплат")
 async def rep_paytypes_entry(msg: Message, state: FSMContext):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="день"),   KeyboardButton(text="неделя")],
-            [KeyboardButton(text="месяц"), KeyboardButton(text="год")],
-            [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
     await state.update_data(report_kind="paytypes")
-    await msg.answer("Выберите период:", reply_markup=kb)
+    await msg.answer("Выберите период:", reply_markup=reports_period_kb())
     await state.set_state(ReportsFSM.waiting_pick_period)
 
 
-@dp.message(ReportsFSM.waiting_pick_period, F.text.casefold() == "назад")
-async def rep_period_back(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    report_kind = data.get("report_kind", "master_orders")
-    if report_kind in ("master_orders", "master_salary"):
-        async with pool.acquire() as conn:
-            masters = await conn.fetch(
-                "SELECT id, tg_user_id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
-                "FROM staff WHERE role IN ('master','admin') AND is_active ORDER BY id LIMIT 10"
-            )
-        if masters:
-            kb = ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text=f"{r['fn']} {r['ln']} | tg:{r['tg_user_id']}")] for r in masters] +
-                         [[KeyboardButton(text="Ввести tg id вручную")],
-                          [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            )
-            await state.set_state(ReportsFSM.waiting_pick_master)
-            return await msg.answer("Выберите мастера или введите tg id:", reply_markup=kb)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        )
-        await state.set_state(ReportsFSM.waiting_pick_master)
-        return await msg.answer("Введите tg id мастера:", reply_markup=kb)
+@dp.message(ReportsFSM.waiting_root, F.text.in_({"Касса", "Прибыль"}))
+async def reports_pick_period(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    kind = msg.text
+    await state.update_data(report_kind=kind)
+    await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer(f"{kind}: выбери период.", reply_markup=reports_period_kb())
 
+
+@dp.message(ReportsFSM.waiting_pick_period, F.text == "Назад")
+async def rep_period_back(msg: Message, state: FSMContext):
     await state.set_state(ReportsFSM.waiting_root)
-    return await msg.answer("Выберите отчёт:", reply_markup=reports_root_kb())
+    await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
+
+
+@dp.message(ReportsFSM.waiting_pick_period, F.text == "Выйти")
+async def reports_exit_to_admin(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(ReportsFSM.waiting_pick_master, F.text.casefold() == "назад")
@@ -1183,10 +1172,17 @@ async def rep_master_back(msg: Message, state: FSMContext):
     return await msg.answer("Выберите отчёт:", reply_markup=reports_root_kb())
 
 
-@dp.message(ReportsFSM.waiting_root, F.text.casefold() == "назад")
+@dp.message(ReportsFSM.waiting_root, F.text == "Назад")
 async def reports_root_back(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.root)
-    return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await state.clear()
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(ReportsFSM.waiting_root, F.text == "Отмена")
+@dp.message(ReportsFSM.waiting_pick_period, F.text == "Отмена")
+async def reports_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Отменено. Возврат в меню администратора.", reply_markup=admin_root_kb())
 
 
 @dp.message(AdminMenuFSM.root, F.text == "Отчёты")
@@ -3142,3 +3138,20 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
     
+@dp.message(ReportsFSM.waiting_pick_period, F.text.in_({"День", "Месяц", "Год"}))
+async def reports_run_period(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    report_kind = data.get("report_kind")
+    mapping = {"День": "day", "Месяц": "month", "Год": "year"}
+    period_code = mapping.get(msg.text, "day")
+
+    if report_kind == "Касса":
+        text = await get_cash_report_text(period_code)
+        await msg.answer(text, reply_markup=reports_period_kb())
+        return
+    if report_kind == "Прибыль":
+        text = await get_profit_report_text(period_code)
+        await msg.answer(text, reply_markup=reports_period_kb())
+        return
+
+    return await rep_master_period(msg, state)
