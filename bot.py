@@ -2442,27 +2442,19 @@ async def ensure_master(user_id: int) -> bool:
     return await has_permission(user_id, "create_orders_clients")
 
 @dp.message(CommandStart())
-async def on_start(msg: Message):
-    # автоматическая регистрация админа остаётся без изменений…
-    # выбираем клавиатуру
-    if await has_permission(msg.from_user.id, "add_master"):
-        kb = main_kb  # админы видят стандартную клавиатуру
-    elif await has_permission(msg.from_user.id, "view_own_salary"):
-        kb = master_kb  # мастера видят мастер‑меню
-    else:
-        kb = main_kb  # на всякий случай
+async def start_handler(msg: Message, state: FSMContext):
+    global pool
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+
+    if role in ("admin", "superadmin"):
+        await admin_menu_start(msg, state)
+        return
+
     await msg.answer(
-        "Привет! Это внутренний бот.\nНажми нужную кнопку.",
-        reply_markup=kb
+        "Привет! Это внутренний бот. Нажми нужную кнопку.",
+        reply_markup=master_kb,
     )
-    # авто-регистрация админа как активного сотрудника
-    if is_admin(msg.from_user.id):
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO staff(tg_user_id, role, is_active) VALUES ($1,'admin',true) "
-                "ON CONFLICT (tg_user_id) DO UPDATE SET is_active=true",
-                msg.from_user.id
-            )
 
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
