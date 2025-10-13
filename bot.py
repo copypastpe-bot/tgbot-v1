@@ -1189,10 +1189,12 @@ async def reports_root_back(msg: Message, state: FSMContext):
     return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
-@dp.message(AdminMenuFSM.root, F.text.casefold() == "отчёты")
+@dp.message(AdminMenuFSM.root, F.text == "Отчёты")
 async def adm_root_reports(msg: Message, state: FSMContext):
-    await state.clear()
-    return await reports_start(msg, state)
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(ReportsFSM.waiting_root)
+    await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
 
 
 @dp.message(AdminMenuFSM.root, F.text.casefold() == "касса")
@@ -3139,3 +3141,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
