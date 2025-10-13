@@ -355,7 +355,7 @@ async def set_commands():
     cmds = [
         BotCommand(command="start", description="Старт"),
         BotCommand(command="help",  description="Помощь"),
-        # если хотите оставить командный поиск клиента — добавьте /find здесь
+        BotCommand(command="admin_panel", description="Меню администратора"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -454,6 +454,11 @@ async def admin_menu_start(msg: Message, state: FSMContext):
         return await msg.answer("Только для администраторов.")
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(Command("admin_panel"))
+async def admin_panel_alias(msg: Message, state: FSMContext):
+    await admin_menu_start(msg, state)
 
 
 @dp.message(Command("whoami"))
@@ -2446,6 +2451,13 @@ async def start_handler(msg: Message, state: FSMContext):
     global pool
     async with pool.acquire() as conn:
         role = await get_user_role(conn, msg.from_user.id)
+        if role not in ("admin", "superadmin") and is_admin(msg.from_user.id):
+            await conn.execute(
+                "INSERT INTO staff(tg_user_id, role, is_active) VALUES ($1,'admin',true) "
+                "ON CONFLICT (tg_user_id) DO UPDATE SET is_active=true",
+                msg.from_user.id,
+            )
+            role = "admin"
 
     if role in ("admin", "superadmin"):
         await admin_menu_start(msg, state)
@@ -2458,35 +2470,34 @@ async def start_handler(msg: Message, state: FSMContext):
 
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
-    # определяем роль из БД
     global pool
-    role = None
     async with pool.acquire() as conn:
-        role = await get_user_role(conn, msg.from_user.id)
+        rec = await conn.fetchrow(
+            "SELECT role, is_active FROM staff WHERE tg_user_id=$1 LIMIT 1",
+            msg.from_user.id,
+        )
+    role = rec["role"] if rec else None
 
-    if role == "admin" or role == "superadmin":
-        lines = [
-            "Доступные команды (админ):",
-            "/reports — отчёты (диалог с кнопками)",
-            "/income <сумма> [тип] [коммент] — внести приход",
-            "/expense <сумма> [коммент] — внести расход",
-            "/withdraw — изъять наличные у мастера (диалог: выбрать мастера → указать сумму → комментарий)",
-            "/add_master <tg_user_id> — добавить мастера",
-            "/list_masters — список мастеров",
-            "/remove_master <tg_user_id> — деактивировать мастера",
-            "/whoami — мои права",
-        ]
-        return await msg.answer("\n".join(lines))
+    if role in ("admin", "superadmin"):
+        text = (
+            "Команды администратора:\n"
+            "/admin_panel — открыть меню администратора\n"
+            "/whoami — мои права\n"
+            "/tx_last <N> — последние N транзакций\n"
+            "/cash [day|month|year|YYYY-MM|YYYY-MM-DD]\n"
+            "/profit [day|month|year|YYYY-MM|YYYY-MM-DD]\n"
+            "/orders [период] [master:<tg> | master_id:<id>]\n"
+            "/list_masters, /add_master, /remove_master\n"
+            "/client_info, /client_set_name, /client_set_phone, /client_set_birthday, /client_set_bonus, /client_add_bonus\n"
+        )
+    else:
+        text = (
+            "Команды мастера:\n"
+            "/whoami — мои права\n"
+            "Для оформления заказа — используйте кнопки ниже."
+        )
 
-    # по умолчанию — мастер и прочие роли
-    lines = [
-        "Доступные команды:",
-        "/whoami — мои права",
-        "",
-        "Основные действия доступны через кнопки в чате.",
-        "Если что-то не работает — напишите администратору.",
-    ]
-    return await msg.answer("\n".join(lines))
+    await msg.answer(text)
 
 # ---- /find ----
 @dp.message(Command("find"))
