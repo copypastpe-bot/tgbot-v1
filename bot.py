@@ -748,46 +748,41 @@ async def payroll_report(msg: Message):
     ]
     await msg.answer(f"ЗП за {period}:\n" + "\n".join(lines))
 
-# ===== /cash admin command =====
-@dp.message(Command("cash"))
-async def cash_report(msg: Message):
-    # доступ только у админа
-    if not await has_permission(msg.from_user.id, "view_cash_reports"):
-        return await msg.answer("Только для администраторов.")
-
-    # Форматы:
-    # /cash                -> за сегодня
-    # /cash day|month|year -> агрегат за текущий период
-    # /cash 2025-10-03     -> конкретный день
-    # /cash 2025-10        -> конкретный месяц
-    parts = msg.text.split(maxsplit=1)
-    args = parts[1].strip().lower() if len(parts) > 1 else "day"
-
-    # хелпер: строим SQL-границы периода [start, end)
+# ---- helper for /cash (aggregates; year -> monthly details)
+async def get_cash_report_text(period: str) -> str:
+    """
+    Build cash report text for:
+      period in {"day","month","year"} or specific "YYYY-MM" / "YYYY-MM-DD".
+    For 'year' the details are aggregated by months, not by days.
+    """
+    import re
     def trunc(unit: str) -> str:
-        # оставляем расчёт на стороне БД
+        # compute bounds on DB side
         return f"date_trunc('{unit}', NOW())"
 
-    if args in ("day", "month", "year"):
-        period_label = {"day": "сегодня", "month": "текущий месяц", "year": "текущий год"}[args]
-        unit = args
+    if period in ("day", "month", "year"):
+        period_label = {"day": "сегодня", "month": "текущий месяц", "year": "текущий год"}[period]
+        unit = period
         start_sql = trunc(unit)
         end_sql = f"{trunc(unit)} + interval '1 {unit}'"
+        detail_by_months = (period == "year")
     else:
-        mday = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", args)
-        mmon = re.fullmatch(r"(\d{4})-(\d{2})", args)
+        mday = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", period or "")
+        mmon = re.fullmatch(r"(\d{4})-(\d{2})", period or "")
         if mday:
             y, m, d = map(int, mday.groups())
             period_label = f"{y:04d}-{m:02d}-{d:02d}"
             start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-{d:02d} 00:00:00+00'"
             end_sql   = f"{start_sql} + interval '1 day'"
+            detail_by_months = False
         elif mmon:
             y, m = map(int, mmon.groups())
             period_label = f"{y:04d}-{m:02d}"
             start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-01 00:00:00+00'"
             end_sql   = f"{start_sql} + interval '1 month'"
+            detail_by_months = False
         else:
-            return await msg.answer("Формат: /cash [day|month|year|YYYY-MM|YYYY-MM-DD]")
+            return "Формат: /cash [day|month|year|YYYY-MM|YYYY-MM-DD]"
 
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
@@ -800,18 +795,35 @@ async def cash_report(msg: Message):
             WHERE day >= {start_sql} AND day < {end_sql};
             """
         )
-        rows = await conn.fetch(
-            f"""
-            SELECT day::date AS d,
-                   COALESCE(income,0)::numeric(12,2)  AS income,
-                   COALESCE(expense,0)::numeric(12,2) AS expense,
-                   COALESCE(delta,0)::numeric(12,2)   AS delta
-            FROM v_cash_summary
-            WHERE day >= {start_sql} AND day < {end_sql}
-            ORDER BY day DESC
-            LIMIT 31;
-            """
-        )
+        if detail_by_months:
+            rows = await conn.fetch(
+                f"""
+                SELECT date_trunc('month', day) AS g,
+                       COALESCE(SUM(income),0)::numeric(12,2)  AS income,
+                       COALESCE(SUM(expense),0)::numeric(12,2) AS expense,
+                       COALESCE(SUM(delta),0)::numeric(12,2)   AS delta
+                FROM v_cash_summary
+                WHERE day >= {start_sql} AND day < {end_sql}
+                GROUP BY 1
+                ORDER BY 1 DESC
+                LIMIT 12;
+                """
+            )
+            detail_label = "Детализация по месяцам (последние):"
+        else:
+            rows = await conn.fetch(
+                f"""
+                SELECT day::date AS g,
+                       COALESCE(income,0)::numeric(12,2)  AS income,
+                       COALESCE(expense,0)::numeric(12,2) AS expense,
+                       COALESCE(delta,0)::numeric(12,2)   AS delta
+                FROM v_cash_summary
+                WHERE day >= {start_sql} AND day < {end_sql}
+                ORDER BY day DESC
+                LIMIT 31;
+                """
+            )
+            detail_label = "Детализация по дням (последние):"
 
     income  = rec["income"] or 0
     expense = rec["expense"] or 0
@@ -824,11 +836,28 @@ async def cash_report(msg: Message):
         f"= Дельта: {delta}₽",
     ]
     if rows:
-        lines.append("\nДетализация по дням (последние):")
+        lines.append(f"\n{detail_label}")
         for r in rows:
-            lines.append(f"{r['d']}: +{r['income']} / -{r['expense']} = {r['delta']}₽")
+            g = r["g"]
+            # g can be date/datetime
+            try:
+                # choose format by detail type
+                label = g.strftime("%Y-%m") if "месяц" in detail_label else g.strftime("%Y-%m-%d")
+            except Exception:
+                label = str(g)
+            lines.append(f"{label}: +{r['income']} / -{r['expense']} = {r['delta']}₽")
+    return "\n".join(lines)
 
-    await msg.answer("\n".join(lines))
+# ===== /cash admin command =====
+@dp.message(Command("cash"))
+async def cash_report(msg: Message):
+    # доступ только у админа
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=1)
+    period = parts[1].strip().lower() if len(parts) > 1 else "day"
+    text = await get_cash_report_text(period)
+    await msg.answer(text)
 
 # ===== /profit admin command =====
 @dp.message(Command("profit"))
