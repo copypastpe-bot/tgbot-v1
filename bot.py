@@ -859,47 +859,45 @@ async def cash_report(msg: Message):
     text = await get_cash_report_text(period)
     await msg.answer(text)
 
-# ===== /profit admin command =====
-@dp.message(Command("profit"))
-async def profit_report(msg: Message):
-    # доступ только у админа
-    if not await has_permission(msg.from_user.id, "view_profit_reports"):
-        return await msg.answer("Только для администраторов.")
-
-    # Форматы:
-    # /profit                -> за сегодня
-    # /profit day|month|year -> текущий период
-    # /profit 2025-10-03     -> конкретный день
-    # /profit 2025-10        -> конкретный месяц
-    parts = msg.text.split(maxsplit=1)
-    args = parts[1].strip().lower() if len(parts) > 1 else "day"
-
+# ---- helper for /profit (aggregates; year -> monthly details)
+async def get_profit_report_text(period: str) -> str:
+    """
+    Build profit report text for:
+      period in {"day","month","year"} or specific "YYYY-MM" / "YYYY-MM-DD".
+    For 'year' the details are aggregated by months, not by days.
+    """
+    import re
     def trunc(unit: str) -> str:
         return f"date_trunc('{unit}', NOW())"
 
-    if args in ("day", "month", "year"):
-        period_label = {"day": "сегодня", "month": "текущий месяц", "year": "текущий год"}[args]
-        unit = args
+    if period in ("day", "month", "year"):
+        period_label = {"day": "сегодня", "month": "текущий месяц", "year": "текущий год"}[period]
+        unit = period
         start_sql = trunc(unit)
         end_sql = f"{trunc(unit)} + interval '1 {unit}'"
+        by_months = (period == "year")
     else:
-        mday = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", args)
-        mmon = re.fullmatch(r"(\d{4})-(\d{2})", args)
+        mday = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", period or "")
+        mmon = re.fullmatch(r"(\d{4})-(\d{2})", period or "")
         if mday:
             y, m, d = map(int, mday.groups())
             period_label = f"{y:04d}-{m:02d}-{d:02d}"
             start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-{d:02d} 00:00:00+00'"
             end_sql   = f"{start_sql} + interval '1 day'"
+            by_months = False
         elif mmon:
             y, m = map(int, mmon.groups())
             period_label = f"{y:04d}-{m:02d}"
             start_sql = f"TIMESTAMP WITH TIME ZONE '{y:04d}-{m:02d}-01 00:00:00+00'"
             end_sql   = f"{start_sql} + interval '1 month'"
+            by_months = False
         else:
-            return await msg.answer("Формат: /profit [day|month|year|YYYY-MM|YYYY-MM-DD]")
+            return "Формат: /profit [day|month|year|YYYY-MM|YYYY-MM-DD]"
+
+    group_sql = "date_trunc('month', day)" if by_months else "date_trunc('day', day)"
+    detail_label = "По месяцам (последние):" if by_months else "По дням (последние):"
 
     async with pool.acquire() as conn:
-        # Итого по периоду
         rev = await conn.fetchval(
             f"""
             SELECT COALESCE(SUM(o.amount_cash), 0)::numeric(12,2)
@@ -914,8 +912,6 @@ async def profit_report(msg: Message):
             WHERE c.kind='expense' AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
             """
         )
-
-        # Детализация по дням (до 31 строки)
         rows = await conn.fetch(
             f"""
             WITH
@@ -930,19 +926,25 @@ async def profit_report(msg: Message):
               FROM cashbook_entries c
               WHERE c.kind='expense' AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
               GROUP BY 1
+            ),
+            d AS (
+              SELECT COALESCE(r.day, e.day) AS day,
+                     COALESCE(r.revenue, 0)   AS revenue,
+                     COALESCE(e.expense, 0)   AS expense
+              FROM r FULL OUTER JOIN e ON r.day = e.day
             )
-            SELECT COALESCE(r.day, e.day) AS day,
-                   COALESCE(r.revenue, 0)::numeric(12,2) AS revenue,
-                   COALESCE(e.expense, 0)::numeric(12,2) AS expense,
-                   (COALESCE(r.revenue, 0) - COALESCE(e.expense, 0))::numeric(12,2) AS profit
-            FROM r FULL OUTER JOIN e ON r.day = e.day
-            ORDER BY day DESC
+            SELECT {group_sql} AS g,
+                   COALESCE(SUM(revenue),0)::numeric(12,2) AS revenue,
+                   COALESCE(SUM(expense),0)::numeric(12,2) AS expense,
+                   (COALESCE(SUM(revenue),0) - COALESCE(SUM(expense),0))::numeric(12,2) AS profit
+            FROM d
+            GROUP BY 1
+            ORDER BY 1 DESC
             LIMIT 31;
             """
         )
 
     profit = (rev or 0) - (exp or 0)
-
     lines = [
         f"Прибыль за {period_label}:",
         f"💰 Выручка: {rev or 0}₽",
@@ -950,11 +952,26 @@ async def profit_report(msg: Message):
         f"= Прибыль: {profit}₽",
     ]
     if rows:
-        lines.append("\nПо дням (последние):")
+        lines.append(f"\n{detail_label}")
         for r in rows:
-            lines.append(f"{r['day']:%Y-%m-%d}: выручка {r['revenue']} / расходы {r['expense']} → прибыль {r['profit']}₽")
+            g = r["g"]
+            try:
+                s = g.strftime("%Y-%m") if by_months else g.strftime("%Y-%m-%d")
+            except Exception:
+                s = str(g)
+            lines.append(f"{s}: выручка {r['revenue']} / расходы {r['expense']} → прибыль {r['profit']}₽")
+    return "\n".join(lines)
 
-    await msg.answer("\n".join(lines))
+# ===== /profit admin command =====
+@dp.message(Command("profit"))
+async def profit_report(msg: Message):
+    # доступ только у админа
+    if not await has_permission(msg.from_user.id, "view_profit_reports"):
+        return await msg.answer("Только для администраторов.")
+    parts = msg.text.split(maxsplit=1)
+    period = parts[1].strip().lower() if len(parts) > 1 else "day"
+    text = await get_profit_report_text(period)
+    await msg.answer(text)
 
 
 @dp.message(Command("orders"))
@@ -3184,3 +3201,20 @@ async def reports_run_period(msg: Message, state: FSMContext):
         return
 
     return await rep_master_period(msg, state)
+
+# === FSM handler for reports (period pick: Касса / Прибыль)
+@dp.message(ReportsFSM.waiting_pick_period, F.text.in_({"День","Месяц","Год"}))
+async def reports_run_period(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    kind = data.get("report_kind")  # "Касса" или "Прибыль"
+    mapping = {"День":"day","Месяц":"month","Год":"year"}
+    period = mapping.get(msg.text, "day")
+
+    if kind == "Касса":
+        text = await get_cash_report_text(period)
+    elif kind == "Прибыль":
+        text = await get_profit_report_text(period)
+    else:
+        return await msg.answer("Неизвестный тип отчёта.")
+
+    await msg.answer(text, reply_markup=reports_period_kb())
