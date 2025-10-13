@@ -461,6 +461,38 @@ async def admin_panel_alias(msg: Message, state: FSMContext):
     await admin_menu_start(msg, state)
 
 
+@dp.message(Command("help"))
+async def help_cmd(msg: Message):
+    global pool
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow(
+            "SELECT role, is_active FROM staff WHERE tg_user_id=$1 LIMIT 1",
+            msg.from_user.id,
+        )
+    role = rec["role"] if rec else None
+
+    if role in ("admin", "superadmin"):
+        text = (
+            "Команды администратора:\n"
+            "/admin_panel — открыть меню администратора\n"
+            "/whoami — мои права\n"
+            "/tx_last <N> — последние N транзакций\n"
+            "/cash [day|month|year|YYYY-MM|YYYY-MM-DD]\n"
+            "/profit [day|month|year|YYYY-MM|YYYY-MM-DD]\n"
+            "/orders [period] [master:<tg> | master_id:<id>]\n"
+            "/list_masters, /add_master, /remove_master\n"
+            "/client_info, /client_set_name, /client_set_phone, /client_set_birthday, /client_set_bonus, /client_add_bonus\n"
+        )
+    else:
+        text = (
+            "Команды мастера:\n"
+            "/whoami — мои права\n"
+            "Для оформления заказа — используйте кнопки ниже."
+        )
+
+    await msg.answer(text)
+
+
 @dp.message(Command("whoami"))
 async def whoami(msg: Message):
     global pool
@@ -1345,7 +1377,7 @@ async def clients_edit(msg: Message, state: FSMContext):
     )
 
 
-@dp.message(ReportsFSM.waiting_pick_master)
+@dp.message(ReportsFSM.waiting_pick_master, ~F.text.startswith("/"))
 async def rep_master_pick(msg: Message, state: FSMContext):
     txt = (msg.text or "").strip()
     m = re.search(r"tg:(\d+)", txt)
@@ -1370,7 +1402,7 @@ async def rep_master_pick(msg: Message, state: FSMContext):
     await state.set_state(ReportsFSM.waiting_pick_period)
 
 
-@dp.message(ReportsFSM.waiting_pick_period)
+@dp.message(ReportsFSM.waiting_pick_period, ~F.text.startswith("/"))
 async def rep_master_period(msg: Message, state: FSMContext):
     period = (msg.text or "").strip().lower()
     if period not in ("день", "неделя", "месяц", "год"):
@@ -2434,7 +2466,7 @@ async def cancel_any(msg: Message, state: FSMContext):
     return await msg.answer("Отменено.", reply_markup=master_kb)
 
 
-@dp.message(AdminMenuFSM.root)
+@dp.message(AdminMenuFSM.root, F.text, ~F.text.startswith("/"))
 async def admin_root_fallback(msg: Message, state: FSMContext):
     await msg.answer("Выберите действие на клавиатуре ниже.", reply_markup=admin_root_kb())
 
@@ -2467,37 +2499,6 @@ async def start_handler(msg: Message, state: FSMContext):
         "Привет! Это внутренний бот. Нажми нужную кнопку.",
         reply_markup=master_kb,
     )
-
-@dp.message(Command("help"))
-async def help_cmd(msg: Message):
-    global pool
-    async with pool.acquire() as conn:
-        rec = await conn.fetchrow(
-            "SELECT role, is_active FROM staff WHERE tg_user_id=$1 LIMIT 1",
-            msg.from_user.id,
-        )
-    role = rec["role"] if rec else None
-
-    if role in ("admin", "superadmin"):
-        text = (
-            "Команды администратора:\n"
-            "/admin_panel — открыть меню администратора\n"
-            "/whoami — мои права\n"
-            "/tx_last <N> — последние N транзакций\n"
-            "/cash [day|month|year|YYYY-MM|YYYY-MM-DD]\n"
-            "/profit [day|month|year|YYYY-MM|YYYY-MM-DD]\n"
-            "/orders [период] [master:<tg> | master_id:<id>]\n"
-            "/list_masters, /add_master, /remove_master\n"
-            "/client_info, /client_set_name, /client_set_phone, /client_set_birthday, /client_set_bonus, /client_add_bonus\n"
-        )
-    else:
-        text = (
-            "Команды мастера:\n"
-            "/whoami — мои права\n"
-            "Для оформления заказа — используйте кнопки ниже."
-        )
-
-    await msg.answer(text)
 
 # ---- /find ----
 @dp.message(Command("find"))
@@ -3063,14 +3064,11 @@ async def master_income(msg: Message):
 
 # fallback
 
-@dp.message(F.text)
+@dp.message(F.text, ~F.text.startswith("/"))
 async def unknown(msg: Message, state: FSMContext):
     # Если пользователь находится в процессе любого сценария — не вмешиваемся
     cur = await state.get_state()
     if cur is not None:
-        return
-    # Не перехватываем команды вида /something
-    if msg.text and msg.text.startswith("/"):
         return
     kb = master_kb if await has_permission(msg.from_user.id, "view_own_salary") else main_kb
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
