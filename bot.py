@@ -3,7 +3,17 @@ import csv, io
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BotCommand, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    BotCommand,
+    BotCommandScopeDefault,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -352,24 +362,38 @@ def tx_last_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
-async def build_masters_kb(conn) -> ReplyKeyboardMarkup:
-    rows: list[list[KeyboardButton]] = []
+async def build_masters_kb(conn) -> InlineKeyboardMarkup:
     masters = await conn.fetch(
         "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
         "FROM staff WHERE role='master' AND is_active=true ORDER BY fn, ln, id"
     )
-    line: list[KeyboardButton] = []
+
+    buttons: list[InlineKeyboardButton] = []
     for r in masters:
         cash_on_hand, _withdrawn = await get_master_wallet(conn, r['id'])
-        label = f"id:{r['id']} — {r['fn']} {r['ln']} (наличн.: {cash_on_hand}₽)".strip()
-        line.append(KeyboardButton(text=label))
-        if len(line) == 2:
-            rows.append(line)
-            line = []
-    if line:
-        rows.append(line)
-    rows.append([KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+        display_name = f"{r['fn']} {r['ln']}".strip() or f"Мастер {r['id']}"
+        amount_str = str((cash_on_hand or Decimal(0)).quantize(Decimal("0.1"))).replace('.', ',')
+        label = f"{display_name}({amount_str})"
+        buttons.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"withdraw_master:{r['id']}",
+            )
+        )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    # store attribute for completeness; InlineKeyboardMarkup ignores resize, but we keep for consistency with requirement
+    setattr(markup, "resize_keyboard", True)
+
+    for i in range(0, len(buttons), 2):
+        markup.row(*buttons[i:i + 2])
+
+    markup.row(
+        InlineKeyboardButton(text="Назад", callback_data="withdraw_nav:back"),
+        InlineKeyboardButton(text="Отмена", callback_data="withdraw_nav:cancel"),
+    )
+
+    return markup
 
 
 def withdraw_nav_kb() -> ReplyKeyboardMarkup:
@@ -846,32 +870,71 @@ async def withdraw_master_cancel(msg: Message, state: FSMContext):
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
-@dp.message(WithdrawFSM.waiting_master)
-async def withdraw_master_got(msg: Message, state: FSMContext):
-    logging.info(f"[withdraw] step=master_selected user={msg.from_user.id} text={msg.text}")
-    m = re.match(r"^\s*id:\s*(\d+)", msg.text or "", re.IGNORECASE)
-    if not m:
-        async with pool.acquire() as conn:
-            kb = await build_masters_kb(conn)
-        return await msg.answer("Выберите мастера КНОПКОЙ ниже.", reply_markup=kb)
-    master_id = int(m.group(1))
+@dp.callback_query(WithdrawFSM.waiting_master)
+async def withdraw_master_callback(query: CallbackQuery, state: FSMContext):
+    logging.info(
+        f"[withdraw] step=master_callback user={query.from_user.id} data={query.data}"
+    )
+    data = (query.data or "").strip()
+
+    if data == "withdraw_nav:back":
+        await query.answer()
+        await state.set_state(WithdrawFSM.waiting_amount)
+        await query.message.answer(
+            "Введите сумму изъятия:", reply_markup=withdraw_nav_kb()
+        )
+        return
+
+    if data == "withdraw_nav:cancel":
+        await query.answer()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer(
+            "Меню администратора:", reply_markup=admin_root_kb()
+        )
+        return
+
+    if not data.startswith("withdraw_master:"):
+        await query.answer("Неизвестное действие", show_alert=True)
+        return
+
+    try:
+        master_id = int(data.split(":", 1)[1])
+    except Exception:
+        await query.answer("Некорректные данные", show_alert=True)
+        return
+
     async with pool.acquire() as conn:
         cash_on_hand, withdrawn = await get_master_wallet(conn, master_id)
 
-    data = await state.get_data()
-    amount = Decimal(data.get("withdraw_amount", "0") or "0")
+    stored = await state.get_data()
+    amount = Decimal(stored.get("withdraw_amount", "0") or "0")
 
     if amount > cash_on_hand:
+        await query.answer("Недостаточно наличных", show_alert=True)
         await state.set_state(WithdrawFSM.waiting_amount)
-        return await msg.answer(
+        await query.message.answer(
             f"У мастера на руках {cash_on_hand}₽ (изъято ранее {withdrawn}₽). "
             f"Вы запросили {amount}₽ — это больше доступного.\n"
             f"Введите сумму не больше {cash_on_hand}₽:",
             reply_markup=withdraw_nav_kb(),
         )
+        return
+
+    await query.answer()
     await state.update_data(withdraw_master_id=master_id)
     await state.set_state(WithdrawFSM.waiting_comment)
-    return await msg.answer("Комментарий (или «Без комментария»):", reply_markup=withdraw_nav_kb())
+    await query.message.answer(
+        "Комментарий (или «Без комментария»):",
+        reply_markup=withdraw_nav_kb(),
+    )
+
+
+@dp.message(WithdrawFSM.waiting_master)
+async def withdraw_master_got(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=master_text_input user={msg.from_user.id} text={msg.text}")
+    async with pool.acquire() as conn:
+        kb = await build_masters_kb(conn)
+    return await msg.answer("Пожалуйста, выберите мастера кнопкой ниже.", reply_markup=kb)
 
 
 @dp.message(WithdrawFSM.waiting_comment, F.text.lower() == "назад")
