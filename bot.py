@@ -360,7 +360,8 @@ async def build_masters_kb(conn) -> ReplyKeyboardMarkup:
     )
     line: list[KeyboardButton] = []
     for r in masters:
-        label = f"id:{r['id']} — {r['fn']} {r['ln']}".strip()
+        cash_on_hand, _withdrawn = await get_master_wallet(conn, r['id'])
+        label = f"id:{r['id']} — {r['fn']} {r['ln']} (наличн.: {cash_on_hand}₽)".strip()
         line.append(KeyboardButton(text=label))
         if len(line) == 2:
             rows.append(line)
@@ -766,6 +767,36 @@ async def admin_masters_remove_phone(msg: Message, state: FSMContext):
     await msg.answer("Мастер деактивирован.", reply_markup=admin_root_kb())
 
 
+async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
+    """
+    Возвращает (cash_on_hand, withdrawn_total) по тем же правилам, что и в отчёте «Мастер/Заказы/Оплаты».
+    cash_on_hand = «Наличных у мастера»
+    withdrawn_total = «Изъято у мастера»
+    """
+    cash_on_orders = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount),0)
+        FROM cashbook_entries
+        WHERE kind='income' AND method='Наличные'
+          AND master_id=$1 AND order_id IS NOT NULL
+        """,
+        master_id,
+    )
+    withdrawn = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount),0)
+        FROM cashbook_entries
+        WHERE kind='income' AND method='Изъятие'
+          AND master_id=$1 AND order_id IS NULL
+        """,
+        master_id,
+    )
+
+    from decimal import Decimal
+
+    return Decimal(cash_on_orders or 0), Decimal(withdrawn or 0)
+
+
 @dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "назад")
 async def withdraw_amount_back(msg: Message, state: FSMContext):
     await state.set_state(AdminMenuFSM.root)
@@ -791,7 +822,11 @@ async def withdraw_amount_got(msg: Message, state: FSMContext):
     async with pool.acquire() as conn:
         kb = await build_masters_kb(conn)
     await state.set_state(WithdrawFSM.waiting_master)
-    return await msg.answer("Выберите мастера:", reply_markup=kb)
+    return await msg.answer(
+        "Выберите мастера:\nДоступно к изъятию = только наличные, которые мастер получил по заказам. "
+        "Изъятия уменьшают этот остаток.",
+        reply_markup=kb,
+    )
 
 
 @dp.message(WithdrawFSM.waiting_master, F.text.lower() == "назад")
@@ -814,6 +849,20 @@ async def withdraw_master_got(msg: Message, state: FSMContext):
             kb = await build_masters_kb(conn)
         return await msg.answer("Выберите мастера КНОПКОЙ ниже.", reply_markup=kb)
     master_id = int(m.group(1))
+    async with pool.acquire() as conn:
+        cash_on_hand, withdrawn = await get_master_wallet(conn, master_id)
+
+    data = await state.get_data()
+    amount = Decimal(data.get("withdraw_amount", "0") or "0")
+
+    if amount > cash_on_hand:
+        await state.set_state(WithdrawFSM.waiting_amount)
+        return await msg.answer(
+            f"У мастера на руках {cash_on_hand}₽ (изъято ранее {withdrawn}₽). "
+            f"Вы запросили {amount}₽ — это больше доступного.\n"
+            f"Введите сумму не больше {cash_on_hand}₽:",
+            reply_markup=withdraw_nav_kb(),
+        )
     await state.update_data(withdraw_master_id=master_id)
     await state.set_state(WithdrawFSM.waiting_comment)
     return await msg.answer("Комментарий (или «Без комментария»):", reply_markup=withdraw_nav_kb())
@@ -849,7 +898,7 @@ async def withdraw_finish(msg: Message, state: FSMContext):
         tx = await conn.fetchrow(
             """
             INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-            VALUES ('income', 'Наличные', $1, $2, NULL, $3, now())
+            VALUES ('income', 'Изъятие', $1, $2, NULL, $3, now())
             RETURNING id
             """,
             amount,
