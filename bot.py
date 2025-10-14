@@ -13,6 +13,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ContentType,
 )
 from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.state import StatesGroup, State
@@ -95,6 +96,7 @@ MASTER_PER_3000 = Decimal(os.getenv("MASTER_RATE_PER_3000", "1000"))
 UPSELL_PER_3000 = Decimal(os.getenv("UPSELL_RATE_PER_3000", "500"))
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 pool: asyncpg.Pool | None = None
@@ -826,6 +828,41 @@ async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
     return Decimal(cash_on_orders or 0), Decimal(withdrawn or 0)
 
 
+def parse_amount_ru(text: str) -> tuple[Decimal | None, dict]:
+    raw = (text or "").strip()
+    dbg: dict[str, object] = {"raw": raw}
+
+    normalized = raw.replace("\u00A0", " ")  # NBSP → space
+    normalized = normalized.replace(" ", "")
+    dbg["no_spaces"] = normalized
+
+    normalized = normalized.replace(",", ".")
+    dbg["comma_to_dot"] = normalized
+
+    if normalized.count(".") > 1:
+        dbg["error"] = "too_many_decimal_points"
+        return None, dbg
+
+    if not any(ch.isdigit() for ch in normalized):
+        dbg["error"] = "no_digits"
+        return None, dbg
+
+    try:
+        value = Decimal(normalized)
+    except Exception as exc:  # noqa: BLE001
+        dbg["error"] = f"decimal_error:{exc}"
+        return None, dbg
+
+    value = value.quantize(Decimal("0.1"))
+    dbg["value"] = str(value)
+
+    if value <= 0:
+        dbg["error"] = "non_positive"
+        return None, dbg
+
+    return value, dbg
+
+
 @dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "назад")
 async def withdraw_amount_back(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=amount_back user={msg.from_user.id} text={msg.text}")
@@ -844,18 +881,20 @@ async def withdraw_amount_cancel(msg: Message, state: FSMContext):
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
-@dp.message(WithdrawFSM.waiting_amount)
+@dp.message(WithdrawFSM.waiting_amount, F.content_type == ContentType.TEXT)
 async def withdraw_amount_got(msg: Message, state: FSMContext):
-    logging.info(f"[withdraw] step=amount_input user={msg.from_user.id} text={msg.text}")
-    txt = (msg.text or "").replace(",", ".").strip()
-    try:
-        amt = Decimal(txt)
-    except Exception:
-        return await msg.answer("Не понял сумму. Пример: 2500 или 2500.50", reply_markup=withdraw_nav_kb())
-    amt = amt.quantize(Decimal("0.1"))
-    if amt <= 0:
-        return await msg.answer("Сумма должна быть > 0. Введите заново:", reply_markup=withdraw_nav_kb())
-    await state.update_data(withdraw_amount=str(amt))
+    logger.debug(
+        f"[withdraw amount] state={await state.get_state()} user={msg.from_user.id} text={msg.text!r}"
+    )
+    amount, dbg = parse_amount_ru(msg.text or "")
+    logger.debug(f"[withdraw amount] parse_dbg={dbg}")
+    if amount is None:
+        return await msg.answer(
+            "Не понял сумму. Пример: 2 500 или 2500,5",
+            reply_markup=withdraw_nav_kb(),
+        )
+
+    await state.update_data(withdraw_amount=str(amount))
     async with pool.acquire() as conn:
         kb = await build_masters_kb(conn)
     await state.set_state(WithdrawFSM.waiting_master)
