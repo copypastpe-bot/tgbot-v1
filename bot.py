@@ -15,6 +15,17 @@ class AdminMenuFSM(StatesGroup):
     clients = State()
 
 
+class AdminClientsFSM(StatesGroup):
+    find_wait_phone = State()
+    edit_wait_phone = State()
+    edit_pick_field = State()
+    edit_wait_value = State()
+
+
+class AdminMastersFSM(StatesGroup):
+    remove_wait_phone = State()
+
+
 class IncomeFSM(StatesGroup):
     waiting_method = State()
     waiting_amount = State()
@@ -317,6 +328,16 @@ def admin_clients_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
+def client_edit_fields_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="Имя"), KeyboardButton(text="Телефон")],
+        [KeyboardButton(text="ДР"), KeyboardButton(text="Бонусы установить")],
+        [KeyboardButton(text="Бонусы добавить/убавить")],
+        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
 def tx_last_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="/tx_last 10"), KeyboardButton(text="/tx_last 30"), KeyboardButton(text="/tx_last 50")],
@@ -577,6 +598,263 @@ async def admin_menu_start(msg: Message, state: FSMContext):
         return await msg.answer("Только для администраторов.")
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text == "Изъятие")
+async def admin_withdraw_entry(msg: Message, state: FSMContext):
+    # если есть право — стратуем диалог; иначе — стоп
+    if not await has_permission(msg.from_user.id, "record_cashflows"):
+        return await msg.answer("Только для администраторов.")
+    # Если у тебя уже реализован /withdraw через FSM — вызови его «старт» тут.
+    # Если нет — пока делаем подсказку (чтобы не прыгало в мастер-меню):
+    return await msg.answer(
+        "Введите команду /withdraw или используйте кнопки из диалога изъятия.",
+        reply_markup=admin_root_kb(),
+    )
+
+
+@dp.message(AdminMenuFSM.root, F.text == "Tx последние")
+async def tx_last_menu(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        return await msg.answer("Только для администраторов.")
+    await msg.answer("Выберите, сколько показать:", reply_markup=tx_last_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text == "Клиенты")
+async def admin_clients_root(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(AdminMenuFSM.clients)
+    await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
+
+
+@dp.message(AdminMenuFSM.root, F.text == "Мастера")
+async def admin_masters_root(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "add_master"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(AdminMenuFSM.masters)
+    await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
+
+
+@dp.message(AdminMenuFSM.clients, F.text == "Найти клиента")
+async def client_find_start(msg: Message, state: FSMContext):
+    await state.set_state(AdminClientsFSM.find_wait_phone)
+    await msg.answer("Введите номер телефона клиента (8/ +7/ 9...):")
+
+
+@dp.message(AdminMenuFSM.clients, F.text == "Редактировать клиента")
+async def client_edit_start(msg: Message, state: FSMContext):
+    await state.set_state(AdminClientsFSM.edit_wait_phone)
+    await msg.answer("Введите номер телефона клиента для редактирования:")
+
+
+@dp.message(AdminMenuFSM.clients, F.text == "Назад")
+async def admin_clients_back(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.clients, F.text == "Отмена")
+async def admin_clients_cancel(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.masters, F.text == "Назад")
+async def admin_masters_back(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.masters, F.text == "Отмена")
+async def admin_masters_cancel(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.masters, F.text == "Список мастеров")
+async def admin_masters_list(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "add_master"):
+        return await msg.answer("Только для администраторов.")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT s.id, s.tg_user_id, s.role, s.is_active, COALESCE(s.first_name,'') AS fn, COALESCE(s.last_name,'') AS ln "
+            "FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id"
+        )
+    if not rows:
+        await msg.answer("Список пуст.")
+    else:
+        lines = [
+            f"#{r['id']} {r['role']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} {'✅' if r['is_active'] else '⛔️'}"
+            for r in rows
+        ]
+        await msg.answer("Мастера/админы:\n" + "\n".join(lines))
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminMenuFSM.masters, F.text == "Добавить мастера")
+async def admin_masters_add(msg: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer(
+        "Введите команду /add_master <tg_user_id> для начала. (Скоро сделаем диалог целиком по кнопкам)",
+        reply_markup=admin_root_kb(),
+    )
+
+
+@dp.message(AdminMenuFSM.masters, F.text == "Деактивировать мастера")
+async def admin_masters_remove_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "add_master"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(AdminMastersFSM.remove_wait_phone)
+    await msg.answer("Введите телефон мастера (8/+7/9...):")
+
+
+@dp.message(AdminMastersFSM.remove_wait_phone)
+async def admin_masters_remove_phone(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "add_master"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Только для администраторов.", reply_markup=admin_root_kb())
+    phone = normalize_phone_for_db(msg.text)
+    if not phone or not phone.startswith("+7"):
+        return await msg.answer("Неверный телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
+    async with pool.acquire() as conn:
+        rec = await conn.fetchrow(
+            "SELECT id FROM staff WHERE phone=$1 AND role='master' LIMIT 1",
+            phone,
+        )
+        if not rec:
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            return await msg.answer("Мастер не найден по этому телефону.", reply_markup=admin_root_kb())
+        await conn.execute("UPDATE staff SET is_active=false WHERE id=$1", rec["id"])
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Мастер деактивирован.", reply_markup=admin_root_kb())
+
+
+@dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Назад")
+async def admin_clients_states_back(msg: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminMenuFSM.clients)
+    await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
+
+
+@dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Отмена")
+async def admin_clients_states_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(AdminClientsFSM.find_wait_phone)
+async def client_find_got_phone(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        rec = await _find_client_by_phone(conn, msg.text)
+    if not rec:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Клиент не найден.", reply_markup=admin_root_kb())
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    return await msg.answer(_fmt_client_row(rec), reply_markup=admin_root_kb())
+
+
+@dp.message(AdminClientsFSM.edit_wait_phone)
+async def client_edit_got_phone(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        rec = await _find_client_by_phone(conn, msg.text)
+    if not rec:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Клиент не найден.", reply_markup=admin_root_kb())
+    await state.update_data(client_id=rec["id"])
+    await state.set_state(AdminClientsFSM.edit_pick_field)
+    await msg.answer("Что изменить?", reply_markup=client_edit_fields_kb())
+
+
+@dp.message(AdminClientsFSM.edit_pick_field, F.text.in_({"Имя", "Телефон", "ДР", "Бонусы установить", "Бонусы добавить/убавить"}))
+async def client_edit_pick_field(msg: Message, state: FSMContext):
+    await state.update_data(edit_field=msg.text)
+    prompt = {
+        "Имя": "Введите новое имя:",
+        "Телефон": "Введите новый телефон (+7 / 8 / 9...):",
+        "ДР": "Введите дату (DD.MM.YYYY или YYYY-MM-DD):",
+        "Бонусы установить": "Введите новое количество бонусов (целое число):",
+        "Бонусы добавить/убавить": "Введите дельту бонусов (целое число, можно со знаком -/+):",
+    }[msg.text]
+    await state.set_state(AdminClientsFSM.edit_wait_value)
+    await msg.answer(prompt)
+
+
+@dp.message(AdminClientsFSM.edit_wait_value)
+async def client_edit_apply(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    client_id = data.get("client_id")
+    field = data.get("edit_field")
+    if not client_id or not field:
+        await state.clear()
+        return await msg.answer("Сессия сброшена, попробуйте заново.", reply_markup=admin_root_kb())
+
+    async with pool.acquire() as conn:
+        if field == "Имя":
+            await conn.execute(
+                "UPDATE clients SET full_name=$1, last_updated=NOW() WHERE id=$2",
+                (msg.text or "").strip(),
+                client_id,
+            )
+        elif field == "Телефон":
+            new_phone = normalize_phone_for_db(msg.text)
+            if not new_phone or not new_phone.startswith("+7"):
+                return await msg.answer("Неверный телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
+            await conn.execute(
+                "UPDATE clients SET phone=$1, last_updated=NOW() WHERE id=$2",
+                new_phone,
+                client_id,
+            )
+        elif field == "ДР":
+            b = parse_birthday_str(msg.text)
+            if not b:
+                return await msg.answer("Неверная дата. Форматы: DD.MM.YYYY / YYYY-MM-DD. Введите ещё раз.")
+            await conn.execute(
+                "UPDATE clients SET birthday=$1, last_updated=NOW() WHERE id=$2",
+                b,
+                client_id,
+            )
+        elif field == "Бонусы установить":
+            try:
+                val = int((msg.text or "0").strip())
+            except Exception:
+                return await msg.answer("Нужно целое число. Введите ещё раз.")
+            await conn.execute(
+                "UPDATE clients SET bonus_balance=$1, last_updated=NOW() WHERE id=$2",
+                val,
+                client_id,
+            )
+        elif field == "Бонусы добавить/убавить":
+            try:
+                delta = int((msg.text or "0").strip())
+            except Exception:
+                return await msg.answer("Нужно целое число (можно со знаком). Введите ещё раз.")
+            rec = await conn.fetchrow(
+                "SELECT bonus_balance FROM clients WHERE id=$1",
+                client_id,
+            )
+            current_bonus = int(rec["bonus_balance"] or 0) if rec else 0
+            new_bonus = current_bonus + delta
+            if new_bonus < 0:
+                new_bonus = 0
+            await conn.execute(
+                "UPDATE clients SET bonus_balance=$1, last_updated=NOW() WHERE id=$2",
+                new_bonus,
+                client_id,
+            )
+
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    return await msg.answer("Готово. Клиент обновлён.", reply_markup=admin_root_kb())
 
 
 @dp.message(Command("admin_panel"))
@@ -1469,24 +1747,6 @@ async def adm_root_whoami(msg: Message, state: FSMContext):
     return await whoami(msg)
 
 
-@dp.message(AdminMenuFSM.root, F.text.casefold() == "мастера")
-async def adm_root_masters(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.masters)
-    await msg.answer("Раздел «Мастера»:", reply_markup=admin_masters_kb())
-
-
-@dp.message(AdminMenuFSM.root, F.text.casefold() == "клиенты")
-async def adm_root_clients(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.clients)
-    await msg.answer("Раздел «Клиенты»:", reply_markup=admin_clients_kb())
-
-
-@dp.message(AdminMenuFSM.root, F.text.casefold() == "изъятие")
-async def adm_root_withdraw(msg: Message, state: FSMContext):
-    await state.clear()
-    return await withdraw_start(msg, state)
-
-
 @dp.message(AdminMenuFSM.root, F.text.casefold() == "приход")
 async def income_wizard_start(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "record_cashflows"):
@@ -1634,31 +1894,6 @@ async def masters_list(msg: Message, state: FSMContext):
 async def masters_remove(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("Формат: /remove_master <tg_user_id>")
-
-
-@dp.message(AdminMenuFSM.clients, F.text.casefold() == "назад")
-async def clients_back(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
-
-
-@dp.message(AdminMenuFSM.clients, F.text.casefold() == "найти клиента")
-async def clients_find(msg: Message, state: FSMContext):
-    await state.clear()
-    await msg.answer("Формат: /client_info <телефон>")
-
-
-@dp.message(AdminMenuFSM.clients, F.text.casefold() == "редактировать клиента")
-async def clients_edit(msg: Message, state: FSMContext):
-    await state.clear()
-    await msg.answer(
-        "Команды редактирования:\n"
-        "/client_set_name <телефон> <новое_имя>\n"
-        "/client_set_phone <старый> <новый>\n"
-        "/client_set_birthday <телефон> <ДД.ММ.ГГГГ|ГГГГ-ММ-ДД>\n"
-        "/client_set_bonus <телефон> <сумма>\n"
-        "/client_add_bonus <телефон> <дельта>"
-    )
 
 
 @dp.message(ReportsFSM.waiting_pick_master, ~F.text.startswith("/"))
@@ -2455,22 +2690,21 @@ async def add_expense(msg: Message, command: CommandObject):
 async def tx_last_cmd(msg: Message):
     if not await has_permission(msg.from_user.id, "view_cash_reports"):
         return await msg.answer("Только для администраторов.")
-    parts = msg.text.split()
-    n = 10
-    if len(parts) > 1:
-        try:
-            n = max(1, min(100, int(parts[1])))
-        except Exception:
-            n = 10
+    # парсим N
+    parts = msg.text.split(maxsplit=1)
+    try:
+        n = int(parts[1]) if len(parts) > 1 else 10
+    except Exception:
+        n = 10
+    if n < 1:
+        n = 1
+    if n > 100:
+        n = 100
+
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, kind, method,
-                   amount::numeric(12,2) AS amount,
-                   order_id,
-                   COALESCE(master_id, 0) AS master_id,
-                   to_char(happened_at, 'YYYY-MM-DD HH24:MI') AS ts,
-                   COALESCE(comment,'') AS comment
+            SELECT id, kind, method, amount, happened_at, order_id, comment, is_void
             FROM cashbook_entries
             ORDER BY id DESC
             LIMIT $1
@@ -2479,12 +2713,16 @@ async def tx_last_cmd(msg: Message):
         )
     if not rows:
         return await msg.answer("Транзакций нет.")
-    lines = ["Последние транзакции:"]
-    for r in rows:
-        lines.append(
-            f"№{r['id']} | ✅ | {r['kind']} | {r['amount']}₽ | {r['method']} | {r['ts']} | order=#{r['order_id']} | {r['comment']}"
+
+    def fmt(r):
+        ok = "✅" if not r["is_void"] else "⛔️"
+        return (
+            f"№{r['id']} | {ok} | {r['kind']} | {r['amount']}₽ | {r['method'] or 'прочее'} | "
+            f"{r['happened_at']:%Y-%m-%d %H:%M} | order=#{r['order_id']} | {r['comment'] or ''}"
         )
-    await msg.answer("\n".join(lines))
+
+    text = "Последние транзакции:\n" + "\n".join(fmt(r) for r in rows)
+    await msg.answer(text)
 
 # ===== /tx_delete superadmin command =====
 @dp.message(Command("tx_delete"))
