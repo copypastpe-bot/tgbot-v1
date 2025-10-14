@@ -831,6 +831,7 @@ async def withdraw_amount_back(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=amount_back user={msg.from_user.id} text={msg.text}")
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Операция отменена.")
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
@@ -839,6 +840,7 @@ async def withdraw_amount_cancel(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=amount_cancel user={msg.from_user.id} text={msg.text}")
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Операция отменена.")
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
@@ -877,6 +879,7 @@ async def withdraw_master_cancel(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=master_cancel user={msg.from_user.id} text={msg.text}")
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Операция отменена.")
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
@@ -900,9 +903,8 @@ async def withdraw_master_callback(query: CallbackQuery, state: FSMContext):
         await query.answer()
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
-        await query.message.answer(
-            "Меню администратора:", reply_markup=admin_root_kb()
-        )
+        await query.message.answer("Операция отменена.")
+        await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
         return
 
     if not data.startswith("withdraw_master:"):
@@ -953,6 +955,18 @@ async def withdraw_master_callback(query: CallbackQuery, state: FSMContext):
     )
 
 
+@dp.callback_query(F.data.startswith("withdraw_"))
+async def withdraw_unexpected_callback(query: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != WithdrawFSM.waiting_master.state:
+        logging.info(
+            f"[withdraw] step=unexpected_callback user={query.from_user.id} data={query.data} state={current}"
+        )
+        await query.answer("Пожалуйста, завершите текущий шаг.", show_alert=True)
+    else:
+        await query.answer()
+
+
 @dp.message(WithdrawFSM.waiting_master)
 async def withdraw_master_got(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=master_text_input user={msg.from_user.id} text={msg.text}")
@@ -980,6 +994,7 @@ async def withdraw_comment_cancel(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=comment_cancel user={msg.from_user.id} text={msg.text}")
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Операция отменена.")
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
