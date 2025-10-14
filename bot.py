@@ -799,18 +799,21 @@ async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
 
 @dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "назад")
 async def withdraw_amount_back(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=amount_back user={msg.from_user.id} text={msg.text}")
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "отмена")
 async def withdraw_amount_cancel(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=amount_cancel user={msg.from_user.id} text={msg.text}")
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(WithdrawFSM.waiting_amount)
 async def withdraw_amount_got(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=amount_input user={msg.from_user.id} text={msg.text}")
     txt = (msg.text or "").replace(",", ".").strip()
     try:
         amt = Decimal(txt)
@@ -831,18 +834,21 @@ async def withdraw_amount_got(msg: Message, state: FSMContext):
 
 @dp.message(WithdrawFSM.waiting_master, F.text.lower() == "назад")
 async def withdraw_master_back(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=master_back user={msg.from_user.id} text={msg.text}")
     await state.set_state(WithdrawFSM.waiting_amount)
     await msg.answer("Введите сумму изъятия:", reply_markup=withdraw_nav_kb())
 
 
 @dp.message(WithdrawFSM.waiting_master, F.text.lower() == "отмена")
 async def withdraw_master_cancel(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=master_cancel user={msg.from_user.id} text={msg.text}")
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(WithdrawFSM.waiting_master)
 async def withdraw_master_got(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=master_selected user={msg.from_user.id} text={msg.text}")
     m = re.match(r"^\s*id:\s*(\d+)", msg.text or "", re.IGNORECASE)
     if not m:
         async with pool.acquire() as conn:
@@ -870,6 +876,7 @@ async def withdraw_master_got(msg: Message, state: FSMContext):
 
 @dp.message(WithdrawFSM.waiting_comment, F.text.lower() == "назад")
 async def withdraw_comment_back(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=comment_back user={msg.from_user.id} text={msg.text}")
     async with pool.acquire() as conn:
         kb = await build_masters_kb(conn)
     await state.set_state(WithdrawFSM.waiting_master)
@@ -878,12 +885,14 @@ async def withdraw_comment_back(msg: Message, state: FSMContext):
 
 @dp.message(WithdrawFSM.waiting_comment, F.text.lower() == "отмена")
 async def withdraw_comment_cancel(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=comment_cancel user={msg.from_user.id} text={msg.text}")
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(WithdrawFSM.waiting_comment)
 async def withdraw_finish(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=finish user={msg.from_user.id} text={msg.text}")
     data = await state.get_data()
     try:
         amount = Decimal(data.get("withdraw_amount", "0"))
@@ -2664,24 +2673,6 @@ async def wipe_test_data(msg: Message):
 from aiogram.types import ContentType, FSInputFile
 from aiogram import types
 
-class ReportsFSM(StatesGroup):
-    waiting_root = State()
-    waiting_pick_master = State()
-    waiting_pick_period = State()
-
-
-class AddMasterFSM(StatesGroup):
-    waiting_first_name = State()
-    waiting_last_name  = State()
-    waiting_phone      = State()
-    payload_tg         = State()
-
-
-class WithdrawFSM(StatesGroup):
-    waiting_pick_master = State()
-    waiting_amount      = State()
-    waiting_comment     = State()
-
 
 class UploadFSM(StatesGroup):
     waiting_csv = State()
@@ -2928,150 +2919,9 @@ async def tx_delete(msg: Message):
 
 @dp.message(Command("withdraw"))
 async def withdraw_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "record_cashflows"):
-        return await msg.answer("Только для администраторов.")
-    async with pool.acquire() as conn:
-        masters = await conn.fetch(
-            "SELECT id, tg_user_id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
-            "FROM staff WHERE role IN ('master','admin') AND is_active ORDER BY id LIMIT 10"
-        )
-    if masters:
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text=f"{r['fn']} {r['ln']} | tg:{r['tg_user_id']}")] for r in masters
-            ] + [[KeyboardButton(text="Ввести tg id вручную")], [KeyboardButton(text="Отмена")]],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        )
-        await msg.answer("Выберите мастера или введите tg id:", reply_markup=kb)
-    else:
-        await msg.answer(
-            "Введите tg id мастера:",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="Отмена")]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
-        )
-    await state.set_state(WithdrawFSM.waiting_pick_master)
+    return await admin_withdraw_entry(msg, state)
 
 
-@dp.message(WithdrawFSM.waiting_pick_master)
-async def withdraw_pick_master(msg: Message, state: FSMContext):
-    txt_cancel = (msg.text or "").strip().casefold()
-    if txt_cancel == "отмена":
-        await state.clear()
-        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
-
-    txt = (msg.text or "").strip()
-    m = re.search(r"tg:(\d+)", txt)
-    tg_id = None
-    if m:
-        tg_id = int(m.group(1))
-    elif txt.isdigit():
-        tg_id = int(txt)
-    if not tg_id:
-        return await msg.answer("Укажи tg id мастера (число) или нажми «Отмена».")
-    async with pool.acquire() as conn:
-        master = await conn.fetchrow(
-            "SELECT id, first_name, last_name FROM staff WHERE tg_user_id=$1 AND is_active",
-            tg_id,
-        )
-    if not master:
-        return await msg.answer("Мастер с таким tg id не найден или не активен. Введите другой.")
-    await state.update_data(
-        master_tg=tg_id,
-        master_id=master["id"],
-        master_f=master["first_name"],
-        master_l=master["last_name"],
-    )
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Отмена")]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    await msg.answer("Введите сумму изъятия (например: 1500 или 1,500.00):", reply_markup=kb)
-    await state.set_state(WithdrawFSM.waiting_amount)
-
-
-@dp.message(WithdrawFSM.waiting_amount)
-async def withdraw_amount(msg: Message, state: FSMContext):
-    txt_cancel = (msg.text or "").strip().casefold()
-    if txt_cancel == "отмена":
-        await state.clear()
-        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
-
-    raw = (msg.text or "").strip().replace(" ", "").replace(",", ".")
-    try:
-        amount = Decimal(raw)
-    except Exception:
-        return await msg.answer("Сумма должна быть числом. Попробуй ещё раз или нажми «Отмена».")
-    if amount <= 0:
-        return await msg.answer("Сумма должна быть > 0. Попробуй ещё раз или нажми «Отмена».")
-    await state.update_data(amount=str(amount))
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Без комментария")], [KeyboardButton(text="Отмена")]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    await msg.answer(
-        "Комментарий? (введите текст или нажмите «Без комментария»)",
-        reply_markup=kb,
-    )
-    await state.set_state(WithdrawFSM.waiting_comment)
-
-
-@dp.message(WithdrawFSM.waiting_comment)
-async def withdraw_comment(msg: Message, state: FSMContext):
-    txt_cancel = (msg.text or "").strip().casefold()
-    if txt_cancel == "отмена":
-        await state.clear()
-        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
-
-    comment = (msg.text or "").strip()
-    if comment.lower() == "без комментария":
-        comment = "Изъятие наличных"
-
-    data = await state.get_data()
-    master_id = int(data["master_id"])
-    tg_id = int(data["master_tg"])
-    amount = Decimal(data["amount"])
-    mf = (data.get("master_f") or "").strip()
-    ml = (data.get("master_l") or "").strip()
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='cashbook_entries' AND column_name='master_id'
-                ) THEN
-                    ALTER TABLE cashbook_entries ADD COLUMN master_id integer REFERENCES staff(id);
-                    CREATE INDEX IF NOT EXISTS ix_cashbook_master ON cashbook_entries(master_id);
-                END IF;
-            END$$;
-            """
-        )
-        tx = await conn.fetchrow(
-            """
-            INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-            VALUES ('expense', 'Изъятие', $1, $2, NULL, $3, now())
-            RETURNING id, happened_at
-            """,
-            amount,
-            comment,
-            master_id,
-        )
-
-    fio = (mf + (" " + ml if ml else "")).strip() or "мастер"
-    when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
-    await msg.answer(
-        f"Изъятие №{tx['id']}: {amount}₽ у {fio} (tg:{tg_id}) — {when}\nКомментарий: {comment}",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await state.clear()
 @dp.message(Command("mysalary"))
 async def my_salary(msg: Message):
     # доступ только для мастеров
