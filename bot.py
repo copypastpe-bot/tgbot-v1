@@ -37,6 +37,12 @@ class ExpenseFSM(StatesGroup):
     waiting_comment = State()
 
 
+class WithdrawFSM(StatesGroup):
+    waiting_amount  = State()
+    waiting_master  = State()
+    waiting_comment = State()
+
+
 class AddMasterFSM(StatesGroup):
     waiting_first_name = State()
     waiting_last_name  = State()
@@ -346,6 +352,33 @@ def tx_last_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
+async def build_masters_kb(conn) -> ReplyKeyboardMarkup:
+    rows: list[list[KeyboardButton]] = []
+    masters = await conn.fetch(
+        "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+        "FROM staff WHERE role='master' AND is_active=true ORDER BY fn, ln, id"
+    )
+    line: list[KeyboardButton] = []
+    for r in masters:
+        label = f"id:{r['id']} — {r['fn']} {r['ln']}".strip()
+        line.append(KeyboardButton(text=label))
+        if len(line) == 2:
+            rows.append(line)
+            line = []
+    if line:
+        rows.append(line)
+    rows.append([KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def withdraw_nav_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 @dp.message(F.text == "Отчёты")
 async def reports_root(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_orders_reports"):
@@ -602,14 +635,12 @@ async def admin_menu_start(msg: Message, state: FSMContext):
 
 @dp.message(AdminMenuFSM.root, F.text == "Изъятие")
 async def admin_withdraw_entry(msg: Message, state: FSMContext):
-    # если есть право — стратуем диалог; иначе — стоп
     if not await has_permission(msg.from_user.id, "record_cashflows"):
         return await msg.answer("Только для администраторов.")
-    # Если у тебя уже реализован /withdraw через FSM — вызови его «старт» тут.
-    # Если нет — пока делаем подсказку (чтобы не прыгало в мастер-меню):
+    await state.set_state(WithdrawFSM.waiting_amount)
     return await msg.answer(
-        "Введите команду /withdraw или используйте кнопки из диалога изъятия.",
-        reply_markup=admin_root_kb(),
+        "Введите сумму изъятия (рубли, целое или с копейками):",
+        reply_markup=withdraw_nav_kb(),
     )
 
 
@@ -733,6 +764,103 @@ async def admin_masters_remove_phone(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Мастер деактивирован.", reply_markup=admin_root_kb())
+
+
+@dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "назад")
+async def withdraw_amount_back(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "отмена")
+async def withdraw_amount_cancel(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(WithdrawFSM.waiting_amount)
+async def withdraw_amount_got(msg: Message, state: FSMContext):
+    txt = (msg.text or "").replace(",", ".").strip()
+    try:
+        amt = Decimal(txt)
+    except Exception:
+        return await msg.answer("Не понял сумму. Пример: 2500 или 2500.50", reply_markup=withdraw_nav_kb())
+    if amt <= 0:
+        return await msg.answer("Сумма должна быть > 0. Введите заново:", reply_markup=withdraw_nav_kb())
+    await state.update_data(withdraw_amount=str(amt))
+    async with pool.acquire() as conn:
+        kb = await build_masters_kb(conn)
+    await state.set_state(WithdrawFSM.waiting_master)
+    return await msg.answer("Выберите мастера:", reply_markup=kb)
+
+
+@dp.message(WithdrawFSM.waiting_master, F.text.lower() == "назад")
+async def withdraw_master_back(msg: Message, state: FSMContext):
+    await state.set_state(WithdrawFSM.waiting_amount)
+    await msg.answer("Введите сумму изъятия:", reply_markup=withdraw_nav_kb())
+
+
+@dp.message(WithdrawFSM.waiting_master, F.text.lower() == "отмена")
+async def withdraw_master_cancel(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(WithdrawFSM.waiting_master)
+async def withdraw_master_got(msg: Message, state: FSMContext):
+    m = re.match(r"^\s*id:\s*(\d+)", msg.text or "", re.IGNORECASE)
+    if not m:
+        async with pool.acquire() as conn:
+            kb = await build_masters_kb(conn)
+        return await msg.answer("Выберите мастера КНОПКОЙ ниже.", reply_markup=kb)
+    master_id = int(m.group(1))
+    await state.update_data(withdraw_master_id=master_id)
+    await state.set_state(WithdrawFSM.waiting_comment)
+    return await msg.answer("Комментарий (или «Без комментария»):", reply_markup=withdraw_nav_kb())
+
+
+@dp.message(WithdrawFSM.waiting_comment, F.text.lower() == "назад")
+async def withdraw_comment_back(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        kb = await build_masters_kb(conn)
+    await state.set_state(WithdrawFSM.waiting_master)
+    await msg.answer("Выберите мастера:", reply_markup=kb)
+
+
+@dp.message(WithdrawFSM.waiting_comment, F.text.lower() == "отмена")
+async def withdraw_comment_cancel(msg: Message, state: FSMContext):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
+@dp.message(WithdrawFSM.waiting_comment)
+async def withdraw_finish(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        amount = Decimal(data.get("withdraw_amount", "0"))
+        master_id = int(data.get("withdraw_master_id"))
+    except Exception:
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Сессия изъятия потеряна. Попробуйте снова.", reply_markup=admin_root_kb())
+    comment = (msg.text or "").strip()
+    if comment.lower() == "без комментария":
+        comment = "Изъятие у мастера"
+    async with pool.acquire() as conn:
+        tx = await conn.fetchrow(
+            """
+            INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+            VALUES ('income', 'Наличные', $1, $2, NULL, $3, now())
+            RETURNING id
+            """,
+            amount,
+            comment,
+            master_id,
+        )
+    await state.set_state(AdminMenuFSM.root)
+    return await msg.answer(
+        f"✅ Изъятие зафиксировано: №{tx['id']} | {amount}₽ | мастер id={master_id}\nКомментарий: {comment}",
+        reply_markup=admin_root_kb(),
+    )
 
 
 @dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Назад")
