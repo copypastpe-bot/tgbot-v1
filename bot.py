@@ -477,12 +477,10 @@ async def _forward_withdraw_from_admin(msg: Message, state: FSMContext):
 
 @dp.message(AdminMenuFSM.root, F.text == "Клиенты")
 async def _forward_clients_from_admin(msg: Message, state: FSMContext):
-    await state.set_state("AdminMenuFSM:clients")
-    try:
-        from handlers.clients import admin_clients_kb  # type: ignore
-        await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
-    except Exception:
-        await msg.answer("Клиенты: выбери действие.")
+    from handlers.clients import AdminClientsFSM, admin_clients_kb  # type: ignore
+
+    await state.set_state(AdminClientsFSM.root)
+    await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
 
 
 @dp.message(AdminMenuFSM.root, F.text == "Мастера")
@@ -505,12 +503,10 @@ async def _forward_withdraw_any_state(msg: Message, state: FSMContext):
 
 @dp.message(F.text.casefold() == "клиенты")
 async def _forward_clients_any_state(msg: Message, state: FSMContext):
-    await state.set_state("AdminMenuFSM:clients")
-    try:
-        from handlers.clients import admin_clients_kb  # type: ignore
-        await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
-    except Exception:
-        await msg.answer("Клиенты: выбери действие.")
+    from handlers.clients import AdminClientsFSM, admin_clients_kb  # type: ignore
+
+    await state.set_state(AdminClientsFSM.root)
+    await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
 
 @dp.message(F.text.casefold() == "мастера")
 async def _forward_masters_any_state(msg: Message, state: FSMContext):

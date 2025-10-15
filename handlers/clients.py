@@ -23,6 +23,8 @@ def _get_main_attr(name: str):
 
 router = Router(name="clients")
 logger = logging.getLogger(__name__)
+_clients_diag_enabled = False
+log_clients = logging.getLogger("clients")
 
 has_permission = _get_main_attr("has_permission")
 normalize_phone_for_db = _get_main_attr("normalize_phone_for_db")
@@ -32,7 +34,26 @@ _find_client_by_phone = _get_main_attr("_find_client_by_phone")
 _pool = _get_main_attr("pool")
 
 
+@router.message(Command("clients_diag_on"))
+async def clients_diag_on(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    global _clients_diag_enabled
+    _clients_diag_enabled = True
+    await msg.answer("Диагностика Клиенты: ВКЛ.")
+
+
+@router.message(Command("clients_diag_off"))
+async def clients_diag_off(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    global _clients_diag_enabled
+    _clients_diag_enabled = False
+    await msg.answer("Диагностика Клиенты: ВЫКЛ.")
+
+
 class AdminClientsFSM(StatesGroup):
+    root = State()
     find_wait_phone = State()
     edit_wait_phone = State()
     edit_pick_field = State()
@@ -71,30 +92,27 @@ def _fmt_client_row(rec) -> str:
 
 @router.message(StateFilter("AdminMenuFSM:root"), F.text == "Клиенты")
 async def admin_clients_root(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "edit_client"):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
         return await msg.answer("Только для администраторов.")
-    await state.set_state("AdminMenuFSM:clients")
+    await state.set_state(AdminClientsFSM.root)
     await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
 
 
-@router.message(StateFilter("AdminMenuFSM:clients"), F.text == "Найти клиента")
+@router.message(AdminClientsFSM.root, F.text == "Найти клиента")
 async def client_find_start(msg: Message, state: FSMContext):
     await state.set_state(AdminClientsFSM.find_wait_phone)
     await msg.answer("Введите номер телефона клиента (8/ +7/ 9...):")
 
-
-@router.message(StateFilter("AdminMenuFSM:clients"), F.text == "Редактировать клиента")
+@router.message(AdminClientsFSM.root, F.text == "Редактировать клиента")
 async def client_edit_start(msg: Message, state: FSMContext):
     await state.set_state(AdminClientsFSM.edit_wait_phone)
     await msg.answer("Введите номер телефона клиента для редактирования:")
 
-
-@router.message(StateFilter("AdminMenuFSM:clients"), F.text == "Назад")
+@router.message(AdminClientsFSM.root, F.text == "Назад")
 async def admin_clients_back(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state)
 
-
-@router.message(StateFilter("AdminMenuFSM:clients"), F.text == "Отмена")
+@router.message(AdminClientsFSM.root, F.text == "Отмена")
 async def admin_clients_cancel(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state)
 
@@ -110,7 +128,7 @@ async def admin_clients_cancel(msg: Message, state: FSMContext):
 )
 async def admin_clients_states_back(msg: Message, state: FSMContext):
     await state.clear()
-    await state.set_state("AdminMenuFSM:clients")
+    await state.set_state(AdminClientsFSM.root)
     await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
 
 
@@ -128,7 +146,7 @@ async def admin_clients_states_cancel(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state)
 
 
-@router.message(AdminClientsFSM.find_wait_phone)
+@router.message(AdminClientsFSM.find_wait_phone, F.text)
 async def client_find_got_phone(msg: Message, state: FSMContext):
     async with _pool.acquire() as conn:
         rec = await _find_client_by_phone(conn, msg.text)
@@ -140,7 +158,7 @@ async def client_find_got_phone(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state, _fmt_client_row(rec))
 
 
-@router.message(AdminClientsFSM.edit_wait_phone)
+@router.message(AdminClientsFSM.edit_wait_phone, F.text)
 async def client_edit_got_phone(msg: Message, state: FSMContext):
     async with _pool.acquire() as conn:
         rec = await _find_client_by_phone(conn, msg.text)
@@ -415,3 +433,22 @@ async def client_set_phone(msg: Message):
             rec["id"],
         )
     return await msg.answer("Телефон обновлён:\n" + _fmt_client_row(rec2))
+
+
+@router.message(F.text)
+async def _clients_diag_catch_all(msg: Message, state: FSMContext):
+    if not _clients_diag_enabled:
+        return
+    cur = await state.get_state()
+    log_clients.info("CLIENTS_ROUTER CATCH: from=%s state=%s text=%r", msg.from_user.id, cur, msg.text)
+    await msg.answer(f"🔎 [clients] state={cur or 'None'} text={msg.text!r}")
+
+
+# DIAG-NOTE:
+# - Key handlers: admin_clients_root, client_find_start, client_edit_start, client_find_got_phone, client_edit_got_phone,
+#   client_edit_apply, client_set_* commands.
+# - Entry state: AdminClientsFSM.root set via bot forwarders and admin_clients_root.
+# - Button mapping: "Найти клиента" → client_find_start (state find_wait_phone), "Редактировать клиента" → client_edit_start
+#   (state edit_wait_phone); back/отмена handlers clear and return to root.
+# - Previous silence: admin forwarders оставляли состояние в "AdminMenuFSM:clients", не соответствующее фильтрам роутера;
+#   теперь форварды и root-хендлер ставят AdminClientsFSM.root. Диагностика позволяет увидеть неожиданные тексты/состояния.
