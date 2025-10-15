@@ -433,7 +433,7 @@ async def client_set_phone(msg: Message):
     return await msg.answer("Телефон обновлён:\n" + _fmt_client_row(rec2))
 
 
-@router.message(F.text)
+@router.message(StateFilter(AdminClientsFSM), ~F.text.startswith("/"), F.text)
 async def _clients_diag_catch_all(msg: Message, state: FSMContext):
     if not _CLIENTS_DIAG:
         return

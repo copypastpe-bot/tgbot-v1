@@ -241,7 +241,7 @@ async def remove_master(msg: Message):
     await msg.answer(f"Пользователь {target_id} деактивирован как мастер.")
 
 
-@router.message(F.text)
+@router.message(StateFilter(AdminMastersFSM), ~F.text.startswith("/"), F.text)
 async def _masters_router_catch_all(msg: Message, state: FSMContext):
     if not _MASTERS_DIAG:
         return
