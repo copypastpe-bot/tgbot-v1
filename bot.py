@@ -104,7 +104,7 @@ pool: asyncpg.Pool | None = None
 # ===== RBAC helpers (DB-driven) =====
 async def get_user_role(conn: asyncpg.Connection, user_id: int) -> str | None:
     rec = await conn.fetchrow(
-        "SELECT role FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
+        "SELECT role FROM staff WHERE tg_user_id=$1 AND is_active=true LIMIT 1",
         user_id,
     )
     return rec["role"] if rec else None
@@ -329,6 +329,11 @@ def admin_root_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+async def show_admin_menu(msg: Message, state: FSMContext, text: str = "Меню администратора:"):
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer(text, reply_markup=admin_root_kb())
+
+
 def admin_masters_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="Добавить мастера"), KeyboardButton(text="Список мастеров")],
@@ -391,8 +396,6 @@ async def build_masters_kb(conn) -> InlineKeyboardMarkup:
         )
 
     markup = InlineKeyboardMarkup(row_width=2)
-    # store attribute for completeness; InlineKeyboardMarkup ignores resize, but we keep for consistency with requirement
-    setattr(markup, "resize_keyboard", True)
 
     for i in range(0, len(buttons), 2):
         markup.row(*buttons[i:i + 2])
@@ -715,26 +718,22 @@ async def client_edit_start(msg: Message, state: FSMContext):
 
 @dp.message(AdminMenuFSM.clients, F.text == "Назад")
 async def admin_clients_back(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state)
 
 
 @dp.message(AdminMenuFSM.clients, F.text == "Отмена")
 async def admin_clients_cancel(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state)
 
 
 @dp.message(AdminMenuFSM.masters, F.text == "Назад")
 async def admin_masters_back(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state)
 
 
 @dp.message(AdminMenuFSM.masters, F.text == "Отмена")
 async def admin_masters_cancel(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state)
 
 
 @dp.message(AdminMenuFSM.masters, F.text == "Список мастеров")
@@ -754,8 +753,7 @@ async def admin_masters_list(msg: Message, state: FSMContext):
             for r in rows
         ]
         await msg.answer("Мастера/админы:\n" + "\n".join(lines))
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state)
 
 
 @dp.message(AdminMenuFSM.masters, F.text == "Добавить мастера")
@@ -867,18 +865,14 @@ def parse_amount_ru(text: str) -> tuple[Decimal | None, dict]:
 async def withdraw_amount_back(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=amount_back user={msg.from_user.id} text={msg.text}")
     await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Операция отменена.")
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state, "Операция отменена.")
 
 
 @dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "отмена")
 async def withdraw_amount_cancel(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=amount_cancel user={msg.from_user.id} text={msg.text}")
     await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Операция отменена.")
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state, "Операция отменена.")
 
 
 @dp.message(WithdrawFSM.waiting_amount, F.content_type == ContentType.TEXT)
@@ -917,9 +911,7 @@ async def withdraw_master_back(msg: Message, state: FSMContext):
 async def withdraw_master_cancel(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=master_cancel user={msg.from_user.id} text={msg.text}")
     await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Операция отменена.")
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state, "Операция отменена.")
 
 
 @dp.callback_query(WithdrawFSM.waiting_master)
@@ -941,9 +933,7 @@ async def withdraw_master_callback(query: CallbackQuery, state: FSMContext):
     if data == "withdraw_nav:cancel":
         await query.answer()
         await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        await query.message.answer("Операция отменена.")
-        await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
+        await show_admin_menu(query.message, state, "Операция отменена.")
         return
 
     if not data.startswith("withdraw_master:"):
@@ -1032,9 +1022,7 @@ async def withdraw_comment_back(msg: Message, state: FSMContext):
 async def withdraw_comment_cancel(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=comment_cancel user={msg.from_user.id} text={msg.text}")
     await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Операция отменена.")
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state, "Операция отменена.")
 
 
 @dp.message(WithdrawFSM.waiting_comment)
@@ -1097,8 +1085,7 @@ async def admin_clients_states_back(msg: Message, state: FSMContext):
 @dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Отмена")
 async def admin_clients_states_cancel(msg: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state)
 
 
 @dp.message(AdminClientsFSM.find_wait_phone)
@@ -1107,11 +1094,11 @@ async def client_find_got_phone(msg: Message, state: FSMContext):
         rec = await _find_client_by_phone(conn, msg.text)
     if not rec:
         await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        return await msg.answer("Клиент не найден.", reply_markup=admin_root_kb())
+        await show_admin_menu(msg, state, "Клиент не найден.")
+        return
     await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    return await msg.answer(_fmt_client_row(rec), reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state, _fmt_client_row(rec))
+    return
 
 
 @dp.message(AdminClientsFSM.edit_wait_phone)
@@ -1120,8 +1107,8 @@ async def client_edit_got_phone(msg: Message, state: FSMContext):
         rec = await _find_client_by_phone(conn, msg.text)
     if not rec:
         await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        return await msg.answer("Клиент не найден.", reply_markup=admin_root_kb())
+        await show_admin_menu(msg, state, "Клиент не найден.")
+        return
     await state.update_data(client_id=rec["id"])
     await state.set_state(AdminClientsFSM.edit_pick_field)
     await msg.answer("Что изменить?", reply_markup=client_edit_fields_kb())
@@ -1205,8 +1192,8 @@ async def client_edit_apply(msg: Message, state: FSMContext):
             )
 
     await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    return await msg.answer("Готово. Клиент обновлён.", reply_markup=admin_root_kb())
+    await show_admin_menu(msg, state, "Готово. Клиент обновлён.")
+    return
 
 
 @dp.message(Command("admin_panel"))
