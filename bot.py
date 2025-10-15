@@ -462,6 +462,23 @@ async def _forward_masters_from_admin(msg: Message, state: FSMContext):
     await _masters_root(msg, state)
 
 
+# === Global fallbacks for these buttons (catch even if state got cleared) ===
+@dp.message(F.text.casefold() == "изъятие")
+async def _forward_withdraw_any_state(msg: Message, state: FSMContext):
+    from handlers.withdraw import withdraw_start as _withdraw_start  # type: ignore
+    await _withdraw_start(msg, state)
+
+@dp.message(F.text.casefold() == "клиенты")
+async def _forward_clients_any_state(msg: Message, state: FSMContext):
+    from handlers.clients import admin_clients_root as _clients_root  # type: ignore
+    await _clients_root(msg, state)
+
+@dp.message(F.text.casefold() == "мастера")
+async def _forward_masters_any_state(msg: Message, state: FSMContext):
+    from handlers.masters import admin_masters_root as _masters_root  # type: ignore
+    await _masters_root(msg, state)
+
+
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
     global pool
