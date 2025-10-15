@@ -8,10 +8,25 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
-from utils.ui import show_admin_menu, admin_root_kb
+import sys
+
+from utils.ui import show_admin_menu
+
+
+def _get_main_attr(name: str):
+    module = sys.modules.get("__main__")
+    if module is None:
+        raise AttributeError(f"__main__ module not found while accessing {name}")
+    if not hasattr(module, name):
+        raise AttributeError(f"{name} is not available on __main__")
+    return getattr(module, name)
 
 router = Router(name="masters")
 logger = logging.getLogger(__name__)
+
+has_permission = _get_main_attr("has_permission")
+normalize_phone_for_db = _get_main_attr("normalize_phone_for_db")
+_pool = _get_main_attr("pool")
 
 
 class AdminMastersFSM(StatesGroup):
@@ -35,8 +50,6 @@ def admin_masters_kb() -> ReplyKeyboardMarkup:
 
 @router.message(StateFilter("AdminMenuFSM:root"), F.text == "Мастера")
 async def admin_masters_root(msg: Message, state: FSMContext):
-    from bot import has_permission  # type: ignore
-
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     await state.set_state("AdminMenuFSM:masters")
@@ -55,8 +68,6 @@ async def admin_masters_cancel(msg: Message, state: FSMContext):
 
 @router.message(StateFilter("AdminMenuFSM:masters"), F.text == "Список мастеров")
 async def admin_masters_list(msg: Message, state: FSMContext):
-    from bot import has_permission, pool as _pool  # type: ignore
-
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     async with _pool.acquire() as conn:
@@ -77,8 +88,6 @@ async def admin_masters_list(msg: Message, state: FSMContext):
 
 @router.message(Command("list_masters"))
 async def list_masters(msg: Message):
-    from bot import has_permission, pool as _pool  # type: ignore
-
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     async with _pool.acquire() as conn:
@@ -97,8 +106,6 @@ async def list_masters(msg: Message):
 
 @router.message(Command("add_master"))
 async def add_master(msg: Message, state: FSMContext):
-    from bot import has_permission  # type: ignore
-
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
@@ -136,8 +143,6 @@ async def add_master_last(msg: Message, state: FSMContext):
 
 @router.message(AddMasterFSM.waiting_phone)
 async def add_master_phone(msg: Message, state: FSMContext):
-    from bot import pool as _pool, normalize_phone_for_db  # type: ignore
-
     phone_norm = normalize_phone_for_db(msg.text)
     if not phone_norm or not phone_norm.startswith("+7"):
         return await msg.answer("Не распознал телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
@@ -158,8 +163,6 @@ async def add_master_phone(msg: Message, state: FSMContext):
 
 @router.message(StateFilter("AdminMenuFSM:masters"), F.text == "Деактивировать мастера")
 async def admin_masters_remove_start(msg: Message, state: FSMContext):
-    from bot import has_permission  # type: ignore
-
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     await state.set_state(AdminMastersFSM.remove_wait_phone)
@@ -168,8 +171,6 @@ async def admin_masters_remove_start(msg: Message, state: FSMContext):
 
 @router.message(AdminMastersFSM.remove_wait_phone)
 async def admin_masters_remove_phone(msg: Message, state: FSMContext):
-    from bot import has_permission, pool as _pool, normalize_phone_for_db  # type: ignore
-
     if not await has_permission(msg.from_user.id, "add_master"):
         await state.clear()
         await show_admin_menu(msg, state, "Только для администраторов.")
@@ -193,8 +194,6 @@ async def admin_masters_remove_phone(msg: Message, state: FSMContext):
 
 @router.message(Command("remove_master"))
 async def remove_master(msg: Message):
-    from bot import has_permission, pool as _pool  # type: ignore
-
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)

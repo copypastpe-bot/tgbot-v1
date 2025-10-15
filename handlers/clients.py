@@ -2,18 +2,34 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 
-import asyncpg
 from aiogram import Router, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
-from utils.ui import show_admin_menu, admin_root_kb
+from utils.ui import show_admin_menu
+
+
+def _get_main_attr(name: str):
+    module = sys.modules.get("__main__")
+    if module is None:
+        raise AttributeError(f"__main__ module not found while accessing {name}")
+    if not hasattr(module, name):
+        raise AttributeError(f"{name} is not available on __main__")
+    return getattr(module, name)
 
 router = Router(name="clients")
 logger = logging.getLogger(__name__)
+
+has_permission = _get_main_attr("has_permission")
+normalize_phone_for_db = _get_main_attr("normalize_phone_for_db")
+only_digits = _get_main_attr("only_digits")
+parse_birthday_str = _get_main_attr("parse_birthday_str")
+_find_client_by_phone = _get_main_attr("_find_client_by_phone")
+_pool = _get_main_attr("pool")
 
 
 class AdminClientsFSM(StatesGroup):
@@ -53,37 +69,8 @@ def _fmt_client_row(rec) -> str:
     ])
 
 
-async def _find_client_by_phone(conn: asyncpg.Connection, phone_input: str):
-    from bot import normalize_phone_for_db  # type: ignore
-
-    s = phone_input or ""
-    norm = normalize_phone_for_db(s)
-    norm_digits = re.sub(r"[^0-9]", "", norm or "")
-    raw_digits = re.sub(r"[^0-9]", "", s)
-
-    candidates: list[str] = []
-    if norm_digits:
-        candidates.append(norm_digits)
-    if raw_digits and raw_digits != norm_digits:
-        candidates.append(raw_digits)
-    if not candidates:
-        return None
-
-    rec = await conn.fetchrow(
-        """
-        SELECT id, full_name, phone, birthday, bonus_balance, status
-        FROM clients
-        WHERE regexp_replace(COALESCE(phone,''), '[^0-9]+', '', 'g') = ANY($1::text[])
-        """,
-        candidates,
-    )
-    return rec
-
-
 @router.message(StateFilter("AdminMenuFSM:root"), F.text == "Клиенты")
 async def admin_clients_root(msg: Message, state: FSMContext):
-    from bot import has_permission  # type: ignore
-
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
     await state.set_state("AdminMenuFSM:clients")
@@ -143,8 +130,6 @@ async def admin_clients_states_cancel(msg: Message, state: FSMContext):
 
 @router.message(AdminClientsFSM.find_wait_phone)
 async def client_find_got_phone(msg: Message, state: FSMContext):
-    from bot import pool as _pool  # type: ignore
-
     async with _pool.acquire() as conn:
         rec = await _find_client_by_phone(conn, msg.text)
     if not rec:
@@ -157,8 +142,6 @@ async def client_find_got_phone(msg: Message, state: FSMContext):
 
 @router.message(AdminClientsFSM.edit_wait_phone)
 async def client_edit_got_phone(msg: Message, state: FSMContext):
-    from bot import pool as _pool  # type: ignore
-
     async with _pool.acquire() as conn:
         rec = await _find_client_by_phone(conn, msg.text)
     if not rec:
@@ -189,14 +172,13 @@ async def client_edit_pick_field(msg: Message, state: FSMContext):
 
 @router.message(AdminClientsFSM.edit_wait_value)
 async def client_edit_apply(msg: Message, state: FSMContext):
-    from bot import pool as _pool, normalize_phone_for_db, parse_birthday_str  # type: ignore
-
     data = await state.get_data()
     client_id = data.get("client_id")
     field = data.get("edit_field")
     if not client_id or not field:
         await state.clear()
-        return await msg.answer("Сессия сброшена, попробуйте заново.", reply_markup=admin_root_kb())
+        await show_admin_menu(msg, state, "Сессия сброшена, попробуйте заново.")
+        return
 
     async with _pool.acquire() as conn:
         if field == "Имя":
@@ -258,8 +240,6 @@ async def client_edit_apply(msg: Message, state: FSMContext):
 
 @router.message(Command("client_info"))
 async def client_info(msg: Message):
-    from bot import has_permission, pool as _pool  # type: ignore
-
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
@@ -275,8 +255,6 @@ async def client_info(msg: Message):
 
 @router.message(Command("client_set_name"))
 async def client_set_name(msg: Message):
-    from bot import has_permission, pool as _pool  # type: ignore
-
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=2)
@@ -298,8 +276,6 @@ async def client_set_name(msg: Message):
 
 @router.message(Command("client_set_birthday"))
 async def client_set_birthday(msg: Message):
-    from bot import has_permission, pool as _pool, normalize_phone_for_db, parse_birthday_str  # type: ignore
-
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
     try:
@@ -340,8 +316,6 @@ async def client_set_birthday(msg: Message):
 
 @router.message(Command("client_set_bonus"))
 async def client_set_bonus(msg: Message):
-    from bot import has_permission, pool as _pool  # type: ignore
-
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=2)
@@ -370,8 +344,6 @@ async def client_set_bonus(msg: Message):
 
 @router.message(Command("client_add_bonus"))
 async def client_add_bonus(msg: Message):
-    from bot import has_permission, pool as _pool  # type: ignore
-
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=2)
@@ -403,8 +375,6 @@ async def client_add_bonus(msg: Message):
 
 @router.message(Command("client_set_phone"))
 async def client_set_phone(msg: Message):
-    from bot import has_permission, pool as _pool, normalize_phone_for_db  # type: ignore
-
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=2)

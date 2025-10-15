@@ -40,9 +40,6 @@ class ReportsFSM(StatesGroup):
 from dotenv import load_dotenv
 
 import asyncpg
-from handlers.withdraw import router as withdraw_router
-from handlers.clients import router as clients_router
-from handlers.masters import router as masters_router
 from services.db import _record_income, _record_expense
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
@@ -76,9 +73,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
-dp.include_router(withdraw_router)
-dp.include_router(clients_router)
-dp.include_router(masters_router)
 pool: asyncpg.Pool | None = None
 
 # ===== RBAC helpers (DB-driven) =====
@@ -214,6 +208,41 @@ def parse_birthday_str(s: str | None) -> date | None:
         except Exception:
             return None
     return None
+
+
+async def _find_client_by_phone(conn: asyncpg.Connection, phone_input: str):
+    """Lookup client by any phone format. Accepts 8XXXXXXXXXX, +7XXXXXXXXXX, 9XXXXXXXXX, mixed text."""
+    s = phone_input or ""
+    norm = normalize_phone_for_db(s)
+    norm_digits = re.sub(r"[^0-9]", "", norm or "")
+    raw_digits = re.sub(r"[^0-9]", "", s)
+
+    candidates: list[str] = []
+    if norm_digits:
+        candidates.append(norm_digits)
+    if raw_digits and raw_digits != norm_digits:
+        candidates.append(raw_digits)
+    if not candidates:
+        return None
+
+    rec = await conn.fetchrow(
+        """
+        SELECT id, full_name, phone, birthday, bonus_balance, status
+        FROM clients
+        WHERE regexp_replace(COALESCE(phone,''), '[^0-9]+', '', 'g') = ANY($1::text[])
+        """,
+        candidates,
+    )
+    return rec
+
+
+from handlers.withdraw import router as withdraw_router
+from handlers.clients import router as clients_router
+from handlers.masters import router as masters_router
+
+dp.include_router(withdraw_router)
+dp.include_router(clients_router)
+dp.include_router(masters_router)
 
 # ==== Payment constants (canonical labels) ====
 PAYMENT_METHODS = ["Карта Женя", "Карта Дима", "Наличные", "р/с"]
@@ -440,43 +469,57 @@ async def admin_panel_alias(msg: Message, state: FSMContext):
 # === Explicit forwards for Admin menu buttons to avoid fallback catching ===
 @dp.message(AdminMenuFSM.root, F.text == "Изъятие")
 async def _forward_withdraw_from_admin(msg: Message, state: FSMContext):
-    # Lazy import to avoid any potential cycles
-    from handlers.withdraw import withdraw_start as _withdraw_start  # type: ignore
+    from handlers.withdraw import WithdrawFSM  # type: ignore
 
-    await _withdraw_start(msg, state)
+    await state.set_state(WithdrawFSM.waiting_amount)
+    await msg.answer("Введите сумму изъятия (например: 1500, 1 350.5) или отправьте «Отмена».")
 
 
 @dp.message(AdminMenuFSM.root, F.text == "Клиенты")
 async def _forward_clients_from_admin(msg: Message, state: FSMContext):
-    # Lazy import to avoid any potential cycles
-    from handlers.clients import admin_clients_root as _clients_root  # type: ignore
-
-    await _clients_root(msg, state)
+    await state.set_state("AdminMenuFSM:clients")
+    try:
+        from handlers.clients import admin_clients_kb  # type: ignore
+        await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
+    except Exception:
+        await msg.answer("Клиенты: выбери действие.")
 
 
 @dp.message(AdminMenuFSM.root, F.text == "Мастера")
 async def _forward_masters_from_admin(msg: Message, state: FSMContext):
-    # Lazy import to avoid any potential cycles
-    from handlers.masters import admin_masters_root as _masters_root  # type: ignore
-
-    await _masters_root(msg, state)
+    await state.set_state("AdminMenuFSM:masters")
+    try:
+        from handlers.masters import admin_masters_kb  # type: ignore
+        await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
+    except Exception:
+        await msg.answer("Мастера: выбери действие.")
 
 
 # === Global fallbacks for these buttons (catch even if state got cleared) ===
 @dp.message(F.text.casefold() == "изъятие")
 async def _forward_withdraw_any_state(msg: Message, state: FSMContext):
-    from handlers.withdraw import withdraw_start as _withdraw_start  # type: ignore
-    await _withdraw_start(msg, state)
+    from handlers.withdraw import WithdrawFSM  # type: ignore
+
+    await state.set_state(WithdrawFSM.waiting_amount)
+    await msg.answer("Введите сумму изъятия (например: 1500, 1 350.5) или отправьте «Отмена».")
 
 @dp.message(F.text.casefold() == "клиенты")
 async def _forward_clients_any_state(msg: Message, state: FSMContext):
-    from handlers.clients import admin_clients_root as _clients_root  # type: ignore
-    await _clients_root(msg, state)
+    await state.set_state("AdminMenuFSM:clients")
+    try:
+        from handlers.clients import admin_clients_kb  # type: ignore
+        await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
+    except Exception:
+        await msg.answer("Клиенты: выбери действие.")
 
 @dp.message(F.text.casefold() == "мастера")
 async def _forward_masters_any_state(msg: Message, state: FSMContext):
-    from handlers.masters import admin_masters_root as _masters_root  # type: ignore
-    await _masters_root(msg, state)
+    await state.set_state("AdminMenuFSM:masters")
+    try:
+        from handlers.masters import admin_masters_kb  # type: ignore
+        await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
+    except Exception:
+        await msg.answer("Мастера: выбери действие.")
 
 
 @dp.message(Command("help"))
