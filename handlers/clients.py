@@ -23,8 +23,8 @@ def _get_main_attr(name: str):
 
 router = Router(name="clients")
 logger = logging.getLogger(__name__)
-_clients_diag_enabled = False
-log_clients = logging.getLogger("clients")
+_CLIENTS_DIAG = False
+log_clients = logging.getLogger("clients_diag")
 logging.getLogger("diag").warning("ROUTER LOADED: %s", __name__)
 
 has_permission = _get_main_attr("has_permission")
@@ -39,18 +39,18 @@ _pool = _get_main_attr("pool")
 async def clients_diag_on(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_orders_reports"):
         return await msg.answer("Только для администраторов.")
-    global _clients_diag_enabled
-    _clients_diag_enabled = True
-    await msg.answer("Диагностика Клиенты: ВКЛ.")
+    global _CLIENTS_DIAG
+    _CLIENTS_DIAG = True
+    await msg.answer("🟢 Диагностика «Клиенты»: ВКЛ.")
 
 
 @router.message(Command("clients_diag_off"))
 async def clients_diag_off(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_orders_reports"):
         return await msg.answer("Только для администраторов.")
-    global _clients_diag_enabled
-    _clients_diag_enabled = False
-    await msg.answer("Диагностика Клиенты: ВЫКЛ.")
+    global _CLIENTS_DIAG
+    _CLIENTS_DIAG = False
+    await msg.answer("⚫️ Диагностика «Клиенты»: ВЫКЛ.")
 
 
 class AdminClientsFSM(StatesGroup):
@@ -435,11 +435,11 @@ async def client_set_phone(msg: Message):
 
 @router.message(F.text)
 async def _clients_diag_catch_all(msg: Message, state: FSMContext):
-    if not _clients_diag_enabled:
+    if not _CLIENTS_DIAG:
         return
     cur = await state.get_state()
-    log_clients.info("CLIENTS_ROUTER CATCH: from=%s state=%s text=%r", msg.from_user.id, cur, msg.text)
-    await msg.answer(f"🔎 [clients] state={cur or 'None'} text={msg.text!r}")
+    log_clients.warning("CLIENTS ROUTER CATCH: state=%s text=%r from=%s", cur, msg.text, msg.from_user.id)
+    await msg.answer(f"🔎 [clients-router] state={cur or 'None'} text={msg.text!r}")
 
 
 # DIAG-NOTE:

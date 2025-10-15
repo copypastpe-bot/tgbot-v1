@@ -23,11 +23,31 @@ def _get_main_attr(name: str):
 
 router = Router(name="masters")
 logger = logging.getLogger(__name__)
+log_masters = logging.getLogger("masters_diag")
+_MASTERS_DIAG = False
 logging.getLogger("diag").warning("ROUTER LOADED: %s", __name__)
 
 has_permission = _get_main_attr("has_permission")
 normalize_phone_for_db = _get_main_attr("normalize_phone_for_db")
 _pool = _get_main_attr("pool")
+
+
+@router.message(Command("masters_diag_on"))
+async def masters_diag_on(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    global _MASTERS_DIAG
+    _MASTERS_DIAG = True
+    await msg.answer("🟢 Диагностика «Мастера»: ВКЛ.")
+
+
+@router.message(Command("masters_diag_off"))
+async def masters_diag_off(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    global _MASTERS_DIAG
+    _MASTERS_DIAG = False
+    await msg.answer("⚫️ Диагностика «Мастера»: ВЫКЛ.")
 
 
 class AdminMastersFSM(StatesGroup):
@@ -219,3 +239,12 @@ async def remove_master(msg: Message):
     async with _pool.acquire() as conn:
         await conn.execute("UPDATE staff SET is_active=false WHERE tg_user_id=$1 AND role='master'", target_id)
     await msg.answer(f"Пользователь {target_id} деактивирован как мастер.")
+
+
+@router.message(F.text)
+async def _masters_router_catch_all(msg: Message, state: FSMContext):
+    if not _MASTERS_DIAG:
+        return
+    cur = await state.get_state()
+    log_masters.warning("MASTERS ROUTER CATCH: state=%s text=%r from=%s", cur, msg.text, msg.from_user.id)
+    await msg.answer(f"🔎 [masters-router] state={cur or 'None'} text={msg.text!r}")
