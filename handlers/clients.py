@@ -90,11 +90,8 @@ def _fmt_client_row(rec) -> str:
     ])
 
 
-@router.message(StateFilter("AdminMenuFSM:root"), F.text == "Клиенты")
+@router.message(AdminClientsFSM.root, F.text == "Клиенты")
 async def admin_clients_root(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_orders_reports"):
-        return await msg.answer("Только для администраторов.")
-    await state.set_state(AdminClientsFSM.root)
     await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
 
 

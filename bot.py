@@ -477,6 +477,8 @@ async def _forward_withdraw_from_admin(msg: Message, state: FSMContext):
 
 @dp.message(AdminMenuFSM.root, F.text == "Клиенты")
 async def _forward_clients_from_admin(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
     from handlers.clients import AdminClientsFSM, admin_clients_kb  # type: ignore
 
     await state.set_state(AdminClientsFSM.root)
@@ -485,12 +487,12 @@ async def _forward_clients_from_admin(msg: Message, state: FSMContext):
 
 @dp.message(AdminMenuFSM.root, F.text == "Мастера")
 async def _forward_masters_from_admin(msg: Message, state: FSMContext):
-    await state.set_state("AdminMenuFSM:masters")
-    try:
-        from handlers.masters import admin_masters_kb  # type: ignore
-        await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
-    except Exception:
-        await msg.answer("Мастера: выбери действие.")
+    if not await has_permission(msg.from_user.id, "add_master"):
+        return await msg.answer("Только для администраторов.")
+    from handlers.masters import AdminMastersFSM, admin_masters_kb  # type: ignore
+
+    await state.set_state(AdminMastersFSM.root)
+    await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
 
 
 # === Global fallbacks for these buttons (catch even if state got cleared) ===
@@ -503,6 +505,8 @@ async def _forward_withdraw_any_state(msg: Message, state: FSMContext):
 
 @dp.message(F.text.casefold() == "клиенты")
 async def _forward_clients_any_state(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "edit_client"):
+        return await msg.answer("Только для администраторов.")
     from handlers.clients import AdminClientsFSM, admin_clients_kb  # type: ignore
 
     await state.set_state(AdminClientsFSM.root)
@@ -510,12 +514,12 @@ async def _forward_clients_any_state(msg: Message, state: FSMContext):
 
 @dp.message(F.text.casefold() == "мастера")
 async def _forward_masters_any_state(msg: Message, state: FSMContext):
-    await state.set_state("AdminMenuFSM:masters")
-    try:
-        from handlers.masters import admin_masters_kb  # type: ignore
-        await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
-    except Exception:
-        await msg.answer("Мастера: выбери действие.")
+    if not await has_permission(msg.from_user.id, "add_master"):
+        return await msg.answer("Только для администраторов.")
+    from handlers.masters import AdminMastersFSM, admin_masters_kb  # type: ignore
+
+    await state.set_state(AdminMastersFSM.root)
+    await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
 
 
 @dp.message(Command("help"))

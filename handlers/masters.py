@@ -30,6 +30,7 @@ _pool = _get_main_attr("pool")
 
 
 class AdminMastersFSM(StatesGroup):
+    root = State()
     remove_wait_phone = State()
 
 
@@ -48,25 +49,24 @@ def admin_masters_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
-@router.message(StateFilter("AdminMenuFSM:root"), F.text == "Мастера")
+@router.message(AdminMastersFSM.root, F.text == "Мастера")
 async def admin_masters_root(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
-    await state.set_state("AdminMenuFSM:masters")
     await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
 
 
-@router.message(StateFilter("AdminMenuFSM:masters"), F.text == "Назад")
+@router.message(AdminMastersFSM.root, F.text == "Назад")
 async def admin_masters_back(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state)
 
 
-@router.message(StateFilter("AdminMenuFSM:masters"), F.text == "Отмена")
+@router.message(AdminMastersFSM.root, F.text == "Отмена")
 async def admin_masters_cancel(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state)
 
 
-@router.message(StateFilter("AdminMenuFSM:masters"), F.text == "Список мастеров")
+@router.message(AdminMastersFSM.root, F.text == "Список мастеров")
 async def admin_masters_list(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
@@ -161,7 +161,7 @@ async def add_master_phone(msg: Message, state: FSMContext):
     await state.clear()
 
 
-@router.message(StateFilter("AdminMenuFSM:masters"), F.text == "Деактивировать мастера")
+@router.message(AdminMastersFSM.root, F.text == "Деактивировать мастера")
 async def admin_masters_remove_start(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
@@ -169,7 +169,19 @@ async def admin_masters_remove_start(msg: Message, state: FSMContext):
     await msg.answer("Введите телефон мастера (8/+7/9...):")
 
 
-@router.message(AdminMastersFSM.remove_wait_phone)
+@router.message(AdminMastersFSM.remove_wait_phone, F.text == "Назад")
+async def admin_masters_remove_back(msg: Message, state: FSMContext):
+    await state.set_state(AdminMastersFSM.root)
+    await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
+
+
+@router.message(AdminMastersFSM.remove_wait_phone, F.text == "Отмена")
+async def admin_masters_remove_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await show_admin_menu(msg, state)
+
+
+@router.message(AdminMastersFSM.remove_wait_phone, F.text)
 async def admin_masters_remove_phone(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "add_master"):
         await state.clear()
