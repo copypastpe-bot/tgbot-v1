@@ -3,6 +3,7 @@ import csv, io
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone
 from aiogram import Bot, Dispatcher, F
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     BotCommand,
@@ -73,7 +74,9 @@ UPSELL_PER_3000 = Decimal(os.getenv("UPSELL_RATE_PER_3000", "500"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+# Explicit in-memory storage for FSM — without this FSM state may not persist and
+# menu buttons that depend on states (AdminMenuFSM.root etc.) won't be handled.
+dp = Dispatcher(storage=MemoryStorage())
 pool: asyncpg.Pool | None = None
 
 # ===== RBAC helpers (DB-driven) =====
