@@ -437,6 +437,31 @@ async def admin_panel_alias(msg: Message, state: FSMContext):
     await admin_menu_start(msg, state)
 
 
+# === Explicit forwards for Admin menu buttons to avoid fallback catching ===
+@dp.message(AdminMenuFSM.root, F.text == "Изъятие")
+async def _forward_withdraw_from_admin(msg: Message, state: FSMContext):
+    # Lazy import to avoid any potential cycles
+    from handlers.withdraw import withdraw_start as _withdraw_start  # type: ignore
+
+    await _withdraw_start(msg, state)
+
+
+@dp.message(AdminMenuFSM.root, F.text == "Клиенты")
+async def _forward_clients_from_admin(msg: Message, state: FSMContext):
+    # Lazy import to avoid any potential cycles
+    from handlers.clients import admin_clients_root as _clients_root  # type: ignore
+
+    await _clients_root(msg, state)
+
+
+@dp.message(AdminMenuFSM.root, F.text == "Мастера")
+async def _forward_masters_from_admin(msg: Message, state: FSMContext):
+    # Lazy import to avoid any potential cycles
+    from handlers.masters import admin_masters_root as _masters_root  # type: ignore
+
+    await _masters_root(msg, state)
+
+
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
     global pool
