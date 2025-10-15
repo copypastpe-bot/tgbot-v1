@@ -10,7 +10,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
-from bot import AdminMenuFSM  # type: ignore
 from utils.ui import show_admin_menu, admin_root_kb
 
 router = Router(name="clients")
@@ -81,34 +80,34 @@ async def _find_client_by_phone(conn: asyncpg.Connection, phone_input: str):
     return rec
 
 
-@router.message(AdminMenuFSM.root, F.text == "Клиенты")
+@router.message(StateFilter("AdminMenuFSM:root"), F.text == "Клиенты")
 async def admin_clients_root(msg: Message, state: FSMContext):
     from bot import has_permission  # type: ignore
 
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
-    await state.set_state(AdminMenuFSM.clients)
+    await state.set_state("AdminMenuFSM:clients")
     await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
 
 
-@router.message(AdminMenuFSM.clients, F.text == "Найти клиента")
+@router.message(StateFilter("AdminMenuFSM:clients"), F.text == "Найти клиента")
 async def client_find_start(msg: Message, state: FSMContext):
     await state.set_state(AdminClientsFSM.find_wait_phone)
     await msg.answer("Введите номер телефона клиента (8/ +7/ 9...):")
 
 
-@router.message(AdminMenuFSM.clients, F.text == "Редактировать клиента")
+@router.message(StateFilter("AdminMenuFSM:clients"), F.text == "Редактировать клиента")
 async def client_edit_start(msg: Message, state: FSMContext):
     await state.set_state(AdminClientsFSM.edit_wait_phone)
     await msg.answer("Введите номер телефона клиента для редактирования:")
 
 
-@router.message(AdminMenuFSM.clients, F.text == "Назад")
+@router.message(StateFilter("AdminMenuFSM:clients"), F.text == "Назад")
 async def admin_clients_back(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state)
 
 
-@router.message(AdminMenuFSM.clients, F.text == "Отмена")
+@router.message(StateFilter("AdminMenuFSM:clients"), F.text == "Отмена")
 async def admin_clients_cancel(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state)
 
@@ -124,7 +123,7 @@ async def admin_clients_cancel(msg: Message, state: FSMContext):
 )
 async def admin_clients_states_back(msg: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(AdminMenuFSM.clients)
+    await state.set_state("AdminMenuFSM:clients")
     await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
 
 
