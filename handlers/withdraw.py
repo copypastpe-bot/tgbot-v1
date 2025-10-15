@@ -143,9 +143,9 @@ async def withdraw_amount_cancel(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state, "Операция отменена.")
 
 
-@router.message(WithdrawFSM.waiting_amount, F.content_type == ContentType.TEXT)
+@router.message(WithdrawFSM.waiting_amount, F.text)
 async def withdraw_amount_got(msg: Message, state: FSMContext):
-    from bot import pool  # type: ignore
+    from bot import pool as _pool  # type: ignore
 
     logger.debug(
         f"[withdraw amount] state={await state.get_state()} user={msg.from_user.id} text={msg.text!r}"
@@ -159,7 +159,7 @@ async def withdraw_amount_got(msg: Message, state: FSMContext):
         )
 
     await state.update_data(withdraw_amount=str(amount))
-    async with pool.acquire() as conn:
+    async with _pool.acquire() as conn:
         kb = await build_masters_kb(conn)
     await state.set_state(WithdrawFSM.waiting_master)
     return await msg.answer(
@@ -186,7 +186,7 @@ async def withdraw_master_cancel(msg: Message, state: FSMContext):
 
 @router.callback_query(WithdrawFSM.waiting_master)
 async def withdraw_master_callback(query: CallbackQuery, state: FSMContext):
-    from bot import pool  # type: ignore
+    from bot import pool as _pool  # type: ignore
 
     logging.info(
         f"[withdraw] step=master_callback user={query.from_user.id} data={query.data}"
@@ -218,7 +218,7 @@ async def withdraw_master_callback(query: CallbackQuery, state: FSMContext):
         await query.answer("Некорректные данные", show_alert=True)
         return
 
-    async with pool.acquire() as conn:
+    async with _pool.acquire() as conn:
         master_row = await conn.fetchrow(
             "SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
             master_id,
@@ -270,20 +270,20 @@ async def withdraw_unexpected_callback(query: CallbackQuery, state: FSMContext):
 
 @router.message(WithdrawFSM.waiting_master)
 async def withdraw_master_got(msg: Message, state: FSMContext):
-    from bot import pool  # type: ignore
+    from bot import pool as _pool  # type: ignore
 
     logging.info(f"[withdraw] step=master_text_input user={msg.from_user.id} text={msg.text}")
-    async with pool.acquire() as conn:
+    async with _pool.acquire() as conn:
         kb = await build_masters_kb(conn)
     return await msg.answer("Пожалуйста, выберите мастера кнопкой ниже.", reply_markup=kb)
 
 
 @router.message(WithdrawFSM.waiting_comment, F.text.lower() == "назад")
 async def withdraw_comment_back(msg: Message, state: FSMContext):
-    from bot import pool  # type: ignore
+    from bot import pool as _pool  # type: ignore
 
     logging.info(f"[withdraw] step=comment_back user={msg.from_user.id} text={msg.text}")
-    async with pool.acquire() as conn:
+    async with _pool.acquire() as conn:
         kb = await build_masters_kb(conn)
     await state.update_data(withdraw_master_id=None, withdraw_master_name=None)
     await state.set_state(WithdrawFSM.waiting_master)
@@ -301,9 +301,9 @@ async def withdraw_comment_cancel(msg: Message, state: FSMContext):
     await show_admin_menu(msg, state, "Операция отменена.")
 
 
-@router.message(WithdrawFSM.waiting_comment)
+@router.message(WithdrawFSM.waiting_comment, F.text)
 async def withdraw_finish(msg: Message, state: FSMContext):
-    from bot import pool, AdminMenuFSM  # type: ignore
+    from bot import pool as _pool, AdminMenuFSM  # type: ignore
 
     logging.info(f"[withdraw] step=finish user={msg.from_user.id} text={msg.text}")
     data = await state.get_data()
@@ -321,7 +321,7 @@ async def withdraw_finish(msg: Message, state: FSMContext):
 
     master_name = data.get("withdraw_master_name")
 
-    async with pool.acquire() as conn:
+    async with _pool.acquire() as conn:
         if not master_name:
             row = await conn.fetchrow(
                 "SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
