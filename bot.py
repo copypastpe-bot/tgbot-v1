@@ -470,9 +470,13 @@ async def admin_panel_alias(msg: Message, state: FSMContext):
 @dp.message(AdminMenuFSM.root, F.text == "Изъятие")
 async def _forward_withdraw_from_admin(msg: Message, state: FSMContext):
     from handlers.withdraw import WithdrawFSM  # type: ignore
+    from handlers.withdraw import withdraw_nav_kb  # type: ignore
 
     await state.set_state(WithdrawFSM.waiting_amount)
-    await msg.answer("Введите сумму изъятия (например: 1500, 1 350.5) или отправьте «Отмена».")
+    await msg.answer(
+        "Введите сумму изъятия (например: 1500, 1 350.5) или отправьте «Отмена».",
+        reply_markup=withdraw_nav_kb(),
+    )
 
 
 @dp.message(AdminMenuFSM.root, F.text == "Клиенты")
@@ -499,9 +503,13 @@ async def _forward_masters_from_admin(msg: Message, state: FSMContext):
 @dp.message(F.text.casefold() == "изъятие")
 async def _forward_withdraw_any_state(msg: Message, state: FSMContext):
     from handlers.withdraw import WithdrawFSM  # type: ignore
+    from handlers.withdraw import withdraw_nav_kb  # type: ignore
 
     await state.set_state(WithdrawFSM.waiting_amount)
-    await msg.answer("Введите сумму изъятия (например: 1500, 1 350.5) или отправьте «Отмена».")
+    await msg.answer(
+        "Введите сумму изъятия (например: 1500, 1 350.5) или отправьте «Отмена».",
+        reply_markup=withdraw_nav_kb(),
+    )
 
 @dp.message(F.text.casefold() == "клиенты")
 async def _forward_clients_any_state(msg: Message, state: FSMContext):
