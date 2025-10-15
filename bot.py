@@ -67,6 +67,7 @@ class ReportsFSM(StatesGroup):
 from dotenv import load_dotenv
 
 import asyncpg
+from services.db import get_master_wallet, _record_income, _record_expense
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
 # Разрешаем пробелы, дефисы и скобки в пользовательском вводе
@@ -514,29 +515,6 @@ async def reports_run_period_year(msg: Message, state: FSMContext):
     await msg.answer(text, reply_markup=reports_period_kb())
 
 
-async def _record_income(conn: asyncpg.Connection, method: str, amount: Decimal, comment: str):
-    norm = norm_pay_method_py(method)
-    tx = await conn.fetchrow(
-        """
-        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-        VALUES ('income', $1, $2, $3, NULL, NULL, now())
-        RETURNING id, happened_at
-        """,
-        norm, amount, comment or "Приход",
-    )
-    return tx
-
-
-async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: str, method: str = "прочее"):
-    tx = await conn.fetchrow(
-        """
-        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-        VALUES ('expense', $1, $2, $3, NULL, NULL, now())
-        RETURNING id, happened_at
-        """,
-        method, amount, comment or "Расход",
-    )
-    return tx
 
 
 # Payment method normalizer (Python side to mirror SQL norm_pay_method)
@@ -796,34 +774,6 @@ async def admin_masters_remove_phone(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Мастер деактивирован.", reply_markup=admin_root_kb())
-
-
-async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
-    """
-    Возвращает (cash_on_hand, withdrawn_total) по тем же правилам, что и в отчёте «Мастер/Заказы/Оплаты».
-    cash_on_hand = «Наличных у мастера»
-    withdrawn_total = «Изъято у мастера»
-    """
-    cash_on_orders = await conn.fetchval(
-        """
-        SELECT COALESCE(SUM(amount),0)
-        FROM cashbook_entries
-        WHERE kind='income' AND method='Наличные'
-          AND master_id=$1 AND order_id IS NOT NULL
-        """,
-        master_id,
-    )
-    withdrawn = await conn.fetchval(
-        """
-        SELECT COALESCE(SUM(amount),0)
-        FROM cashbook_entries
-        WHERE kind='withdrawal' AND method='cash'
-          AND master_id=$1 AND order_id IS NULL
-        """,
-        master_id,
-    )
-
-    return Decimal(cash_on_orders or 0), Decimal(withdrawn or 0)
 
 
 def parse_amount_ru(text: str) -> tuple[Decimal | None, dict]:
