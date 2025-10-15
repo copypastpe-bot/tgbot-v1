@@ -1388,30 +1388,6 @@ async def expense_wizard_comment(msg: Message, state: FSMContext):
     await state.clear()
 
 
-@dp.message(AdminMenuFSM.masters, F.text.casefold() == "назад")
-async def masters_back(msg: Message, state: FSMContext):
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
-
-
-@dp.message(AdminMenuFSM.masters, F.text.casefold() == "добавить мастера")
-async def masters_add(msg: Message, state: FSMContext):
-    await state.clear()
-    await msg.answer("Формат: /add_master <tg_user_id>")
-
-
-@dp.message(AdminMenuFSM.masters, F.text.casefold() == "список мастеров")
-async def masters_list(msg: Message, state: FSMContext):
-    await state.clear()
-    return await list_masters(msg)
-
-
-@dp.message(AdminMenuFSM.masters, F.text.casefold() == "деактивировать мастера")
-async def masters_remove(msg: Message, state: FSMContext):
-    await state.clear()
-    await msg.answer("Формат: /remove_master <tg_user_id>")
-
-
 @dp.message(ReportsFSM.waiting_pick_master, ~F.text.startswith("/"))
 async def rep_master_pick(msg: Message, state: FSMContext):
     txt = (msg.text or "").strip()
