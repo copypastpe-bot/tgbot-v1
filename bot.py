@@ -22,13 +22,6 @@ class AdminMenuFSM(StatesGroup):
     clients = State()
 
 
-class AdminClientsFSM(StatesGroup):
-    find_wait_phone = State()
-    edit_wait_phone = State()
-    edit_pick_field = State()
-    edit_wait_value = State()
-
-
 class AdminMastersFSM(StatesGroup):
     remove_wait_phone = State()
 
@@ -58,6 +51,7 @@ from dotenv import load_dotenv
 
 import asyncpg
 from handlers.withdraw import router as withdraw_router
+from handlers.clients import router as clients_router
 from services.db import _record_income, _record_expense
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
@@ -92,6 +86,7 @@ logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 dp.include_router(withdraw_router)
+dp.include_router(clients_router)
 pool: asyncpg.Pool | None = None
 
 # ===== RBAC helpers (DB-driven) =====
@@ -228,46 +223,6 @@ def parse_birthday_str(s: str | None) -> date | None:
             return None
     return None
 
-# ===== Client edit helpers =====
-async def _find_client_by_phone(conn: asyncpg.Connection, phone_input: str):
-    """Lookup client by any phone format. Accepts 8XXXXXXXXXX, +7XXXXXXXXXX, 9XXXXXXXXX, mixed text.
-    Uses normalize_phone_for_db first, then falls back to raw digits. Matches by phone_digits.
-    """
-    s = phone_input or ""
-    # normalized to +7XXXXXXXXXX if possible
-    norm = normalize_phone_for_db(s)
-    norm_digits = re.sub(r"[^0-9]", "", norm or "")
-    raw_digits = re.sub(r"[^0-9]", "", s)
-
-    candidates: list[str] = []
-    if norm_digits:
-        candidates.append(norm_digits)
-    if raw_digits and raw_digits != norm_digits:
-        candidates.append(raw_digits)
-    if not candidates:
-        return None
-
-    rec = await conn.fetchrow(
-        """
-        SELECT id, full_name, phone, birthday, bonus_balance, status
-        FROM clients
-        WHERE regexp_replace(COALESCE(phone,''), '[^0-9]+', '', 'g') = ANY($1::text[])
-        """,
-        candidates,
-    )
-    return rec
-
-def _fmt_client_row(rec) -> str:
-    bday = rec["birthday"].strftime("%Y-%m-%d") if rec["birthday"] else "—"
-    return "\n".join([
-        f"id: {rec['id']}",
-        f"Имя: {rec['full_name'] or '—'}",
-        f"Телефон: {rec['phone'] or '—'}",
-        f"ДР: {bday}",
-        f"Бонусы: {rec['bonus_balance']}",
-        f"Статус: {rec['status']}",
-    ])
-
 # ==== Payment constants (canonical labels) ====
 PAYMENT_METHODS = ["Карта Женя", "Карта Дима", "Наличные", "р/с"]
 GIFT_CERT_LABEL = "Подарочный сертификат"
@@ -331,24 +286,6 @@ def admin_masters_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="Добавить мастера"), KeyboardButton(text="Список мастеров")],
         [KeyboardButton(text="Деактивировать мастера")],
-        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
-    ]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
-
-
-def admin_clients_kb() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text="Найти клиента"), KeyboardButton(text="Редактировать клиента")],
-        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
-    ]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
-
-
-def client_edit_fields_kb() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text="Имя"), KeyboardButton(text="Телефон")],
-        [KeyboardButton(text="ДР"), KeyboardButton(text="Бонусы установить")],
-        [KeyboardButton(text="Бонусы добавить/убавить")],
         [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
@@ -600,42 +537,12 @@ async def tx_last_menu(msg: Message, state: FSMContext):
     await msg.answer("Выберите, сколько показать:", reply_markup=tx_last_kb())
 
 
-@dp.message(AdminMenuFSM.root, F.text == "Клиенты")
-async def admin_clients_root(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "edit_client"):
-        return await msg.answer("Только для администраторов.")
-    await state.set_state(AdminMenuFSM.clients)
-    await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
-
-
 @dp.message(AdminMenuFSM.root, F.text == "Мастера")
 async def admin_masters_root(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     await state.set_state(AdminMenuFSM.masters)
     await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
-
-
-@dp.message(AdminMenuFSM.clients, F.text == "Найти клиента")
-async def client_find_start(msg: Message, state: FSMContext):
-    await state.set_state(AdminClientsFSM.find_wait_phone)
-    await msg.answer("Введите номер телефона клиента (8/ +7/ 9...):")
-
-
-@dp.message(AdminMenuFSM.clients, F.text == "Редактировать клиента")
-async def client_edit_start(msg: Message, state: FSMContext):
-    await state.set_state(AdminClientsFSM.edit_wait_phone)
-    await msg.answer("Введите номер телефона клиента для редактирования:")
-
-
-@dp.message(AdminMenuFSM.clients, F.text == "Назад")
-async def admin_clients_back(msg: Message, state: FSMContext):
-    await show_admin_menu(msg, state)
-
-
-@dp.message(AdminMenuFSM.clients, F.text == "Отмена")
-async def admin_clients_cancel(msg: Message, state: FSMContext):
-    await show_admin_menu(msg, state)
 
 
 @dp.message(AdminMenuFSM.masters, F.text == "Назад")
@@ -708,127 +615,6 @@ async def admin_masters_remove_phone(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
     await msg.answer("Мастер деактивирован.", reply_markup=admin_root_kb())
-
-
-@dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Назад")
-async def admin_clients_states_back(msg: Message, state: FSMContext):
-    await state.clear()
-    await state.set_state(AdminMenuFSM.clients)
-    await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
-
-
-@dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Отмена")
-async def admin_clients_states_cancel(msg: Message, state: FSMContext):
-    await state.clear()
-    await show_admin_menu(msg, state)
-
-
-@dp.message(AdminClientsFSM.find_wait_phone)
-async def client_find_got_phone(msg: Message, state: FSMContext):
-    async with pool.acquire() as conn:
-        rec = await _find_client_by_phone(conn, msg.text)
-    if not rec:
-        await state.clear()
-        await show_admin_menu(msg, state, "Клиент не найден.")
-        return
-    await state.clear()
-    await show_admin_menu(msg, state, _fmt_client_row(rec))
-    return
-
-
-@dp.message(AdminClientsFSM.edit_wait_phone)
-async def client_edit_got_phone(msg: Message, state: FSMContext):
-    async with pool.acquire() as conn:
-        rec = await _find_client_by_phone(conn, msg.text)
-    if not rec:
-        await state.clear()
-        await show_admin_menu(msg, state, "Клиент не найден.")
-        return
-    await state.update_data(client_id=rec["id"])
-    await state.set_state(AdminClientsFSM.edit_pick_field)
-    await msg.answer("Что изменить?", reply_markup=client_edit_fields_kb())
-
-
-@dp.message(AdminClientsFSM.edit_pick_field, F.text.in_({"Имя", "Телефон", "ДР", "Бонусы установить", "Бонусы добавить/убавить"}))
-async def client_edit_pick_field(msg: Message, state: FSMContext):
-    await state.update_data(edit_field=msg.text)
-    prompt = {
-        "Имя": "Введите новое имя:",
-        "Телефон": "Введите новый телефон (+7 / 8 / 9...):",
-        "ДР": "Введите дату (DD.MM.YYYY или YYYY-MM-DD):",
-        "Бонусы установить": "Введите новое количество бонусов (целое число):",
-        "Бонусы добавить/убавить": "Введите дельту бонусов (целое число, можно со знаком -/+):",
-    }[msg.text]
-    await state.set_state(AdminClientsFSM.edit_wait_value)
-    await msg.answer(prompt)
-
-
-@dp.message(AdminClientsFSM.edit_wait_value)
-async def client_edit_apply(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    client_id = data.get("client_id")
-    field = data.get("edit_field")
-    if not client_id or not field:
-        await state.clear()
-        return await msg.answer("Сессия сброшена, попробуйте заново.", reply_markup=admin_root_kb())
-
-    async with pool.acquire() as conn:
-        if field == "Имя":
-            await conn.execute(
-                "UPDATE clients SET full_name=$1, last_updated=NOW() WHERE id=$2",
-                (msg.text or "").strip(),
-                client_id,
-            )
-        elif field == "Телефон":
-            new_phone = normalize_phone_for_db(msg.text)
-            if not new_phone or not new_phone.startswith("+7"):
-                return await msg.answer("Неверный телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
-            await conn.execute(
-                "UPDATE clients SET phone=$1, last_updated=NOW() WHERE id=$2",
-                new_phone,
-                client_id,
-            )
-        elif field == "ДР":
-            b = parse_birthday_str(msg.text)
-            if not b:
-                return await msg.answer("Неверная дата. Форматы: DD.MM.YYYY / YYYY-MM-DD. Введите ещё раз.")
-            await conn.execute(
-                "UPDATE clients SET birthday=$1, last_updated=NOW() WHERE id=$2",
-                b,
-                client_id,
-            )
-        elif field == "Бонусы установить":
-            try:
-                val = int((msg.text or "0").strip())
-            except Exception:
-                return await msg.answer("Нужно целое число. Введите ещё раз.")
-            await conn.execute(
-                "UPDATE clients SET bonus_balance=$1, last_updated=NOW() WHERE id=$2",
-                val,
-                client_id,
-            )
-        elif field == "Бонусы добавить/убавить":
-            try:
-                delta = int((msg.text or "0").strip())
-            except Exception:
-                return await msg.answer("Нужно целое число (можно со знаком). Введите ещё раз.")
-            rec = await conn.fetchrow(
-                "SELECT bonus_balance FROM clients WHERE id=$1",
-                client_id,
-            )
-            current_bonus = int(rec["bonus_balance"] or 0) if rec else 0
-            new_bonus = current_bonus + delta
-            if new_bonus < 0:
-                new_bonus = 0
-            await conn.execute(
-                "UPDATE clients SET bonus_balance=$1, last_updated=NOW() WHERE id=$2",
-                new_bonus,
-                client_id,
-            )
-
-    await state.clear()
-    await show_admin_menu(msg, state, "Готово. Клиент обновлён.")
-    return
 
 
 @dp.message(Command("admin_panel"))
@@ -918,150 +704,6 @@ async def whoami(msg: Message):
             ("Права: " + (", ".join(perms) if perms else "—"))
         ])
     )
-
-# ===== Client admin edit commands =====
-@dp.message(Command("client_info"))
-async def client_info(msg: Message):
-    if not await has_permission(msg.from_user.id, "edit_client"):
-        return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await msg.answer("Формат: /client_info <телефон>")
-    phone_q = parts[1].strip()
-    async with pool.acquire() as conn:
-        rec = await _find_client_by_phone(conn, phone_q)
-    if not rec:
-        return await msg.answer("Клиент не найден по этому номеру.")
-    return await msg.answer(_fmt_client_row(rec))
-
-@dp.message(Command("client_set_name"))
-async def client_set_name(msg: Message):
-    if not await has_permission(msg.from_user.id, "edit_client"):
-        return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=2)
-    if len(parts) < 3:
-        return await msg.answer("Формат: /client_set_name <телефон> <новое_имя>")
-    phone_q = parts[1].strip()
-    new_name = parts[2].strip()
-    async with pool.acquire() as conn:
-        rec = await _find_client_by_phone(conn, phone_q)
-        if not rec:
-            return await msg.answer("Клиент не найден по этому номеру.")
-        await conn.execute("UPDATE clients SET full_name=$1, last_updated=NOW() WHERE id=$2", new_name, rec["id"])
-        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
-    return await msg.answer("Имя обновлено:\n" + _fmt_client_row(rec2))
-
-@dp.message(Command("client_set_birthday"))
-async def client_set_birthday(msg: Message):
-    if not await has_permission(msg.from_user.id, "edit_client"):
-        return await msg.answer("Только для администраторов.")
-    try:
-        parts = msg.text.split(maxsplit=2)
-        if len(parts) < 3:
-            return await msg.answer("Формат: /client_set_birthday <телефон> <ДР: DD.MM.YYYY или YYYY-MM-DD>")
-        phone_q = parts[1].strip()
-        bday_raw = parts[2].strip()
-
-        # 1) нормализация даты → Python date
-        bday_date = parse_birthday_str(bday_raw)
-        if not bday_date:
-            return await msg.answer("Не распознал дату. Форматы: DD.MM.YYYY (допускаются 1-2 цифры) или YYYY-MM-DD.")
-
-        # 2) поиск клиента и обновление
-        async with pool.acquire() as conn:
-            rec = await _find_client_by_phone(conn, phone_q)
-            if not rec:
-                norm = normalize_phone_for_db(phone_q)
-                digits = re.sub(r"[^0-9]", "", norm or phone_q)
-                return await msg.answer(f"Клиент не найден по номеру.\nИскали: {phone_q}\nНормализовано: {norm}\nЦифры: {digits}")
-
-            await conn.execute(
-                "UPDATE clients SET birthday=$1, last_updated=NOW() WHERE id=$2",
-                bday_date, rec["id"]
-            )
-            rec2 = await conn.fetchrow(
-                "SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1",
-                rec["id"]
-            )
-
-        return await msg.answer("ДР обновлён:\n" + _fmt_client_row(rec2))
-
-    except Exception as e:
-        logging.exception("client_set_birthday failed")
-        return await msg.answer(f"Ошибка при обновлении ДР: {e}")
-
-@dp.message(Command("client_set_bonus"))
-async def client_set_bonus(msg: Message):
-    if not await has_permission(msg.from_user.id, "edit_client"):
-        return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=2)
-    if len(parts) < 3:
-        return await msg.answer("Формат: /client_set_bonus <телефон> <сумма_баллов>")
-    phone_q = parts[1].strip()
-    try:
-        amount = int(parts[2].strip())
-    except Exception:
-        return await msg.answer("Сумма должна быть целым числом.")
-    async with pool.acquire() as conn:
-        rec = await _find_client_by_phone(conn, phone_q)
-        if not rec:
-            return await msg.answer("Клиент не найден по этому номеру.")
-        await conn.execute("UPDATE clients SET bonus_balance=$1, last_updated=NOW() WHERE id=$2", amount, rec["id"])
-        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
-    return await msg.answer("Бонусы установлены:\n" + _fmt_client_row(rec2))
-
-@dp.message(Command("client_add_bonus"))
-async def client_add_bonus(msg: Message):
-    if not await has_permission(msg.from_user.id, "edit_client"):
-        return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=2)
-    if len(parts) < 3:
-        return await msg.answer("Формат: /client_add_bonus <телефон> <дельта>")
-    phone_q = parts[1].strip()
-    try:
-        delta = int(parts[2].strip())
-    except Exception:
-        return await msg.answer("Дельта должна быть целым числом (можно со знаком -/+).")
-    async with pool.acquire() as conn:
-        rec = await _find_client_by_phone(conn, phone_q)
-        if not rec:
-            return await msg.answer("Клиент не найден по этому номеру.")
-        new_bonus = int(rec["bonus_balance"] or 0) + delta
-        if new_bonus < 0:
-            new_bonus = 0
-        await conn.execute("UPDATE clients SET bonus_balance=$1, last_updated=NOW() WHERE id=$2", new_bonus, rec["id"])
-        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
-    return await msg.answer("Бонусы обновлены:\n" + _fmt_client_row(rec2))
-
-@dp.message(Command("client_set_phone"))
-async def client_set_phone(msg: Message):
-    if not await has_permission(msg.from_user.id, "edit_client"):
-        return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=2)
-    if len(parts) < 3:
-        return await msg.answer("Формат: /client_set_phone <старый_телефон> <новый_телефон>")
-    phone_q = parts[1].strip()
-    new_phone_raw = parts[2].strip()
-    new_phone_norm = normalize_phone_for_db(new_phone_raw)
-    if not new_phone_norm or not new_phone_norm.startswith("+7") or len(re.sub(r"[^0-9]", "", new_phone_norm)) != 11:
-        return await msg.answer("Не распознал новый телефон. Пример: +7XXXXXXXXXX")
-    async with pool.acquire() as conn:
-        rec = await _find_client_by_phone(conn, phone_q)
-        if not rec:
-            return await msg.answer("Клиент не найден по этому номеру.")
-        try:
-            await conn.execute("UPDATE clients SET phone=$1, last_updated=NOW() WHERE id=$2", new_phone_norm, rec["id"])
-        except asyncpg.exceptions.UniqueViolationError:
-            # конфликт по уникальному phone/phone_digits
-            other = await conn.fetchrow(
-                "SELECT id, full_name FROM clients WHERE phone_digits = regexp_replace($1,'[^0-9]','','g') AND id <> $2",
-                new_phone_norm, rec["id"]
-            )
-            if other:
-                return await msg.answer(f"Номер уже используется клиентом id={other['id']} ({other['full_name'] or '—'}).")
-            return await msg.answer("Номер уже используется другим клиентом.")
-        rec2 = await conn.fetchrow("SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1", rec["id"])
-    return await msg.answer("Телефон обновлён:\n" + _fmt_client_row(rec2))
 
 # ===== /payroll admin command =====
 @dp.message(Command("payroll"))
