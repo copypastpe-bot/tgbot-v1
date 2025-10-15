@@ -21,6 +21,7 @@ from utils.ui import show_admin_menu, admin_root_kb
 
 router = Router(name="withdraw")
 logger = logging.getLogger(__name__)
+logging.getLogger("diag").warning("ROUTER LOADED: %s", __name__)
 
 
 class WithdrawFSM(StatesGroup):

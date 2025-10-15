@@ -23,6 +23,7 @@ def _get_main_attr(name: str):
 
 router = Router(name="masters")
 logger = logging.getLogger(__name__)
+logging.getLogger("diag").warning("ROUTER LOADED: %s", __name__)
 
 has_permission = _get_main_attr("has_permission")
 normalize_phone_for_db = _get_main_attr("normalize_phone_for_db")

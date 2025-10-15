@@ -25,6 +25,7 @@ router = Router(name="clients")
 logger = logging.getLogger(__name__)
 _clients_diag_enabled = False
 log_clients = logging.getLogger("clients")
+logging.getLogger("diag").warning("ROUTER LOADED: %s", __name__)
 
 has_permission = _get_main_attr("has_permission")
 normalize_phone_for_db = _get_main_attr("normalize_phone_for_db")

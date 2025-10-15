@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 
 import asyncpg
 from services.db import _record_income, _record_expense
+from utils.diag import build_info
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
 # Разрешаем пробелы, дефисы и скобки в пользовательском вводе
@@ -243,6 +244,19 @@ from handlers.masters import router as masters_router
 dp.include_router(withdraw_router)
 dp.include_router(clients_router)
 dp.include_router(masters_router)
+
+# === DIAG STARTUP LOG ===
+try:
+    info = build_info()
+    logging.getLogger("diag").warning(
+        "BOOT: git=%s dirty=%s aiogram=%s cwd=%s main=%s py=%s venv=%s time=%s routers=%s",
+        info.get("git"), info.get("dirty"), info.get("aiogram"),
+        info.get("cwd"), info.get("main_file"),
+        info.get("python"), info.get("venv"), info.get("time"),
+        [r.name for r in dp.sub_routers]
+    )
+except Exception as e:
+    logging.getLogger("diag").warning("BOOT DIAG FAILED: %r", e)
 
 # ==== Payment constants (canonical labels) ====
 PAYMENT_METHODS = ["Карта Женя", "Карта Дима", "Наличные", "р/с"]
@@ -464,6 +478,41 @@ async def tx_last_menu(msg: Message, state: FSMContext):
 @dp.message(Command("admin_panel"))
 async def admin_panel_alias(msg: Message, state: FSMContext):
     await admin_menu_start(msg, state)
+
+
+@dp.message(Command("version"))
+async def cmd_version(msg: Message, state: FSMContext):
+    info = build_info()
+    text = (
+        "🧩 Версия бота\n"
+        f"- git: {info.get('git') or 'n/a'}{' (dirty)' if info.get('dirty') else ''}\n"
+        f"- aiogram: {info.get('aiogram')}\n"
+        f"- cwd: {info.get('cwd')}\n"
+        f"- main: {info.get('main_file')}\n"
+        f"- py: {info.get('python')}\n"
+        f"- venv: {info.get('venv')}\n"
+        f"- time: {info.get('time')}\n"
+        f"- routers: {', '.join([r.name for r in dp.sub_routers])}"
+    )
+    await msg.answer(text)
+
+
+@dp.message(Command("where"))
+async def cmd_where(msg: Message, state: FSMContext):
+    import os, sys
+
+    await msg.answer(
+        "📍 Где я запущен?\n"
+        f"- __file__: {__file__}\n"
+        f"- cwd: {os.getcwd()}\n"
+        f"- sys.path[0]: {sys.path[0]}"
+    )
+
+
+@dp.message(Command("state"))
+async def cmd_state(msg: Message, state: FSMContext):
+    cur = await state.get_state()
+    await msg.answer(f"🧭 FSM: {cur or 'None'}")
 
 
 # === Explicit forwards for Admin menu buttons to avoid fallback catching ===
