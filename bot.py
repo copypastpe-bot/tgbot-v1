@@ -22,10 +22,6 @@ class AdminMenuFSM(StatesGroup):
     clients = State()
 
 
-class AdminMastersFSM(StatesGroup):
-    remove_wait_phone = State()
-
-
 class IncomeFSM(StatesGroup):
     waiting_method = State()
     waiting_amount = State()
@@ -37,12 +33,6 @@ class ExpenseFSM(StatesGroup):
     waiting_comment = State()
 
 
-class AddMasterFSM(StatesGroup):
-    waiting_first_name = State()
-    waiting_last_name  = State()
-    waiting_phone      = State()
-
-
 class ReportsFSM(StatesGroup):
     waiting_root        = State()
     waiting_pick_master = State()
@@ -52,6 +42,7 @@ from dotenv import load_dotenv
 import asyncpg
 from handlers.withdraw import router as withdraw_router
 from handlers.clients import router as clients_router
+from handlers.masters import router as masters_router
 from services.db import _record_income, _record_expense
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
@@ -87,6 +78,7 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 dp.include_router(withdraw_router)
 dp.include_router(clients_router)
+dp.include_router(masters_router)
 pool: asyncpg.Pool | None = None
 
 # ===== RBAC helpers (DB-driven) =====
@@ -282,15 +274,6 @@ async def show_admin_menu(msg: Message, state: FSMContext, text: str = "Меню
     await msg.answer(text, reply_markup=admin_root_kb())
 
 
-def admin_masters_kb() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text="Добавить мастера"), KeyboardButton(text="Список мастеров")],
-        [KeyboardButton(text="Деактивировать мастера")],
-        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
-    ]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
-
-
 def tx_last_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="/tx_last 10"), KeyboardButton(text="/tx_last 30"), KeyboardButton(text="/tx_last 50")],
@@ -433,94 +416,6 @@ async def set_commands():
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
-# ===== Admin commands (must be defined after dp is created) =====
-@dp.message(Command("list_masters"))
-async def list_masters(msg: Message):
-    if not await has_permission(msg.from_user.id, "add_master"):
-        return await msg.answer("Только для администраторов.")
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT s.id, s.tg_user_id, s.role, s.is_active, COALESCE(s.first_name,'') AS fn, COALESCE(s.last_name,'') AS ln "
-            "FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id"
-        )
-    if not rows:
-        return await msg.answer("Список пуст.")
-    lines = [f"#{r['id']} {r['role']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} {'✅' if r['is_active'] else '⛔️'}" for r in rows]
-    await msg.answer("Мастера/админы:\n" + "\n".join(lines))
-
-@dp.message(Command("add_master"))
-async def add_master(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "add_master"):
-        return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await msg.answer("Формат: /add_master <tg_user_id>")
-    try:
-        target_id = int(parts[1].lstrip("@"))
-    except Exception:
-        return await msg.answer("Нужно указать числовой tg_user_id.")
-    await state.clear()
-    await state.update_data(tg_id=target_id)
-    await state.set_state(AddMasterFSM.waiting_first_name)
-    await msg.answer("Имя мастера:")
-
-
-@dp.message(AddMasterFSM.waiting_first_name)
-async def add_master_first(msg: Message, state: FSMContext):
-    first = (msg.text or "").strip()
-    if len(first) < 2:
-        return await msg.answer("Имя слишком короткое. Введите корректное имя (>= 2 символов).")
-    await state.update_data(first_name=first)
-    await state.set_state(AddMasterFSM.waiting_last_name)
-    await msg.answer("Фамилия мастера:")
-
-
-@dp.message(AddMasterFSM.waiting_last_name)
-async def add_master_last(msg: Message, state: FSMContext):
-    last = (msg.text or "").strip()
-    if len(last) < 2:
-        return await msg.answer("Фамилия слишком короткая. Введите корректную фамилию (>= 2 символов).")
-    await state.update_data(last_name=last)
-    await state.set_state(AddMasterFSM.waiting_phone)
-    await msg.answer("Телефон мастера (формат: +7XXXXXXXXXX или 8/9...):")
-
-
-@dp.message(AddMasterFSM.waiting_phone)
-async def add_master_phone(msg: Message, state: FSMContext):
-    phone_norm = normalize_phone_for_db(msg.text)
-    if not phone_norm or not phone_norm.startswith("+7"):
-        return await msg.answer("Не распознал телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
-    data = await state.get_data()
-    if len((data.get("first_name") or "").strip()) < 2 or len((data.get("last_name") or "").strip()) < 2:
-        return await msg.answer("Имя/фамилия заданы некорректно. Перезапустите /add_master.")
-    tg_id = int(data["tg_id"])
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO staff(tg_user_id, role, is_active, first_name, last_name, phone) "
-            "VALUES ($1,'master',true,$2,$3,$4) "
-            "ON CONFLICT (tg_user_id) DO UPDATE SET role='master', is_active=true, first_name=$2, last_name=$3, phone=$4",
-            tg_id, data.get("first_name"), data.get("last_name"), phone_norm
-        )
-    await msg.answer(f"✅ Мастер добавлен: {data.get('first_name','')} {data.get('last_name','')}, tg={tg_id}")
-    await state.clear()
-
-
-@dp.message(Command("remove_master"))
-async def remove_master(msg: Message):
-    if not await has_permission(msg.from_user.id, "add_master"):
-        return await msg.answer("Только для администраторов.")
-    parts = msg.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await msg.answer("Формат: /remove_master <tg_user_id>")
-    try:
-        target_id = int(parts[1].lstrip("@"))
-    except Exception:
-        return await msg.answer("Нужно указать числовой tg_user_id.")
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE staff SET is_active=false WHERE tg_user_id=$1 AND role='master'", target_id)
-    await msg.answer(f"Пользователь {target_id} деактивирован как мастер.")
-
-
 @dp.message(Command("admin_menu"))
 async def admin_menu_start(msg: Message, state: FSMContext):
     # пускаем и супер-админа, и обычного админа (где есть право отчётов по заказам)
@@ -535,86 +430,6 @@ async def tx_last_menu(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_cash_reports"):
         return await msg.answer("Только для администраторов.")
     await msg.answer("Выберите, сколько показать:", reply_markup=tx_last_kb())
-
-
-@dp.message(AdminMenuFSM.root, F.text == "Мастера")
-async def admin_masters_root(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "add_master"):
-        return await msg.answer("Только для администраторов.")
-    await state.set_state(AdminMenuFSM.masters)
-    await msg.answer("Мастера: выбери действие.", reply_markup=admin_masters_kb())
-
-
-@dp.message(AdminMenuFSM.masters, F.text == "Назад")
-async def admin_masters_back(msg: Message, state: FSMContext):
-    await show_admin_menu(msg, state)
-
-
-@dp.message(AdminMenuFSM.masters, F.text == "Отмена")
-async def admin_masters_cancel(msg: Message, state: FSMContext):
-    await show_admin_menu(msg, state)
-
-
-@dp.message(AdminMenuFSM.masters, F.text == "Список мастеров")
-async def admin_masters_list(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "add_master"):
-        return await msg.answer("Только для администраторов.")
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT s.id, s.tg_user_id, s.role, s.is_active, COALESCE(s.first_name,'') AS fn, COALESCE(s.last_name,'') AS ln "
-            "FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id"
-        )
-    if not rows:
-        await msg.answer("Список пуст.")
-    else:
-        lines = [
-            f"#{r['id']} {r['role']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} {'✅' if r['is_active'] else '⛔️'}"
-            for r in rows
-        ]
-        await msg.answer("Мастера/админы:\n" + "\n".join(lines))
-    await show_admin_menu(msg, state)
-
-
-@dp.message(AdminMenuFSM.masters, F.text == "Добавить мастера")
-async def admin_masters_add(msg: Message, state: FSMContext):
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer(
-        "Введите команду /add_master <tg_user_id> для начала. (Скоро сделаем диалог целиком по кнопкам)",
-        reply_markup=admin_root_kb(),
-    )
-
-
-@dp.message(AdminMenuFSM.masters, F.text == "Деактивировать мастера")
-async def admin_masters_remove_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "add_master"):
-        return await msg.answer("Только для администраторов.")
-    await state.set_state(AdminMastersFSM.remove_wait_phone)
-    await msg.answer("Введите телефон мастера (8/+7/9...):")
-
-
-@dp.message(AdminMastersFSM.remove_wait_phone)
-async def admin_masters_remove_phone(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "add_master"):
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        return await msg.answer("Только для администраторов.", reply_markup=admin_root_kb())
-    phone = normalize_phone_for_db(msg.text)
-    if not phone or not phone.startswith("+7"):
-        return await msg.answer("Неверный телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
-    async with pool.acquire() as conn:
-        rec = await conn.fetchrow(
-            "SELECT id FROM staff WHERE phone=$1 AND role='master' LIMIT 1",
-            phone,
-        )
-        if not rec:
-            await state.clear()
-            await state.set_state(AdminMenuFSM.root)
-            return await msg.answer("Мастер не найден по этому телефону.", reply_markup=admin_root_kb())
-        await conn.execute("UPDATE staff SET is_active=false WHERE id=$1", rec["id"])
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Мастер деактивирован.", reply_markup=admin_root_kb())
 
 
 @dp.message(Command("admin_panel"))
