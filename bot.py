@@ -371,7 +371,7 @@ def format_money(amount: Decimal) -> str:
 async def build_masters_kb(conn) -> tuple[ReplyKeyboardMarkup | None, dict[str, dict]]:
     """
     Построить reply-клавиатуру выбора мастера:
-    - до 2 кнопок в ряд для мастеров
+    - по одной кнопке в ряд для мастеров
     - нижний ряд: Назад / Отмена
     Возвращает (клавиатура, mapping кнопка->данные мастера).
     """
@@ -382,7 +382,6 @@ async def build_masters_kb(conn) -> tuple[ReplyKeyboardMarkup | None, dict[str, 
 
     options: dict[str, dict] = {}
     rows: list[list[KeyboardButton]] = []
-    current_row: list[KeyboardButton] = []
     for r in masters:
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, r['id'])
         available = cash_on_orders - withdrawn_total
@@ -400,12 +399,7 @@ async def build_masters_kb(conn) -> tuple[ReplyKeyboardMarkup | None, dict[str, 
             "name": display_name,
             "available": str(available),
         }
-        current_row.append(KeyboardButton(text=label))
-        if len(current_row) == 2:
-            rows.append(current_row)
-            current_row = []
-    if current_row:
-        rows.append(current_row)
+        rows.append([KeyboardButton(text=label)])
 
     if not rows:
         return None, {}
@@ -702,6 +696,7 @@ async def admin_withdraw_entry(msg: Message, state: FSMContext):
         withdraw_master_name=None,
         withdraw_amount=None,
         withdraw_available=None,
+        withdraw_remaining=None,
     )
     await state.set_state(WithdrawFSM.waiting_master)
     return await msg.answer(
@@ -910,6 +905,7 @@ async def withdraw_amount_back(msg: Message, state: FSMContext):
         withdraw_master_id=None,
         withdraw_master_name=None,
         withdraw_available=None,
+        withdraw_remaining=None,
         withdraw_choices=options,
     )
     await state.set_state(WithdrawFSM.waiting_master)
@@ -1094,19 +1090,31 @@ async def withdraw_master_pick(msg: Message, state: FSMContext):
     )
 
 
-@dp.message(WithdrawFSM.waiting_confirm, F.text.lower() == "отмена")
-async def withdraw_confirm_cancel(msg: Message, state: FSMContext):
-    logging.info(f"[withdraw] step=confirm_cancel user={msg.from_user.id} text={msg.text}")
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Операция отменена.")
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
-
-
-@dp.message(WithdrawFSM.waiting_confirm, F.text.lower() == "подтвердить")
-async def withdraw_confirm_commit(msg: Message, state: FSMContext):
-    logging.info(f"[withdraw] step=confirm_commit user={msg.from_user.id} text={msg.text}")
+@dp.message(WithdrawFSM.waiting_confirm)
+async def withdraw_confirm(msg: Message, state: FSMContext):
+    text_raw = (msg.text or "").strip().lower()
+    logging.info(f"[withdraw] step=confirm user={msg.from_user.id} text={msg.text}")
     data = await state.get_data()
+    if text_raw == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await msg.answer("Операция отменена.")
+        await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+        return
+
+    if text_raw != "подтвердить":
+        amount = Decimal(data.get("withdraw_amount", "0") or "0")
+        remaining = Decimal(data.get("withdraw_remaining", "0") or "0")
+        master_name = data.get("withdraw_master_name") or "Мастер"
+        summary = (
+            f"Мастер: {master_name}\n"
+            f"Сумма изъятия: {format_money(amount)}₽\n"
+            f"Останется на руках: {format_money(remaining)}₽\n"
+            "Нажмите «Подтвердить» или «Отмена»."
+        )
+        await msg.answer(summary, reply_markup=withdraw_confirm_kb())
+        return
+
     try:
         amount = Decimal(data.get("withdraw_amount", "0") or "0").quantize(Decimal("0.1"))
         master_id = int(data.get("withdraw_master_id"))
@@ -1163,21 +1171,6 @@ async def withdraw_confirm_commit(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
     await msg.answer(text, reply_markup=admin_root_kb())
-
-
-@dp.message(WithdrawFSM.waiting_confirm)
-async def withdraw_confirm_prompt(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    amount = Decimal(data.get("withdraw_amount", "0") or "0")
-    remaining = Decimal(data.get("withdraw_remaining", "0") or "0")
-    master_name = data.get("withdraw_master_name") or "Мастер"
-    summary = (
-        f"Мастер: {master_name}\n"
-        f"Сумма изъятия: {format_money(amount)}₽\n"
-        f"Останется на руках: {format_money(remaining)}₽\n"
-        "Нажмите «Подтвердить» или «Отмена»."
-    )
-    await msg.answer(summary, reply_markup=withdraw_confirm_kb())
 
 
 @dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Назад")
