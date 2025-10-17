@@ -5,16 +5,20 @@ from datetime import date, datetime, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
+    CallbackQuery,
     BotCommand,
     BotCommandScopeDefault,
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
     ContentType,
 )
 from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ===== FSM State Groups =====
 class AdminMenuFSM(StatesGroup):
@@ -46,8 +50,9 @@ class ExpenseFSM(StatesGroup):
 
 
 class WithdrawFSM(StatesGroup):
-    waiting_master  = State()
     waiting_amount  = State()
+    waiting_master  = State()
+    waiting_comment = State()
     waiting_confirm = State()
 
 
@@ -368,20 +373,19 @@ def format_money(amount: Decimal) -> str:
     return f"{int_formatted},{frac_part}"
 
 
-async def build_masters_kb(conn) -> tuple[ReplyKeyboardMarkup | None, dict[str, dict]]:
+async def build_masters_kb(conn) -> InlineKeyboardMarkup | None:
     """
-    Построить reply-клавиатуру выбора мастера:
+    Построить inline-клавиатуру выбора мастера:
     - по одной кнопке в ряд для мастеров
     - нижний ряд: Назад / Отмена
-    Возвращает (клавиатура, mapping кнопка->данные мастера).
     """
     masters = await conn.fetch(
         "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
         "FROM staff WHERE role='master' AND is_active=true ORDER BY fn, ln, id"
     )
 
-    options: dict[str, dict] = {}
-    rows: list[list[KeyboardButton]] = []
+    builder = InlineKeyboardBuilder()
+    has_master = False
     for r in masters:
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, r['id'])
         available = cash_on_orders - withdrawn_total
@@ -394,19 +398,21 @@ async def build_masters_kb(conn) -> tuple[ReplyKeyboardMarkup | None, dict[str, 
         label = f"{label_base} #{r['id']} {amount_str}₽"
         if len(label) > 62:
             label = label[:59] + "…"
-        options[label] = {
-            "id": r["id"],
-            "name": display_name,
-            "available": str(available),
-        }
-        rows.append([KeyboardButton(text=label)])
+        builder.button(
+            text=label,
+            callback_data=f"withdraw_master:{r['id']}",
+        )
+        has_master = True
 
-    if not rows:
-        return None, {}
+    if not has_master:
+        return None
 
-    rows.append([KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")])
-    kb = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-    return kb, options
+    builder.adjust(1)
+    builder.row(
+        InlineKeyboardButton(text="Назад", callback_data="withdraw_nav:back"),
+        InlineKeyboardButton(text="Отмена", callback_data="withdraw_nav:cancel"),
+    )
+    return builder.as_markup()
 
 
 def withdraw_nav_kb() -> ReplyKeyboardMarkup:
@@ -417,11 +423,12 @@ def withdraw_nav_kb() -> ReplyKeyboardMarkup:
     )
 
 
-def withdraw_confirm_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Подтвердить"), KeyboardButton(text="Отмена")]],
-        resize_keyboard=True,
-    )
+def withdraw_confirm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Подтвердить", callback_data="withdraw_confirm:yes")
+    kb.button(text="Отмена", callback_data="withdraw_confirm:cancel")
+    kb.adjust(2)
+    return kb.as_markup()
 
 
 @dp.message(F.text == "Отчёты")
@@ -543,6 +550,20 @@ async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: st
         RETURNING id, happened_at
         """,
         method, amount, comment or "Расход",
+    )
+    return tx
+
+
+async def _record_withdrawal(conn: asyncpg.Connection, master_id: int, amount: Decimal, comment: str = "Изъятие"):
+    tx = await conn.fetchrow(
+        """
+        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+        VALUES ('withdrawal', 'cash', $1, $2, NULL, $3, now())
+        RETURNING id, happened_at
+        """,
+        amount,
+        comment or "Изъятие",
+        master_id,
     )
     return tx
 
@@ -683,22 +704,21 @@ async def admin_withdraw_entry(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "record_cashflows"):
         return await msg.answer("Только для администраторов.")
     async with pool.acquire() as conn:
-        kb, options = await build_masters_kb(conn)
-    if not options or kb is None:
+        kb = await build_masters_kb(conn)
+    if kb is None:
         await state.set_state(AdminMenuFSM.root)
         return await msg.answer(
             "Нет активных мастеров с наличными для изъятия.",
             reply_markup=admin_root_kb(),
         )
+    await state.set_state(WithdrawFSM.waiting_master)
     await state.update_data(
-        withdraw_choices=options,
         withdraw_master_id=None,
         withdraw_master_name=None,
         withdraw_amount=None,
         withdraw_available=None,
-        withdraw_remaining=None,
+        withdraw_comment="",
     )
-    await state.set_state(WithdrawFSM.waiting_master)
     return await msg.answer(
         "Выберите мастера, у которого нужно изъять наличные:",
         reply_markup=kb,
@@ -894,8 +914,8 @@ def parse_amount_ru(text: str) -> tuple[Decimal | None, dict]:
 async def withdraw_amount_back(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=amount_back user={msg.from_user.id} text={msg.text}")
     async with pool.acquire() as conn:
-        kb, options = await build_masters_kb(conn)
-    if not options or kb is None:
+        kb = await build_masters_kb(conn)
+    if kb is None:
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
         await msg.answer("Нет активных мастеров для изъятия.", reply_markup=admin_root_kb())
@@ -905,8 +925,7 @@ async def withdraw_amount_back(msg: Message, state: FSMContext):
         withdraw_master_id=None,
         withdraw_master_name=None,
         withdraw_available=None,
-        withdraw_remaining=None,
-        withdraw_choices=options,
+        withdraw_comment="",
     )
     await state.set_state(WithdrawFSM.waiting_master)
     await msg.answer(
@@ -941,38 +960,30 @@ async def withdraw_amount_got(msg: Message, state: FSMContext):
         data = await state.get_data()
         master_id = data.get("withdraw_master_id")
         if not master_id:
-            kb, options = await build_masters_kb(conn)
+            kb = await build_masters_kb(conn)
             await state.set_state(WithdrawFSM.waiting_master)
-            if not options or kb is None:
+            if kb is None:
                 await state.clear()
                 await state.set_state(AdminMenuFSM.root)
                 return await msg.answer("Нет активных мастеров для изъятия.", reply_markup=admin_root_kb())
-            await state.update_data(withdraw_choices=options)
-            return await msg.answer(
-                "Сначала выберите мастера для изъятия.",
-                reply_markup=kb,
-            )
+            return await msg.answer("Сначала выберите мастера для изъятия.", reply_markup=kb)
         master_id = int(master_id)
         master_row = await conn.fetchrow(
             "SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
             master_id,
         )
-        display_name = (data.get("withdraw_master_name") or "").strip()
         if not master_row:
-            kb, options = await build_masters_kb(conn)
+            kb = await build_masters_kb(conn)
             await state.update_data(
                 withdraw_master_id=None,
                 withdraw_master_name=None,
-                withdraw_choices=options,
             )
             await state.set_state(WithdrawFSM.waiting_master)
-            if not options or kb is None:
+            if kb is None:
                 await state.clear()
                 await state.set_state(AdminMenuFSM.root)
                 return await msg.answer("Мастер не найден. Попробуйте снова из меню.", reply_markup=admin_root_kb())
             return await msg.answer("Мастер не найден. Выберите другого мастера.", reply_markup=kb)
-        if not display_name:
-            display_name = f"{(master_row['fn'] or '').strip()} {(master_row['ln'] or '').strip()}".strip() or f"Мастер {master_id}"
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
         available = cash_on_orders - withdrawn_total
         if available < Decimal(0):
@@ -983,25 +994,23 @@ async def withdraw_amount_got(msg: Message, state: FSMContext):
             reply_markup=withdraw_nav_kb(),
         )
 
-    remaining = available - amount
-    if remaining < Decimal(0):
-        remaining = Decimal(0)
-
     await state.update_data(
         withdraw_amount=str(amount),
         withdraw_available=str(available),
-        withdraw_remaining=str(remaining),
-        withdraw_master_name=display_name,
+        withdraw_comment="",
     )
-    await state.set_state(WithdrawFSM.waiting_confirm)
     amount_str = format_money(amount)
-    remaining_str = format_money(remaining)
-    summary = (
-        f"Мастер: {display_name}\n"
-        f"Сумма изъятия: {amount_str}₽\n"
-        f"Останется на руках: {remaining_str}₽"
+    left_after = format_money(available - amount)
+
+    await state.set_state(WithdrawFSM.waiting_confirm)
+    return await msg.answer(
+        "\n".join([
+            f"Мастер: {(master_row['fn'] or '').strip()} {(master_row['ln'] or '').strip()}".strip() or f'ID {master_id}',
+            f"Сумма изъятия: {amount_str}₽",
+            f"Осталось на руках: {left_after}₽",
+        ]),
+        reply_markup=withdraw_confirm_kb(),
     )
-    return await msg.answer(summary, reply_markup=withdraw_confirm_kb())
 
 
 @dp.message(WithdrawFSM.waiting_master, F.text.lower() == "назад")
@@ -1022,155 +1031,172 @@ async def withdraw_master_cancel(msg: Message, state: FSMContext):
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
-@dp.message(WithdrawFSM.waiting_master, F.text)
-async def withdraw_master_pick(msg: Message, state: FSMContext):
-    logging.info(f"[withdraw] step=master_pick user={msg.from_user.id} text={msg.text}")
-    text = (msg.text or "").strip()
-    data = await state.get_data()
-    choices: dict[str, dict] = data.get("withdraw_choices") or {}
-    option = choices.get(text)
-    if not option:
-        async with pool.acquire() as conn:
-            kb, options = await build_masters_kb(conn)
-        if not options or kb is None:
-            await state.clear()
-            await state.set_state(AdminMenuFSM.root)
-            return await msg.answer("Нет активных мастеров для изъятия.", reply_markup=admin_root_kb())
-        await state.update_data(withdraw_choices=options)
-        return await msg.answer("Пожалуйста, выберите мастера кнопкой ниже.", reply_markup=kb)
+@dp.callback_query(WithdrawFSM.waiting_master)
+async def withdraw_master_callback(query: CallbackQuery, state: FSMContext):
+    logging.info(f"[withdraw] step=master_callback user={query.from_user.id} data={query.data}")
+    payload = (query.data or "").strip()
 
-    master_id = int(option["id"])
+    if payload == "withdraw_nav:back":
+        await query.answer()
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
+        return
+
+    if payload == "withdraw_nav:cancel":
+        await query.answer()
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Операция отменена.")
+        await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
+        return
+
+    if not payload.startswith("withdraw_master:"):
+        await query.answer("Неизвестное действие", show_alert=True)
+        return
+
+    try:
+        master_id = int(payload.split(":", 1)[1])
+    except Exception:
+        await query.answer("Некорректные данные", show_alert=True)
+        return
+
     async with pool.acquire() as conn:
         master_row = await conn.fetchrow(
             """
-            SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln, is_active
+            SELECT COALESCE(first_name,'') AS fn,
+                   COALESCE(last_name,'')  AS ln,
+                   is_active
             FROM staff
             WHERE id=$1
             """,
             master_id,
         )
         if not master_row or not master_row["is_active"]:
-            kb, options = await build_masters_kb(conn)
-            await state.update_data(withdraw_choices=options)
-            if not options or kb is None:
+            kb = await build_masters_kb(conn)
+            if kb is None:
+                await query.answer("Мастер недоступен", show_alert=True)
                 await state.clear()
                 await state.set_state(AdminMenuFSM.root)
-                return await msg.answer("Мастер недоступен. Возвращаю в меню.", reply_markup=admin_root_kb())
-            return await msg.answer("Мастер недоступен. Выберите другого.", reply_markup=kb)
+                await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
+                return
+            await query.answer()
+            await query.message.answer("Мастер недоступен. Выберите другого мастера.", reply_markup=kb)
+            return
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
 
     available = cash_on_orders - withdrawn_total
     if available < Decimal(0):
         available = Decimal(0)
 
-    display_name = (option.get("name") or "").strip()
-    if not display_name:
-        display_name = f"{(master_row['fn'] or '').strip()} {(master_row['ln'] or '').strip()}".strip() or f"Мастер {master_id}"
-
-    if available <= Decimal(0):
-        async with pool.acquire() as conn:
-            kb, options = await build_masters_kb(conn)
-        await state.update_data(withdraw_choices=options)
-        await msg.answer(
-            f"У мастера {display_name} нет наличных для изъятия. Выберите другого мастера.",
-            reply_markup=kb,
-        )
+    if available <= 0:
+        await query.answer("У мастера нет наличных для изъятия", show_alert=True)
         return
+
+    display_name = f"{(master_row['fn'] or '').strip()} {(master_row['ln'] or '').strip()}".strip() or f"Мастер {master_id}"
 
     await state.update_data(
         withdraw_master_id=master_id,
         withdraw_master_name=display_name,
         withdraw_available=str(available),
+        withdraw_amount=None,
+        withdraw_comment="",
     )
     await state.set_state(WithdrawFSM.waiting_amount)
     available_str = format_money(available)
-    await msg.answer(
+    await query.answer()
+    await query.message.answer(
         f"{display_name}: на руках {available_str}₽.\nВведите сумму изъятия:",
         reply_markup=withdraw_nav_kb(),
     )
 
 
-@dp.message(WithdrawFSM.waiting_confirm)
-async def withdraw_confirm(msg: Message, state: FSMContext):
-    text_raw = (msg.text or "").strip().lower()
-    logging.info(f"[withdraw] step=confirm user={msg.from_user.id} text={msg.text}")
-    data = await state.get_data()
-    if text_raw == "отмена":
+@dp.message(WithdrawFSM.waiting_master)
+async def withdraw_master_prompt(msg: Message, state: FSMContext):
+    logging.info(f"[withdraw] step=master_text user={msg.from_user.id} text={msg.text}")
+    async with pool.acquire() as conn:
+        kb = await build_masters_kb(conn)
+    if kb is None:
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
-        await msg.answer("Операция отменена.")
-        await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+        return await msg.answer("Нет активных мастеров для изъятия.", reply_markup=admin_root_kb())
+    return await msg.answer("Пожалуйста, выберите мастера кнопкой ниже.", reply_markup=kb)
+
+
+@dp.callback_query(WithdrawFSM.waiting_confirm)
+async def withdraw_confirm_handler(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+
+    if data == "withdraw_confirm:cancel":
+        await query.answer()
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Операция отменена.")
+        await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
         return
 
-    if text_raw != "подтвердить":
-        amount = Decimal(data.get("withdraw_amount", "0") or "0")
-        remaining = Decimal(data.get("withdraw_remaining", "0") or "0")
-        master_name = data.get("withdraw_master_name") or "Мастер"
-        summary = (
-            f"Мастер: {master_name}\n"
-            f"Сумма изъятия: {format_money(amount)}₽\n"
-            f"Останется на руках: {format_money(remaining)}₽\n"
-            "Нажмите «Подтвердить» или «Отмена»."
-        )
-        await msg.answer(summary, reply_markup=withdraw_confirm_kb())
+    if data != "withdraw_confirm:yes":
+        await query.answer("Неизвестное действие", show_alert=True)
         return
 
+    await query.answer()
+
+    s = await state.get_data()
     try:
-        amount = Decimal(data.get("withdraw_amount", "0") or "0").quantize(Decimal("0.1"))
-        master_id = int(data.get("withdraw_master_id"))
+        master_id = int(s.get("withdraw_master_id"))
+        amount = Decimal(str(s.get("withdraw_amount") or "0"))
     except Exception:
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
-        return await msg.answer("Сессия изъятия потеряна. Попробуйте снова.", reply_markup=admin_root_kb())
+        await query.message.answer("Сессия изъятия потеряна. Попробуйте снова.", reply_markup=admin_root_kb())
+        return
 
-    master_name = (data.get("withdraw_master_name") or "").strip()
-    if not master_name:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
-                master_id,
-            )
-        master_name = f"{(row['fn'] or '').strip()} {(row['ln'] or '').strip()}".strip() or f"ID {master_id}"
+    comment = (s.get("withdraw_comment") or "").strip() or "Без комментария"
 
     async with pool.acquire() as conn:
-        tx = await conn.fetchrow(
-            """
-            INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, created_by, happened_at)
-            VALUES ('withdrawal', 'cash', $1, '—', NULL, $2, $3, now())
-            RETURNING id, happened_at
-            """,
-            amount,
-            master_id,
-            msg.from_user.id,
-        )
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
+        current_available = cash_on_orders - withdrawn_total
+        if current_available < Decimal(0):
+            current_available = Decimal(0)
 
-    remaining = cash_on_orders - withdrawn_total
-    if remaining < Decimal(0):
-        remaining = Decimal(0)
+        if amount > current_available:
+            await state.set_state(WithdrawFSM.waiting_amount)
+            await query.message.answer(
+                f"Сейчас у мастера доступно только {format_money(current_available)}₽. Введите сумму снова:",
+                reply_markup=withdraw_nav_kb(),
+            )
+            return
 
+        tx = await _record_withdrawal(conn, master_id, amount, comment)
+
+        master_row = await conn.fetchrow(
+            "SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
+            master_id,
+        )
+        display_name = f"{(master_row['fn'] or '').strip()} {(master_row['ln'] or '').strip()}".strip() or f"ID {master_id}"
+
+        new_cash_on_orders, new_withdrawn_total = await get_master_wallet(conn, master_id)
+        new_available = new_cash_on_orders - new_withdrawn_total
+        if new_available < Decimal(0):
+            new_available = Decimal(0)
+
+    dt = datetime.now().strftime("%d.%m.%Y %H:%M")
+    tx_id = tx["id"]
     amount_str = format_money(amount)
-    remaining_str = format_money(remaining)
-    happened_at = tx["happened_at"]
-    if isinstance(happened_at, datetime):
-        try:
-            happened_text = happened_at.astimezone().strftime("%d.%m.%Y %H:%M")
-        except Exception:
-            happened_text = happened_at.strftime("%d.%m.%Y %H:%M")
-    else:
-        happened_text = str(happened_at)
-
-    text = (
-        f"Изъятие №{tx['id']}\n"
-        f"{happened_text}\n"
-        f"Мастер: {master_name}\n"
-        f"Изъято: {amount_str}₽\n"
-        f"Осталось на руках: {remaining_str}₽"
-    )
+    left_str = format_money(new_available)
+    text = "\n".join([
+        f"Изъятие №{tx_id}",
+        dt,
+        f"Мастер: {display_name}",
+        f"Изъято: {amount_str}₽",
+        f"Осталось на руках: {left_str}₽",
+    ])
 
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
-    await msg.answer(text, reply_markup=admin_root_kb())
+    await query.message.answer(text)
+    await query.message.answer("Готово")
+    await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
 @dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Назад")
