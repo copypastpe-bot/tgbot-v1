@@ -373,6 +373,15 @@ def format_money(amount: Decimal) -> str:
     return f"{int_formatted},{frac_part}"
 
 
+def _withdrawal_filter_sql(alias: str = "e") -> str:
+    """SQL-предикат для строк-изъятий из наличных мастера (не расходы компании)."""
+    return (
+        f"({alias}.kind='expense' AND {alias}.method='Наличные' "
+        f"AND {alias}.order_id IS NULL AND {alias}.master_id IS NOT NULL "
+        f"AND ({alias}.comment ILIKE '[WDR]%' OR {alias}.comment ILIKE 'изъят%'))"
+    )
+
+
 async def build_masters_kb(conn) -> InlineKeyboardMarkup | None:
     """
     Построить inline-клавиатуру выбора мастера:
@@ -555,13 +564,17 @@ async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: st
 
 
 async def _record_withdrawal(conn: asyncpg.Connection, master_id: int, amount: Decimal, comment: str = "Изъятие"):
+    # Изъятие — внутреннее перемещение: уменьшает наличные у мастера, но не влияет на прибыль.
+    # Храним в общей таблице cashbook_entries, помечаем [WDR], чтобы исключить из P&L-отчётов.
     tx = await conn.fetchrow(
         """
         INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
         VALUES ('expense', 'Наличные', $1, $2, NULL, $3, now())
         RETURNING id, happened_at
         """,
-        amount, comment or "Изъятие", master_id
+        amount,
+        ("[WDR] " + (comment or "Изъятие")).strip(),
+        master_id,
     )
     return tx
 
@@ -866,6 +879,7 @@ async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
         FROM cashbook_entries
         WHERE kind='expense' AND method='Наличные'
           AND master_id=$1 AND order_id IS NULL
+          AND (comment ILIKE '[WDR]%' OR comment ILIKE 'изъят%')
         """,
         master_id,
     )
@@ -1592,6 +1606,7 @@ async def get_cash_report_text(period: str) -> str:
       period in {"day","month","year"} or specific "YYYY-MM" / "YYYY-MM-DD".
     For 'year' the details are aggregated by months, not by days.
     """
+    # Исключаем изъятия из расходов компании, так как это внутреннее движение (наличные мастеров → касса)
     import re
     def trunc(unit: str) -> str:
         # compute bounds on DB side
@@ -1747,11 +1762,14 @@ async def get_profit_report_text(period: str) -> str:
             WHERE o.created_at >= {start_sql} AND o.created_at < {end_sql}
             """
         )
+        # Исключаем изъятия из расходов компании, так как это внутреннее движение (наличные мастеров → касса)
         exp = await conn.fetchval(
             f"""
             SELECT COALESCE(SUM(c.amount), 0)::numeric(12,2)
             FROM cashbook_entries c
-            WHERE c.kind='expense' AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+            WHERE c.kind='expense'
+              AND NOT ({_withdrawal_filter_sql("c")})
+              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
             """
         )
         rows = await conn.fetch(
@@ -1766,7 +1784,9 @@ async def get_profit_report_text(period: str) -> str:
             e AS (
               SELECT date_trunc('day', c.happened_at) AS day, SUM(c.amount) AS expense
               FROM cashbook_entries c
-              WHERE c.kind='expense' AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+              WHERE c.kind='expense'
+                AND NOT ({_withdrawal_filter_sql("c")})
+                AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
               GROUP BY 1
             ),
             d AS (
