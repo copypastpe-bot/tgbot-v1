@@ -3237,13 +3237,8 @@ async def find_cmd(msg: Message):
     # проверяем формат номера
     if not is_valid_phone_format(user_input):
         return await msg.answer("Формат: /find +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX")
-    phone_in = normalize_phone_for_db(user_input)  # нормализуем, если формат корректный
     async with pool.acquire() as conn:
-        rec = await conn.fetchrow(
-            "SELECT full_name, phone, bonus_balance, birthday, status "
-            "FROM clients WHERE regexp_replace(phone,'[^0-9]+','','g')=regexp_replace($1,'[^0-9]+','','g')",
-            phone_in
-        )
+        rec = await _find_client_by_phone(conn, user_input)
     if not rec:
         return await msg.answer("Не найдено.")
     bd = rec["birthday"].isoformat() if rec["birthday"] else "—"
@@ -3257,7 +3252,8 @@ async def find_cmd(msg: Message):
     )
     if status == 'lead':
         text += "\n\nЭто лид. Нажмите «🧾 Заказ», чтобы оформить первый заказ и обновить имя."
-    await msg.answer(text, reply_markup=main_kb)
+    kb = master_kb if await ensure_master(msg.from_user.id) else main_kb
+    await msg.answer(text, reply_markup=kb)
 
 # ===== FSM: Я ВЫПОЛНИЛ ЗАКАЗ =====
 class OrderFSM(StatesGroup):
@@ -3298,22 +3294,14 @@ async def got_phone(msg: Message, state: FSMContext):
     user_input = msg.text.strip()
     # если формат неправильный — вернуть сообщение об ошибке и сбросить состояние
     if not is_valid_phone_format(user_input):
-        await state.clear()
         return await msg.answer(
             "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="Отмена")]],
-                resize_keyboard=True
-            )
+            reply_markup=cancel_kb
         )
     # если всё хорошо — нормализуем номер
     phone_in = normalize_phone_for_db(user_input)
     async with pool.acquire() as conn:
-        client = await conn.fetchrow(
-            "SELECT id, full_name, phone, bonus_balance, birthday, status "
-            "FROM clients WHERE regexp_replace(phone,'[^0-9]+','','g')=regexp_replace($1,'[^0-9]+','','g')",
-            phone_in
-        )
+        client = await _find_client_by_phone(conn, user_input)
     data = {"phone_in": phone_in}
     if client:
         data["client_id"] = client["id"]
@@ -3327,7 +3315,7 @@ async def got_phone(msg: Message, state: FSMContext):
             await state.set_state(OrderFSM.name_fix)
             return await msg.answer(
                 "Найден лид/некорректное имя.\n"
-                "Введите правильное имя клиента (или нажмите ‘Отмена’):",
+                "Введите правильное имя клиента (или нажмите «Отмена»):",
                 reply_markup=cancel_kb
             )
 
@@ -3351,7 +3339,7 @@ async def got_phone(msg: Message, state: FSMContext):
 async def fix_name(msg: Message, state: FSMContext):
     new_name = msg.text.strip()
     if not new_name:
-        return await msg.answer("Имя не может быть пустым. Введите имя или нажмите ‘Отмена’.", reply_markup=cancel_kb)
+        return await msg.answer("Имя не может быть пустым. Введите имя или нажмите «Отмена».", reply_markup=cancel_kb)
     if is_bad_name(new_name):
         return await msg.answer("Имя похоже на номер/метку. Введите корректное имя.", reply_markup=cancel_kb)
 
@@ -3677,22 +3665,13 @@ async def master_find_phone(msg: Message, state: FSMContext):
     user_input = msg.text.strip()
     # если формат неправильный — вернуть сообщение об ошибке
     if not is_valid_phone_format(user_input):
-        cancel_kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="Отмена")]],
-            resize_keyboard=True
-        )
         return await msg.answer(
             "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
             reply_markup=cancel_kb
         )
 
-    phone_in = normalize_phone_for_db(user_input)
     async with pool.acquire() as conn:
-        rec = await conn.fetchrow(
-            "SELECT full_name, phone, bonus_balance, birthday, status "
-            "FROM clients WHERE regexp_replace(phone,'[^0-9]+','','g')=regexp_replace($1,'[^0-9]+','','g')",
-            phone_in
-        )
+        rec = await _find_client_by_phone(conn, user_input)
     await state.clear()
     if not rec:
         return await msg.answer("Не найдено.", reply_markup=master_kb)
