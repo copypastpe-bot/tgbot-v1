@@ -1135,68 +1135,70 @@ async def withdraw_confirm_handler(query: CallbackQuery, state: FSMContext):
         await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
         return
 
-    if data != "withdraw_confirm:yes":
-        await query.answer("Неизвестное действие", show_alert=True)
-        return
+    if data == "withdraw_confirm:yes":
+        await query.answer()
 
-    await query.answer()
-
-    s = await state.get_data()
-    try:
-        master_id = int(s.get("withdraw_master_id"))
-        amount = Decimal(str(s.get("withdraw_amount") or "0"))
-    except Exception:
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        await query.message.answer("Сессия изъятия потеряна. Попробуйте снова.", reply_markup=admin_root_kb())
-        return
-
-    comment = (s.get("withdraw_comment") or "").strip() or "Без комментария"
-
-    async with pool.acquire() as conn:
-        cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
-        current_available = cash_on_orders - withdrawn_total
-        if current_available < Decimal(0):
-            current_available = Decimal(0)
-
-        if amount > current_available:
-            await state.set_state(WithdrawFSM.waiting_amount)
-            await query.message.answer(
-                f"Сейчас у мастера доступно только {format_money(current_available)}₽. Введите сумму снова:",
-                reply_markup=withdraw_nav_kb(),
-            )
+        s = await state.get_data()
+        try:
+            master_id = int(s.get("withdraw_master_id"))
+            amount = Decimal(str(s.get("withdraw_amount") or "0"))
+        except Exception:
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            await query.message.answer("Сессия изъятия потеряна. Попробуйте снова.", reply_markup=admin_root_kb())
             return
 
-        tx = await _record_withdrawal(conn, master_id, amount, comment)
+        comment = (s.get("withdraw_comment") or "").strip() or "Без комментария"
 
-        master_row = await conn.fetchrow(
-            "SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
-            master_id,
-        )
-        display_name = f"{(master_row['fn'] or '').strip()} {(master_row['ln'] or '').strip()}".strip() or f"ID {master_id}"
+        async with pool.acquire() as conn:
+            cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
+            current_available = cash_on_orders - withdrawn_total
+            if current_available < Decimal(0):
+                current_available = Decimal(0)
 
-        new_cash_on_orders, new_withdrawn_total = await get_master_wallet(conn, master_id)
-        new_available = new_cash_on_orders - new_withdrawn_total
-        if new_available < Decimal(0):
-            new_available = Decimal(0)
+            if amount > current_available:
+                await state.set_state(WithdrawFSM.waiting_amount)
+                await query.message.answer(
+                    f"Сейчас у мастера доступно только {format_money(current_available)}₽. Введите сумму снова:",
+                    reply_markup=withdraw_nav_kb(),
+                )
+                return
 
-    dt = datetime.now().strftime("%d.%m.%Y %H:%M")
-    tx_id = tx["id"]
-    amount_str = format_money(amount)
-    left_str = format_money(new_available)
-    text = "\n".join([
-        f"Изъятие №{tx_id}",
-        dt,
-        f"Мастер: {display_name}",
-        f"Изъято: {amount_str}₽",
-        f"Осталось на руках: {left_str}₽",
-    ])
+            tx = await _record_withdrawal(conn, master_id, amount, comment)
 
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await query.message.answer(text)
-    await query.message.answer("Готово")
-    await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
+            master_row = await conn.fetchrow(
+                "SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
+                master_id,
+            )
+            display_name = f"{(master_row['fn'] or '').strip()} {(master_row['ln'] or '').strip()}".strip() or f"ID {master_id}"
+
+            new_cash_on_orders, new_withdrawn_total = await get_master_wallet(conn, master_id)
+            new_available = new_cash_on_orders - new_withdrawn_total
+            if new_available < Decimal(0):
+                new_available = Decimal(0)
+
+        dt = datetime.now().strftime("%d.%m.%Y %H:%M")
+        tx_id = tx["id"]
+        amount_str = format_money(amount)
+        left_str = format_money(new_available)
+        text = "\n".join([
+            f"Изъятие №{tx_id}",
+            dt,
+            f"Мастер: {display_name}",
+            f"Изъято: {amount_str}₽",
+            f"Осталось на руках: {left_str}₽",
+        ])
+
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer(text)
+        await query.message.answer("Готово")
+        await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
+        return
+
+    else:
+        await query.answer("Неизвестное действие", show_alert=True)
+        return
 
 
 @dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Назад")
