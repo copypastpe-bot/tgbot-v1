@@ -18,6 +18,7 @@ from aiogram.types import (
 from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ===== FSM State Groups =====
 class AdminMenuFSM(StatesGroup):
@@ -372,37 +373,38 @@ def format_money(amount: Decimal) -> str:
 
 
 async def build_masters_kb(conn) -> InlineKeyboardMarkup:
+    """
+    Построить inline-клавиатуру выбора мастера:
+    - по 2 кнопки в ряд для мастеров
+    - нижний ряд: Назад / Отмена
+    """
     masters = await conn.fetch(
         "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
         "FROM staff WHERE role='master' AND is_active=true ORDER BY fn, ln, id"
     )
 
-    buttons: list[InlineKeyboardButton] = []
+    kb = InlineKeyboardBuilder()
+
     for r in masters:
         cash_on_hand, _withdrawn = await get_master_wallet(conn, r['id'])
         display_name = f"{r['fn']} {r['ln']}".strip() or f"Мастер {r['id']}"
         amount_str = format_money(cash_on_hand)
         label = f"{display_name}({amount_str})"
-        buttons.append(
-            InlineKeyboardButton(
-                text=label,
-                callback_data=f"withdraw_master:{r['id']}",
-            )
+        kb.button(
+            text=label,
+            callback_data=f"withdraw_master:{r['id']}",
         )
 
-    markup = InlineKeyboardMarkup(row_width=2)
-    # store attribute for completeness; InlineKeyboardMarkup ignores resize, but we keep for consistency with requirement
-    setattr(markup, "resize_keyboard", True)
+    # по 2 в ряд
+    kb.adjust(2)
 
-    for i in range(0, len(buttons), 2):
-        markup.row(*buttons[i:i + 2])
-
-    markup.row(
+    # нижний ряд
+    kb.row(
         InlineKeyboardButton(text="Назад", callback_data="withdraw_nav:back"),
         InlineKeyboardButton(text="Отмена", callback_data="withdraw_nav:cancel"),
     )
 
-    return markup
+    return kb.as_markup()
 
 
 def withdraw_nav_kb() -> ReplyKeyboardMarkup:
