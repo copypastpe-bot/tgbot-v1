@@ -558,12 +558,10 @@ async def _record_withdrawal(conn: asyncpg.Connection, master_id: int, amount: D
     tx = await conn.fetchrow(
         """
         INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-        VALUES ('withdrawal', 'cash', $1, $2, NULL, $3, now())
+        VALUES ('expense', 'Наличные', $1, $2, NULL, $3, now())
         RETURNING id, happened_at
         """,
-        amount,
-        comment or "Изъятие",
-        master_id,
+        amount, comment or "Изъятие", master_id
     )
     return tx
 
@@ -866,7 +864,7 @@ async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
         """
         SELECT COALESCE(SUM(amount),0)
         FROM cashbook_entries
-        WHERE kind='withdrawal' AND method='cash'
+        WHERE kind='expense' AND method='Наличные'
           AND master_id=$1 AND order_id IS NULL
         """,
         master_id,
@@ -1149,6 +1147,7 @@ async def withdraw_confirm_handler(query: CallbackQuery, state: FSMContext):
             return
 
         comment = (s.get("withdraw_comment") or "").strip() or "Без комментария"
+        master_name = s.get("withdraw_master_name") or "—"
 
         async with pool.acquire() as conn:
             cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
@@ -1166,34 +1165,29 @@ async def withdraw_confirm_handler(query: CallbackQuery, state: FSMContext):
 
             tx = await _record_withdrawal(conn, master_id, amount, comment)
 
-            master_row = await conn.fetchrow(
-                "SELECT COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
-                master_id,
-            )
-            display_name = f"{(master_row['fn'] or '').strip()} {(master_row['ln'] or '').strip()}".strip() or f"ID {master_id}"
+            cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
 
-            new_cash_on_orders, new_withdrawn_total = await get_master_wallet(conn, master_id)
-            new_available = new_cash_on_orders - new_withdrawn_total
-            if new_available < Decimal(0):
-                new_available = Decimal(0)
+        available_after = cash_on_orders - withdrawn_total
+        if available_after < Decimal(0):
+            available_after = Decimal(0)
 
-        dt = datetime.now().strftime("%d.%m.%Y %H:%M")
         tx_id = tx["id"]
+        dt_str = tx["happened_at"].strftime("%d.%m.%Y %H:%M")
         amount_str = format_money(amount)
-        left_str = format_money(new_available)
-        text = "\n".join([
-            f"Изъятие №{tx_id}",
-            dt,
-            f"Мастер: {display_name}",
-            f"Изъято: {amount_str}₽",
-            f"Осталось на руках: {left_str}₽",
-        ])
+        avail_str = format_money(available_after)
 
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
-        await query.message.answer(text)
-        await query.message.answer("Готово")
-        await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
+        await query.message.answer(
+            "\n".join([
+                f"Изъятие №{tx_id}",
+                dt_str,
+                f"Мастер: {master_name}",
+                f"Изъято: {amount_str}₽",
+                f"Осталось на руках: {avail_str}₽",
+            ]),
+            reply_markup=admin_root_kb(),
+        )
         return
 
     else:
