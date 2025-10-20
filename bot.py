@@ -911,11 +911,39 @@ async def backfill_cash_incomes_from_orders(conn) -> int:
         AND o.master_id IS NOT NULL
         AND e.id IS NULL;
     """
-    res = await conn.execute(sql)
+    res_insert = await conn.execute(sql)
     try:
-        return int((res or "0").split()[-1])
+        inserted = int((res_insert or "0").split()[-1])
     except Exception:
-        return 0
+        inserted = 0
+
+    update_sql = """
+    UPDATE cashbook_entries e
+    SET
+        master_id   = COALESCE(o.master_id, e.master_id),
+        amount      = CASE WHEN o.amount_cash IS NULL THEN e.amount ELSE o.amount_cash END,
+        happened_at = CASE
+            WHEN e.happened_at IS NULL THEN COALESCE(o.finished_at, e.happened_at, now())
+            ELSE e.happened_at
+        END
+    FROM orders o
+    WHERE e.kind='income'
+      AND e.method='Наличные'
+      AND e.order_id = o.id
+      AND o.master_id IS NOT NULL
+      AND (
+            e.master_id IS DISTINCT FROM o.master_id
+         OR (o.amount_cash IS NOT NULL AND e.amount IS DISTINCT FROM o.amount_cash)
+         OR (e.happened_at IS NULL AND (o.finished_at IS NOT NULL))
+      );
+    """
+    res_update = await conn.execute(update_sql)
+    try:
+        updated = int((res_update or "0").split()[-1])
+    except Exception:
+        updated = 0
+
+    return inserted + updated
 
 
 async def ensure_cash_income_for_order(conn, order_id: int) -> tuple[bool, str]:
