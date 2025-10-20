@@ -395,6 +395,10 @@ async def build_masters_kb(conn) -> InlineKeyboardMarkup | None:
 
     builder = InlineKeyboardBuilder()
     has_master = False
+    try:
+        await backfill_cash_incomes_from_orders(conn)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("backfill cash incomes skipped: %s", e)
     for r in masters:
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, r['id'])
         available = cash_on_orders - withdrawn_total
@@ -875,6 +879,45 @@ async def get_master_cash_on_orders(conn, master_id: int) -> Decimal:
     return Decimal(cash_sum or 0)
 
 
+async def backfill_cash_incomes_from_orders(conn) -> int:
+    """
+    Однократно добивает отсутствующие приходы по Наличным из таблицы orders
+    в cashbook_entries. Нужен для консистентности кошелька мастера.
+    Возвращает кол-во добавленных строк.
+    Предполагается, что в orders есть колонки:
+      - id (order_id)
+      - master_id
+      - payment_method (каноника 'Наличные', 'Карта Женя', 'Карта Дима', 'р/с', ... )
+      - amount_cash (сумма, принятая налом)
+      - finished_at (дата заказа, используем как happened_at)
+    """
+    sql = """
+    INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+    SELECT
+        'income'::text      AS kind,
+        'Наличные'::text    AS method,
+        o.amount_cash       AS amount,
+        'Автодобавление: приход по заказу (нал)' AS comment,
+        o.id                AS order_id,
+        o.master_id         AS master_id,
+        COALESCE(o.finished_at, now()) AS happened_at
+    FROM orders o
+    LEFT JOIN cashbook_entries e
+           ON e.order_id = o.id
+          AND e.kind = 'income'
+          AND e.method = 'Наличные'
+    WHERE
+        o.amount_cash > 0
+        AND o.master_id IS NOT NULL
+        AND e.id IS NULL;
+    """
+    res = await conn.execute(sql)
+    try:
+        return int((res or "0").split()[-1])
+    except Exception:
+        return 0
+
+
 async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
     """
     Возвращает (cash_on_hand, withdrawn_total) по тем же правилам, что и в отчёте «Мастер/Заказы/Оплаты».
@@ -1005,6 +1048,10 @@ async def withdraw_amount_got(msg: Message, state: FSMContext):
                 await state.set_state(AdminMenuFSM.root)
                 return await msg.answer("Мастер не найден. Попробуйте снова из меню.", reply_markup=admin_root_kb())
             return await msg.answer("Мастер не найден. Выберите другого мастера.", reply_markup=kb)
+        try:
+            await backfill_cash_incomes_from_orders(conn)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("backfill cash incomes skipped: %s", e)
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
         available = cash_on_orders - withdrawn_total
         if available < Decimal(0):
