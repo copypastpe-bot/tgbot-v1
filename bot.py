@@ -144,6 +144,7 @@ PERMISSIONS_CANON = [
     "withdraw_cash",
     "manage_clients",
     "manage_masters",
+    "create_orders_clients",
     "view_last_transactions",
 ]
 
@@ -158,8 +159,11 @@ ROLE_MATRIX = {
         "withdraw_cash",
         "manage_clients",
         "manage_masters",
+        "create_orders_clients",
     ],
-    "master": [],
+    "master": [
+        "create_orders_clients",
+    ],
 }
 
 
