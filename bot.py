@@ -134,6 +134,57 @@ async def has_permission(user_id: int, permission_name: str) -> bool:
         )
         return rec is not None
 
+
+PERMISSIONS_CANON = [
+    "view_cash_reports",
+    "view_profit_reports",
+    "view_payments_by_method",
+    "manage_income",
+    "manage_expense",
+    "withdraw_cash",
+    "manage_clients",
+    "manage_masters",
+    "view_last_transactions",
+]
+
+ROLE_MATRIX = {
+    "superadmin": PERMISSIONS_CANON,
+    "admin": [
+        "view_cash_reports",
+        "view_profit_reports",
+        "view_payments_by_method",
+        "manage_income",
+        "manage_expense",
+        "withdraw_cash",
+        "manage_clients",
+        "manage_masters",
+    ],
+    "master": [],
+}
+
+
+async def init_permissions(conn):
+    for p in PERMISSIONS_CANON:
+        await conn.execute(
+            """
+            INSERT INTO permissions(name)
+            VALUES ($1)
+            ON CONFLICT (name) DO NOTHING
+            """,
+            p,
+        )
+    for role, perms in ROLE_MATRIX.items():
+        await conn.execute("DELETE FROM role_permissions WHERE role=$1", role)
+        if not perms:
+            continue
+        await conn.executemany(
+            """
+            INSERT INTO role_permissions(role, permission_id)
+            SELECT $1, id FROM permissions WHERE name=$2
+            """,
+            [(role, perm) for perm in perms],
+        )
+
 # ===== helpers =====
 def only_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
@@ -413,6 +464,122 @@ async def _send_tx_last(msg: Message, limit: int) -> None:
 
     await msg.answer("\n".join(lines))
     await msg.answer("Быстрый выбор:", reply_markup=tx_last_kb())
+
+
+async def get_master_cash_on_orders(conn, master_id: int) -> Decimal:
+    """
+    Возвращает сумму наличных, полученных мастером от заказов (все время).
+    Считается по таблице cashbook_entries, kind='income', method='Наличные'.
+    """
+    cash_sum = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount),0)
+        FROM cashbook_entries
+        WHERE kind='income' AND method='Наличные'
+          AND master_id=$1 AND order_id IS NOT NULL
+        """,
+        master_id,
+    )
+    return Decimal(cash_sum or 0)
+
+
+async def _ensure_bonus_posted_column(conn):
+    await conn.execute(
+        """
+        DO $$
+        BEGIN
+            BEGIN
+                ALTER TABLE orders ADD COLUMN bonus_posted boolean NOT NULL DEFAULT false;
+            EXCEPTION WHEN duplicate_column THEN
+                PERFORM 1;
+            END;
+            BEGIN
+                CREATE INDEX IF NOT EXISTS idx_orders_bonus_posted ON orders(bonus_posted);
+            EXCEPTION WHEN others THEN
+                PERFORM 1;
+            END;
+        END$$;
+        """
+    )
+
+
+async def bonus_baseline_init(conn, client_id: int | None = None) -> int:
+    if client_id is None:
+        await conn.execute(
+            """
+            WITH agg AS (
+                SELECT o.client_id, COALESCE(SUM(o.bonus_earned - o.bonus_spent),0) AS bal
+                FROM orders o
+                GROUP BY o.client_id
+            )
+            UPDATE clients c
+            SET bonus_balance = COALESCE(a.bal, 0)
+            FROM agg a
+            WHERE a.client_id = c.id;
+            """
+        )
+        await conn.execute("UPDATE orders SET bonus_posted = true;")
+        rec = await conn.fetchval("SELECT COUNT(*) FROM clients")
+        return int(rec or 0)
+    await conn.execute(
+        """
+        WITH agg AS (
+            SELECT o.client_id, COALESCE(SUM(o.bonus_earned - o.bonus_spent),0) AS bal
+            FROM orders o
+            WHERE o.client_id = $1
+            GROUP BY o.client_id
+        )
+        UPDATE clients c
+        SET bonus_balance = COALESCE((SELECT bal FROM agg WHERE client_id=c.id), 0)
+        WHERE c.id = $1;
+        """,
+        client_id,
+    )
+    await conn.execute("UPDATE orders SET bonus_posted = true WHERE client_id = $1;", client_id)
+    return 1
+
+
+async def post_order_bonus_delta(conn, order_id: int) -> bool:
+    row = await conn.fetchrow(
+        """
+        SELECT o.client_id, o.bonus_earned, o.bonus_spent, o.bonus_posted
+        FROM orders o
+        WHERE o.id = $1
+        LIMIT 1
+        """,
+        order_id,
+    )
+    if not row:
+        return False
+    if row["bonus_posted"]:
+        logging.info("[bonus_delta] order=%s already posted", order_id)
+        return False
+
+    delta = Decimal(row["bonus_earned"] or 0) - Decimal(row["bonus_spent"] or 0)
+    async with conn.transaction():
+        await conn.execute(
+            """
+            UPDATE clients
+            SET bonus_balance = bonus_balance + $1
+            WHERE id = $2
+            """,
+            delta,
+            row["client_id"],
+        )
+        await conn.execute(
+            """
+            UPDATE orders SET bonus_posted = true WHERE id = $1
+            """,
+            order_id,
+        )
+    logging.info(
+        "[bonus_delta] order=%s client=%s delta=%s applied=%s",
+        order_id,
+        row["client_id"],
+        str(delta),
+        True,
+    )
+    return True
 
 
 def format_money(amount: Decimal) -> str:
@@ -906,15 +1073,11 @@ async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
     cash_on_hand = «Наличных у мастера»
     withdrawn_total = «Изъято у мастера»
     """
-    cash_on_orders = await conn.fetchval(
-        """
-        SELECT COALESCE(SUM(amount_cash),0)
-        FROM orders
-        WHERE master_id=$1
-          AND payment_method='Наличные'
-        """,
-        master_id,
-    )
+    try:
+        await backfill_cash_incomes_from_orders(conn)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("backfill cash incomes in wallet skipped: %s", e)
+    cash_on_orders = await get_master_cash_on_orders(conn, master_id)
     withdrawn = await conn.fetchval(
         """
         SELECT COALESCE(SUM(amount),0)
@@ -3233,7 +3396,7 @@ async def tx_last_cmd(msg: Message, command: CommandObject | None = None):
 
 
 @dp.message(F.text.in_({"/tx_last 10", "/tx_last 30", "/tx_last 50"}))
-async def tx_last_quick_buttons(msg: Message):
+async def tx_last_presets(msg: Message):
     try:
         limit = int(msg.text.split()[1])
     except Exception:
@@ -3803,29 +3966,16 @@ async def commit_order(msg: Message, state: FSMContext):
                     client_id, bonus_earned, order_id
                 )
 
-            # стало: пересчитываем по сумме всех транзакций клиента
-            await conn.execute(
-                """
-                UPDATE clients c
-                SET bonus_balance = GREATEST(
-                    0,
-                    COALESCE((
-                        SELECT SUM(bt.delta)::integer
-                        FROM bonus_transactions bt
-                        WHERE bt.client_id = c.id
-                    ), 0)
-                )
-                WHERE c.id = $1
-                """,
-                client_id
-            )
-
             await conn.execute(
                 "INSERT INTO payroll_items (order_id, master_id, base_pay, fuel_pay, upsell_pay, total_pay, calc_info) "
                 "VALUES ($1, (SELECT id FROM staff WHERE tg_user_id=$2), $3, $4, $5, $6, "
                 "        jsonb_build_object('cash_payment', to_jsonb(($7)::numeric), 'rules', '1000/3000 + 150 + 500/3000'))",
                 order_id, msg.from_user.id, base_pay, fuel_pay, upsell_pay, total_pay, cash_payment
             )
+        try:
+            await post_order_bonus_delta(conn, order_id)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("post_order_bonus_delta failed for order_id=%s: %s", order_id, e)
 
     await state.clear()
     await msg.answer("Готово ✅ Заказ сохранён.\nСпасибо!", reply_markup=master_kb)
@@ -3962,6 +4112,9 @@ async def unknown(msg: Message, state: FSMContext):
 async def main():
     global pool
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
+    async with pool.acquire() as _conn:
+        await init_permissions(_conn)
+        await _ensure_bonus_posted_column(_conn)
     await set_commands()
     await dp.start_polling(bot)
 
