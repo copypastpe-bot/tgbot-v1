@@ -3178,42 +3178,58 @@ async def add_expense(msg: Message, command: CommandObject):
 
 # ===== /tx_last admin command =====
 @dp.message(Command("tx_last"))
-async def tx_last_cmd(msg: Message):
+async def tx_last_handler(msg: Message, command: CommandObject | None = None):
+    # Временно проверяем то же право, что и раньше (чтобы не ломать матрицу ролей)
     if not await has_permission(msg.from_user.id, "view_cash_reports"):
         return await msg.answer("Только для администраторов.")
-    # парсим N
-    parts = msg.text.split(maxsplit=1)
+
+    # Разбор лимита: /tx_last 10  (по умолчанию 30, максимум 200)
+    limit = 30
     try:
-        n = int(parts[1]) if len(parts) > 1 else 10
+        if command and command.args:
+            n = int((command.args or "30").strip())
+            if 1 <= n <= 200:
+                limit = n
     except Exception:
-        n = 10
-    if n < 1:
-        n = 1
-    if n > 100:
-        n = 100
+        pass
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, kind, method, amount, happened_at, order_id, comment, is_void
+            SELECT id, happened_at, kind, method, amount,
+                   COALESCE(order_id, 0) AS order_id,
+                   COALESCE(master_id, 0) AS master_id,
+                   COALESCE(comment,'') AS comment
             FROM cashbook_entries
             ORDER BY id DESC
             LIMIT $1
             """,
-            n,
+            limit,
         )
+
     if not rows:
         return await msg.answer("Транзакций нет.")
 
-    def fmt(r):
-        ok = "✅" if not r["is_void"] else "⛔️"
-        return (
-            f"№{r['id']} | {ok} | {r['kind']} | {r['amount']}₽ | {r['method'] or 'прочее'} | "
-            f"{r['happened_at']:%Y-%m-%d %H:%M} | order=#{r['order_id']} | {r['comment'] or ''}"
-        )
+    lines = [f"Последние транзакции (показать: {limit}):"]
+    for r in rows:
+        sign = "+" if r["kind"] == "income" else "-"
+        amt = format_money(Decimal(r["amount"] or 0))
+        dt = (r["happened_at"] or datetime.now()).strftime("%d.%m.%Y %H:%M")
+        base = f"#{r['id']} {dt} {sign}{amt}₽ [{r['kind']}/{r['method']}]"
+        extras = []
+        if r["order_id"]:
+            extras.append(f"order:{r['order_id']}")
+        if r["master_id"]:
+            extras.append(f"master:{r['master_id']}")
+        c = (r["comment"] or "").strip()
+        if c:
+            extras.append(c[:80])
+        if extras:
+            base += " — " + " | ".join(extras)
+        lines.append(base)
 
-    text = "Последние транзакции:\n" + "\n".join(fmt(r) for r in rows)
-    await msg.answer(text)
+    text = "\n".join(lines)
+    await msg.answer(text, reply_markup=tx_last_kb())
 
 # ===== /tx_delete superadmin command =====
 @dp.message(Command("tx_delete"))
