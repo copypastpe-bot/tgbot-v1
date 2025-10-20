@@ -3606,6 +3606,7 @@ class OrderFSM(StatesGroup):
     upsell_flag = State()
     upsell_amount = State()
     bonus_spend = State()
+    bonus_custom = State()
     waiting_payment_method = State()
     maybe_bday = State()
     name_fix = State()
@@ -3788,15 +3789,45 @@ async def got_bonus_spend(msg: Message, state: FSMContext):
     elif "0" in choice:
         spend = Decimal("0")
     else:
-        v = re.sub(r"[^\d]", "", msg.text)
-        if not v:
-            return await msg.answer("Введите целую сумму бонусов (руб), например: 300")
-        spend = Decimal(v)
+        await state.set_state(OrderFSM.bonus_custom)
+        return await msg.answer(
+            "Введите целую сумму бонусов для списания (в рублях), например 300.\n"
+            f"Максимум доступно: {bonus_max}.",
+            reply_markup=cancel_kb
+        )
     if spend > bonus_max:
         return await msg.answer(f"Нельзя списать больше {bonus_max}. Введите сумму не превышающую лимит.")
     cash_payment = amount - spend
     if cash_payment < MIN_CASH:
         return await msg.answer(f"Минимальная оплата деньгами {MIN_CASH}. Уменьшите списание бонусов.")
+    await state.update_data(bonus_spent=spend, amount_cash=cash_payment)
+    await state.set_state(OrderFSM.waiting_payment_method)
+    return await msg.answer(
+        f"Оплата деньгами: {cash_payment}\nВыберите способ оплаты:",
+        reply_markup=payment_method_kb()
+    )
+
+
+@dp.message(OrderFSM.bonus_custom, F.text)
+async def bonus_custom_amount(msg: Message, state: FSMContext):
+    raw = (msg.text or "").strip()
+    digits = re.sub(r"[^\d]", "", raw)
+    if not digits:
+        return await msg.answer("Введите целую сумму бонусов (например 300) или нажмите «Отмена».", reply_markup=cancel_kb)
+    try:
+        spend = Decimal(digits)
+    except Exception:
+        return await msg.answer("Не удалось распознать сумму. Введите число, например 300.", reply_markup=cancel_kb)
+
+    data = await state.get_data()
+    amount = Decimal(str(data["amount_total"]))
+    bonus_max = Decimal(str(data["bonus_max"]))
+    if spend > bonus_max:
+        return await msg.answer(f"Нельзя списать больше {bonus_max}. Введите сумму не превышающую лимит.", reply_markup=cancel_kb)
+    cash_payment = amount - spend
+    if cash_payment < MIN_CASH:
+        return await msg.answer(f"Минимальная оплата деньгами {MIN_CASH}. Уменьшите списание бонусов.", reply_markup=cancel_kb)
+
     await state.update_data(bonus_spent=spend, amount_cash=cash_payment)
     await state.set_state(OrderFSM.waiting_payment_method)
     return await msg.answer(
