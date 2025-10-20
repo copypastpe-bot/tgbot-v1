@@ -2517,6 +2517,7 @@ async def rep_master_period(msg: Message, state: FSMContext):
 
     tg_id = int(data["master_tg"])
 
+    on_hand_str = None
     async with pool.acquire() as conn:
         mid = await conn.fetchval("SELECT id FROM staff WHERE tg_user_id=$1", tg_id)
         if not mid:
@@ -2556,6 +2557,12 @@ async def rep_master_period(msg: Message, state: FSMContext):
             mid,
         )
 
+        cash_on_orders, withdrawn_total = await get_master_wallet(conn, mid)
+        on_hand_now = cash_on_orders - withdrawn_total
+        if on_hand_now < Decimal(0):
+            on_hand_now = Decimal(0)
+        on_hand_str = format_money(on_hand_now)
+
     lines = [
         f"Мастер: {fio or '—'} ({tg_id}) — {label}",
         f"Заказов выполнено: {rec['cnt']}"
@@ -2572,10 +2579,11 @@ async def rep_master_period(msg: Message, state: FSMContext):
         lines.append(f"Оплачено сертификатом: {rec['s_gift_total']}₽")
 
     withdrawn = rec["withdrawn"] or Decimal(0)
-    on_hand = (rec["s_cash"] or Decimal(0)) - withdrawn
     if withdrawn and withdrawn > 0:
         lines.append(f"Изъято у мастера: {withdrawn}₽")
-    lines.append(f"Итого на руках наличных: {on_hand}₽")
+    if on_hand_str is None:
+        on_hand_str = format_money(Decimal(0))
+    lines.append(f"Итого на руках наличных: {on_hand_str}₽")
 
     await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
     await state.clear()
