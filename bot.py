@@ -395,10 +395,6 @@ async def build_masters_kb(conn) -> InlineKeyboardMarkup | None:
 
     builder = InlineKeyboardBuilder()
     has_master = False
-    try:
-        await backfill_cash_incomes_from_orders(conn)
-    except Exception as e:  # noqa: BLE001
-        logging.warning("backfill cash incomes skipped: %s", e)
     for r in masters:
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, r['id'])
         available = cash_on_orders - withdrawn_total
@@ -862,165 +858,21 @@ async def admin_masters_remove_phone(msg: Message, state: FSMContext):
     await msg.answer("Мастер деактивирован.", reply_markup=admin_root_kb())
 
 
-async def get_master_cash_on_orders(conn, master_id: int) -> Decimal:
-    """
-    Возвращает сумму наличных, полученных мастером от заказов (все время).
-    Считается по таблице cashbook_entries, kind='income', method='Наличные'.
-    """
-    cash_sum = await conn.fetchval(
-        """
-        SELECT COALESCE(SUM(amount),0)
-        FROM cashbook_entries
-        WHERE kind='income' AND method='Наличные'
-          AND master_id=$1 AND order_id IS NOT NULL
-        """,
-        master_id,
-    )
-    return Decimal(cash_sum or 0)
-
-
-async def backfill_cash_incomes_from_orders(conn) -> int:
-    """
-    Однократно добивает отсутствующие приходы по Наличным из таблицы orders
-    в cashbook_entries. Нужен для консистентности кошелька мастера.
-    Возвращает кол-во добавленных строк.
-    Предполагается, что в orders есть колонки:
-      - id (order_id)
-      - master_id
-      - payment_method (каноника 'Наличные', 'Карта Женя', 'Карта Дима', 'р/с', ... )
-      - amount_cash (сумма, принятая налом)
-      - finished_at (дата заказа, используем как happened_at)
-    """
-    sql = """
-    INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-    SELECT
-        'income'::text      AS kind,
-        'Наличные'::text    AS method,
-        o.amount_cash       AS amount,
-        'Автодобавление: приход по заказу (нал)' AS comment,
-        o.id                AS order_id,
-        o.master_id         AS master_id,
-        COALESCE(o.finished_at, now()) AS happened_at
-    FROM orders o
-    LEFT JOIN cashbook_entries e
-           ON e.order_id = o.id
-          AND e.kind = 'income'
-          AND e.method = 'Наличные'
-    WHERE
-        o.amount_cash > 0
-        AND o.master_id IS NOT NULL
-        AND e.id IS NULL;
-    """
-    res_insert = await conn.execute(sql)
-    try:
-        inserted = int((res_insert or "0").split()[-1])
-    except Exception:
-        inserted = 0
-
-    update_sql = """
-    UPDATE cashbook_entries e
-    SET
-        master_id   = COALESCE(o.master_id, e.master_id),
-        amount      = CASE WHEN o.amount_cash IS NULL THEN e.amount ELSE o.amount_cash END,
-        happened_at = CASE
-            WHEN e.happened_at IS NULL THEN COALESCE(o.finished_at, e.happened_at, now())
-            ELSE e.happened_at
-        END
-    FROM orders o
-    WHERE e.kind='income'
-      AND e.method='Наличные'
-      AND e.order_id = o.id
-      AND o.master_id IS NOT NULL
-      AND (
-            e.master_id IS DISTINCT FROM o.master_id
-         OR (o.amount_cash IS NOT NULL AND e.amount IS DISTINCT FROM o.amount_cash)
-         OR (e.happened_at IS NULL AND (o.finished_at IS NOT NULL))
-      );
-    """
-    res_update = await conn.execute(update_sql)
-    try:
-        updated = int((res_update or "0").split()[-1])
-    except Exception:
-        updated = 0
-
-    return inserted + updated
-
-
-async def ensure_cash_income_for_order(conn, order_id: int) -> tuple[bool, str]:
-    """
-    Гарантирует, что по заказу order_id существует корректная строка в cashbook_entries
-    для прихода 'Наличные' (kind='income', method='Наличные', order_id=<id>, master_id, amount, happened_at).
-    - Если записи нет — создаёт.
-    - Если есть — корректирует master_id/amount/happened_at при несовпадении.
-    Возвращает (changed, info).
-    """
-    o = await conn.fetchrow(
-        """
-        SELECT id, master_id, payment_method, amount_cash, finished_at
-        FROM orders
-        WHERE id=$1
-        """,
-        order_id,
-    )
-    if not o:
-        return False, "order_not_found"
-    if not o["master_id"]:
-        return False, "no_master_id"
-    amount_cash = (o["amount_cash"] or Decimal(0))
-    if amount_cash <= 0:
-        return False, "no_cash_amount"
-    existing = await conn.fetchrow(
-        """
-        SELECT id, master_id, amount, happened_at
-        FROM cashbook_entries
-        WHERE kind='income' AND method='Наличные' AND order_id=$1
-        LIMIT 1
-        """,
-        order_id,
-    )
-    hap = o["finished_at"] or datetime.now()
-    if not existing:
-        await conn.execute(
-            """
-            INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-            VALUES ('income','Наличные',$1,'Приход по заказу (нал)', $2, $3, $4)
-            """,
-            amount_cash, o["id"], o["master_id"], hap,
-        )
-        return True, "inserted"
-    updates = []
-    params = []
-    if existing["master_id"] != o["master_id"]:
-        updates.append("master_id=$%d" % (len(params) + 1))
-        params.append(o["master_id"])
-    if existing["amount"] != amount_cash:
-        updates.append("amount=$%d" % (len(params) + 1))
-        params.append(amount_cash)
-    if existing["happened_at"] is None and hap:
-        updates.append("happened_at=$%d" % (len(params) + 1))
-        params.append(hap)
-    if updates:
-        params.append(order_id)
-        await conn.execute(
-            f"UPDATE cashbook_entries SET {', '.join(updates)} "
-            "WHERE kind='income' AND method='Наличные' AND order_id=$%d" % (len(params),),
-            *params,
-        )
-        return True, "updated"
-    return False, "up_to_date"
-
-
 async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
     """
     Возвращает (cash_on_hand, withdrawn_total) по тем же правилам, что и в отчёте «Мастер/Заказы/Оплаты».
     cash_on_hand = «Наличных у мастера»
     withdrawn_total = «Изъято у мастера»
     """
-    try:
-        await backfill_cash_incomes_from_orders(conn)
-    except Exception as e:  # noqa: BLE001
-        logging.warning("backfill cash incomes in wallet skipped: %s", e)
-    cash_on_orders = await get_master_cash_on_orders(conn, master_id)
+    cash_on_orders = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount_cash),0)
+        FROM orders
+        WHERE master_id=$1
+          AND payment_method='Наличные'
+        """,
+        master_id,
+    )
     withdrawn = await conn.fetchval(
         """
         SELECT COALESCE(SUM(amount),0)
@@ -1144,10 +996,6 @@ async def withdraw_amount_got(msg: Message, state: FSMContext):
                 await state.set_state(AdminMenuFSM.root)
                 return await msg.answer("Мастер не найден. Попробуйте снова из меню.", reply_markup=admin_root_kb())
             return await msg.answer("Мастер не найден. Выберите другого мастера.", reply_markup=kb)
-        try:
-            await backfill_cash_incomes_from_orders(conn)
-        except Exception as e:  # noqa: BLE001
-            logging.warning("backfill cash incomes skipped: %s", e)
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
         available = cash_on_orders - withdrawn_total
         if available < Decimal(0):
@@ -2669,6 +2517,8 @@ async def rep_master_period(msg: Message, state: FSMContext):
 
     tg_id = int(data["master_tg"])
 
+    on_hand_str = None
+    withdrawn_str = None
     async with pool.acquire() as conn:
         mid = await conn.fetchval("SELECT id FROM staff WHERE tg_user_id=$1", tg_id)
         if not mid:
@@ -2708,6 +2558,29 @@ async def rep_master_period(msg: Message, state: FSMContext):
             mid,
         )
 
+        cash_on_orders, withdrawn_total = await get_master_wallet(conn, mid)
+        on_hand_now = cash_on_orders - withdrawn_total
+        if on_hand_now < Decimal(0):
+            on_hand_now = Decimal(0)
+        on_hand_str = format_money(on_hand_now)
+
+        dt_from = await conn.fetchval(f"SELECT {start_sql}")
+        dt_to = await conn.fetchval(f"SELECT {end_sql}")
+        # Добавляем строку с изъятиями мастера за период
+        withdrawn_period = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(amount),0)
+            FROM cashbook_entries
+            WHERE kind='expense' AND method='Наличные'
+              AND master_id=$1 AND order_id IS NULL
+              AND (comment ILIKE '[WDR]%' OR comment ILIKE 'изъят%')
+              AND happened_at >= $2 AND happened_at < $3
+            """,
+            mid, dt_from, dt_to,
+        )
+        withdrawn_period = Decimal(withdrawn_period or 0)
+        withdrawn_str = format_money(withdrawn_period)
+
     lines = [
         f"Мастер: {fio or '—'} ({tg_id}) — {label}",
         f"Заказов выполнено: {rec['cnt']}"
@@ -2724,10 +2597,14 @@ async def rep_master_period(msg: Message, state: FSMContext):
         lines.append(f"Оплачено сертификатом: {rec['s_gift_total']}₽")
 
     withdrawn = rec["withdrawn"] or Decimal(0)
-    on_hand = (rec["s_cash"] or Decimal(0)) - withdrawn
     if withdrawn and withdrawn > 0:
         lines.append(f"Изъято у мастера: {withdrawn}₽")
-    lines.append(f"Итого на руках наличных: {on_hand}₽")
+    if withdrawn_str is None:
+        withdrawn_str = format_money(Decimal(0))
+    lines.append(f"Изъято у мастера за период: {withdrawn_str}₽")
+    if on_hand_str is None:
+        on_hand_str = format_money(Decimal(0))
+    lines.append(f"Итого на руках наличных: {on_hand_str}₽")
 
     await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
     await state.clear()
@@ -3884,15 +3761,6 @@ async def commit_order(msg: Message, state: FSMContext):
             )
             order_id = order["id"]
 
-            try:
-                await ensure_cash_income_for_order(conn, order_id)
-            except Exception as e:  # noqa: BLE001
-                logging.warning(
-                    "ensure_cash_income_for_order (create) failed for order_id=%s: %s",
-                    order_id,
-                    e,
-                )
-
             await conn.execute(
                 "INSERT INTO staff(tg_user_id, role, is_active) "
                 "VALUES ($1,'master',true) ON CONFLICT (tg_user_id) DO UPDATE SET is_active=true",
@@ -4074,4 +3942,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
