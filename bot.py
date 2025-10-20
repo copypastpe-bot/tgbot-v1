@@ -858,21 +858,30 @@ async def admin_masters_remove_phone(msg: Message, state: FSMContext):
     await msg.answer("Мастер деактивирован.", reply_markup=admin_root_kb())
 
 
+async def get_master_cash_on_orders(conn, master_id: int) -> Decimal:
+    """
+    Возвращает сумму наличных, полученных мастером от заказов (все время).
+    Считается по таблице cashbook_entries, kind='income', method='Наличные'.
+    """
+    cash_sum = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount),0)
+        FROM cashbook_entries
+        WHERE kind='income' AND method='Наличные'
+          AND master_id=$1 AND order_id IS NOT NULL
+        """,
+        master_id,
+    )
+    return Decimal(cash_sum or 0)
+
+
 async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
     """
     Возвращает (cash_on_hand, withdrawn_total) по тем же правилам, что и в отчёте «Мастер/Заказы/Оплаты».
     cash_on_hand = «Наличных у мастера»
     withdrawn_total = «Изъято у мастера»
     """
-    cash_on_orders = await conn.fetchval(
-        """
-        SELECT COALESCE(SUM(amount_cash),0)
-        FROM orders
-        WHERE master_id=$1
-          AND payment_method='Наличные'
-        """,
-        master_id,
-    )
+    cash_on_orders = await get_master_cash_on_orders(conn, master_id)
     withdrawn = await conn.fetchval(
         """
         SELECT COALESCE(SUM(amount),0)
