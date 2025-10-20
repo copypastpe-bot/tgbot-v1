@@ -366,6 +366,55 @@ def tx_last_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
+async def _send_tx_last(msg: Message, limit: int) -> None:
+    # проверку прав оставляем как сейчас — через view_cash_reports
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        await msg.answer("Только для администраторов.")
+        return
+
+    if not (1 <= limit <= 200):
+        limit = 30
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, happened_at, kind, method, amount,
+                   COALESCE(order_id, 0) AS order_id,
+                   COALESCE(master_id, 0) AS master_id,
+                   COALESCE(comment,'') AS comment
+            FROM cashbook_entries
+            ORDER BY id DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+
+    if not rows:
+        await msg.answer("Транзакций нет.")
+        return
+
+    lines = [f"Последние транзакции (показать: {limit}):"]
+    for r in rows:
+        sign = "+" if r["kind"] == "income" else "-"
+        amt = format_money(Decimal(r["amount"] or 0))
+        dt = (r["happened_at"] or datetime.now()).strftime("%d.%m.%Y %H:%M")
+        base = f"#{r['id']} {dt} {sign}{amt}₽ [{r['kind']}/{r['method']}]"
+        extras = []
+        if r["order_id"]:
+            extras.append(f"order:{r['order_id']}")
+        if r["master_id"]:
+            extras.append(f"master:{r['master_id']}")
+        c = (r["comment"] or "").strip()
+        if c:
+            extras.append(c[:80])
+        if extras:
+            base += " — " + " | ".join(extras)
+        lines.append(base)
+
+    await msg.answer("\n".join(lines))
+    await msg.answer("Быстрый выбор:", reply_markup=tx_last_kb())
+
+
 def format_money(amount: Decimal) -> str:
     q = (amount or Decimal(0)).quantize(Decimal("0.1"))
     int_part, frac_part = f"{q:.1f}".split('.')
@@ -3178,12 +3227,7 @@ async def add_expense(msg: Message, command: CommandObject):
 
 # ===== /tx_last admin command =====
 @dp.message(Command("tx_last"))
-async def tx_last_handler(msg: Message, command: CommandObject | None = None):
-    # Временно проверяем то же право, что и раньше (чтобы не ломать матрицу ролей)
-    if not await has_permission(msg.from_user.id, "view_cash_reports"):
-        return await msg.answer("Только для администраторов.")
-
-    # Разбор лимита: /tx_last 10  (по умолчанию 30, максимум 200)
+async def tx_last_cmd(msg: Message, command: CommandObject | None = None):
     limit = 30
     try:
         if command and command.args:
@@ -3192,44 +3236,16 @@ async def tx_last_handler(msg: Message, command: CommandObject | None = None):
                 limit = n
     except Exception:
         pass
+    await _send_tx_last(msg, limit)
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, happened_at, kind, method, amount,
-                   COALESCE(order_id, 0) AS order_id,
-                   COALESCE(master_id, 0) AS master_id,
-                   COALESCE(comment,'') AS comment
-            FROM cashbook_entries
-            ORDER BY id DESC
-            LIMIT $1
-            """,
-            limit,
-        )
 
-    if not rows:
-        return await msg.answer("Транзакций нет.")
-
-    lines = [f"Последние транзакции (показать: {limit}):"]
-    for r in rows:
-        sign = "+" if r["kind"] == "income" else "-"
-        amt = format_money(Decimal(r["amount"] or 0))
-        dt = (r["happened_at"] or datetime.now()).strftime("%d.%m.%Y %H:%M")
-        base = f"#{r['id']} {dt} {sign}{amt}₽ [{r['kind']}/{r['method']}]"
-        extras = []
-        if r["order_id"]:
-            extras.append(f"order:{r['order_id']}")
-        if r["master_id"]:
-            extras.append(f"master:{r['master_id']}")
-        c = (r["comment"] or "").strip()
-        if c:
-            extras.append(c[:80])
-        if extras:
-            base += " — " + " | ".join(extras)
-        lines.append(base)
-
-    text = "\n".join(lines)
-    await msg.answer(text, reply_markup=tx_last_kb())
+@dp.message(F.text.in_({"/tx_last 10", "/tx_last 30", "/tx_last 50"}))
+async def tx_last_quick_buttons(msg: Message):
+    try:
+        limit = int(msg.text.split()[1])
+    except Exception:
+        limit = 30
+    await _send_tx_last(msg, limit)
 
 # ===== /tx_delete superadmin command =====
 @dp.message(Command("tx_delete"))
