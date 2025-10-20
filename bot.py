@@ -2517,8 +2517,6 @@ async def rep_master_period(msg: Message, state: FSMContext):
 
     tg_id = int(data["master_tg"])
 
-    on_hand_str = None
-    withdrawn_str = None
     async with pool.acquire() as conn:
         mid = await conn.fetchval("SELECT id FROM staff WHERE tg_user_id=$1", tg_id)
         if not mid:
@@ -2558,29 +2556,6 @@ async def rep_master_period(msg: Message, state: FSMContext):
             mid,
         )
 
-        cash_on_orders, withdrawn_total = await get_master_wallet(conn, mid)
-        on_hand_now = cash_on_orders - withdrawn_total
-        if on_hand_now < Decimal(0):
-            on_hand_now = Decimal(0)
-        on_hand_str = format_money(on_hand_now)
-
-        dt_from = await conn.fetchval(f"SELECT {start_sql}")
-        dt_to = await conn.fetchval(f"SELECT {end_sql}")
-        # Добавляем строку с изъятиями мастера за период
-        withdrawn_period = await conn.fetchval(
-            """
-            SELECT COALESCE(SUM(amount),0)
-            FROM cashbook_entries
-            WHERE kind='expense' AND method='Наличные'
-              AND master_id=$1 AND order_id IS NULL
-              AND (comment ILIKE '[WDR]%' OR comment ILIKE 'изъят%')
-              AND happened_at >= $2 AND happened_at < $3
-            """,
-            mid, dt_from, dt_to,
-        )
-        withdrawn_period = Decimal(withdrawn_period or 0)
-        withdrawn_str = format_money(withdrawn_period)
-
     lines = [
         f"Мастер: {fio or '—'} ({tg_id}) — {label}",
         f"Заказов выполнено: {rec['cnt']}"
@@ -2597,14 +2572,10 @@ async def rep_master_period(msg: Message, state: FSMContext):
         lines.append(f"Оплачено сертификатом: {rec['s_gift_total']}₽")
 
     withdrawn = rec["withdrawn"] or Decimal(0)
+    on_hand = (rec["s_cash"] or Decimal(0)) - withdrawn
     if withdrawn and withdrawn > 0:
         lines.append(f"Изъято у мастера: {withdrawn}₽")
-    if withdrawn_str is None:
-        withdrawn_str = format_money(Decimal(0))
-    lines.append(f"Изъято у мастера за период: {withdrawn_str}₽")
-    if on_hand_str is None:
-        on_hand_str = format_money(Decimal(0))
-    lines.append(f"Итого на руках наличных: {on_hand_str}₽")
+    lines.append(f"Итого на руках наличных: {on_hand}₽")
 
     await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
     await state.clear()
@@ -3942,3 +3913,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
