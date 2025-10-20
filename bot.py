@@ -326,7 +326,7 @@ def admin_root_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Отчёты")],
         [KeyboardButton(text="Приход"), KeyboardButton(text="Расход"), KeyboardButton(text="Изъятие")],
         [KeyboardButton(text="Мастера"), KeyboardButton(text="Клиенты")],
-        [KeyboardButton(text="Tx последние"), KeyboardButton(text="Кто я")],
+        [KeyboardButton(text="Кто я")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -783,13 +783,6 @@ async def admin_withdraw_entry(msg: Message, state: FSMContext):
         "Выберите мастера, у которого нужно изъять наличные:",
         reply_markup=kb,
     )
-
-
-@dp.message(AdminMenuFSM.root, F.text == "Tx последние")
-async def tx_last_menu(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_cash_reports"):
-        return await msg.answer("Только для администраторов.")
-    await msg.answer("Выберите, сколько показать:", reply_markup=tx_last_kb())
 
 
 @dp.message(AdminMenuFSM.root, F.text == "Клиенты")
