@@ -918,12 +918,80 @@ async def backfill_cash_incomes_from_orders(conn) -> int:
         return 0
 
 
+async def ensure_cash_income_for_order(conn, order_id: int) -> tuple[bool, str]:
+    """
+    Гарантирует, что по заказу order_id существует корректная строка в cashbook_entries
+    для прихода 'Наличные' (kind='income', method='Наличные', order_id=<id>, master_id, amount, happened_at).
+    - Если записи нет — создаёт.
+    - Если есть — корректирует master_id/amount/happened_at при несовпадении.
+    Возвращает (changed, info).
+    """
+    o = await conn.fetchrow(
+        """
+        SELECT id, master_id, payment_method, amount_cash, finished_at
+        FROM orders
+        WHERE id=$1
+        """,
+        order_id,
+    )
+    if not o:
+        return False, "order_not_found"
+    if not o["master_id"]:
+        return False, "no_master_id"
+    amount_cash = (o["amount_cash"] or Decimal(0))
+    if amount_cash <= 0:
+        return False, "no_cash_amount"
+    existing = await conn.fetchrow(
+        """
+        SELECT id, master_id, amount, happened_at
+        FROM cashbook_entries
+        WHERE kind='income' AND method='Наличные' AND order_id=$1
+        LIMIT 1
+        """,
+        order_id,
+    )
+    hap = o["finished_at"] or datetime.now()
+    if not existing:
+        await conn.execute(
+            """
+            INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+            VALUES ('income','Наличные',$1,'Приход по заказу (нал)', $2, $3, $4)
+            """,
+            amount_cash, o["id"], o["master_id"], hap,
+        )
+        return True, "inserted"
+    updates = []
+    params = []
+    if existing["master_id"] != o["master_id"]:
+        updates.append("master_id=$%d" % (len(params) + 1))
+        params.append(o["master_id"])
+    if existing["amount"] != amount_cash:
+        updates.append("amount=$%d" % (len(params) + 1))
+        params.append(amount_cash)
+    if existing["happened_at"] is None and hap:
+        updates.append("happened_at=$%d" % (len(params) + 1))
+        params.append(hap)
+    if updates:
+        params.append(order_id)
+        await conn.execute(
+            f"UPDATE cashbook_entries SET {', '.join(updates)} "
+            "WHERE kind='income' AND method='Наличные' AND order_id=$%d" % (len(params),),
+            *params,
+        )
+        return True, "updated"
+    return False, "up_to_date"
+
+
 async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
     """
     Возвращает (cash_on_hand, withdrawn_total) по тем же правилам, что и в отчёте «Мастер/Заказы/Оплаты».
     cash_on_hand = «Наличных у мастера»
     withdrawn_total = «Изъято у мастера»
     """
+    try:
+        await backfill_cash_incomes_from_orders(conn)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("backfill cash incomes in wallet skipped: %s", e)
     cash_on_orders = await get_master_cash_on_orders(conn, master_id)
     withdrawn = await conn.fetchval(
         """
@@ -3787,6 +3855,15 @@ async def commit_order(msg: Message, state: FSMContext):
                 bonus_spent, bonus_earned, payment_method
             )
             order_id = order["id"]
+
+            try:
+                await ensure_cash_income_for_order(conn, order_id)
+            except Exception as e:  # noqa: BLE001
+                logging.warning(
+                    "ensure_cash_income_for_order (create) failed for order_id=%s: %s",
+                    order_id,
+                    e,
+                )
 
             await conn.execute(
                 "INSERT INTO staff(tg_user_id, role, is_active) "
