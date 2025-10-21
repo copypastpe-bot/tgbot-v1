@@ -757,48 +757,21 @@ async def reports_shortcut_payment_types(msg: Message, state: FSMContext):
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "День")
 async def reports_run_period_day(msg: Message, state: FSMContext):
     data = await state.get_data()
-    kind = data.get("report_kind")
-    period = "day"
-    if kind == "Касса":
-        text = await get_cash_report_text(period)
-    elif kind == "Прибыль":
-        text = await get_profit_report_text(period)
-    elif kind == "Типы оплат":
-        text = await get_payments_by_method_report_text(period)
-    else:
-        text = "Неизвестный тип отчёта."
+    text = await _build_report_text(data.get("report_kind"), data, "day", state)
     await msg.answer(text, reply_markup=reports_period_kb())
 
 
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "Месяц")
 async def reports_run_period_month(msg: Message, state: FSMContext):
     data = await state.get_data()
-    kind = data.get("report_kind")
-    period = "month"
-    if kind == "Касса":
-        text = await get_cash_report_text(period)
-    elif kind == "Прибыль":
-        text = await get_profit_report_text(period)
-    elif kind == "Типы оплат":
-        text = await get_payments_by_method_report_text(period)
-    else:
-        text = "Неизвестный тип отчёта."
+    text = await _build_report_text(data.get("report_kind"), data, "month", state)
     await msg.answer(text, reply_markup=reports_period_kb())
 
 
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "Год")
 async def reports_run_period_year(msg: Message, state: FSMContext):
     data = await state.get_data()
-    kind = data.get("report_kind")
-    period = "year"
-    if kind == "Касса":
-        text = await get_cash_report_text(period)
-    elif kind == "Прибыль":
-        text = await get_profit_report_text(period)
-    elif kind == "Типы оплат":
-        text = await get_payments_by_method_report_text(period)
-    else:
-        text = "Неизвестный тип отчёта."
+    text = await _build_report_text(data.get("report_kind"), data, "year", state)
     await msg.answer(text, reply_markup=reports_period_kb())
 
 
@@ -2217,6 +2190,223 @@ async def get_payments_by_method_report_text(period: str) -> str:
     return "\n".join(lines)
 
 
+def _normalize_report_kind(kind: str | None) -> str:
+    mapping = {
+        "master_orders": "Мастер/Заказы/Оплаты",
+        "master_salary": "Мастер/Зарплата",
+        "paytypes": "Типы оплат",
+    }
+    if not kind:
+        return ""
+    return mapping.get(kind, kind)
+
+
+def _report_period_bounds(period: str) -> tuple[str, str, str] | None:
+    period = (period or "").lower()
+    mapping = {
+        "day": ("date_trunc('day', NOW())", "date_trunc('day', NOW()) + interval '1 day'", "за сегодня"),
+        "week": ("date_trunc('week', NOW())", "date_trunc('week', NOW()) + interval '1 week'", "за неделю"),
+        "month": ("date_trunc('month', NOW())", "date_trunc('month', NOW()) + interval '1 month'", "за месяц"),
+        "year": ("date_trunc('year', NOW())", "date_trunc('year', NOW()) + interval '1 year'", "за год"),
+    }
+    return mapping.get(period)
+
+
+async def _resolve_master_id_from_state(data: dict) -> int | None:
+    tg_val = data.get("report_master_tg") or data.get("master_tg")
+    if tg_val is None:
+        return None
+    try:
+        tg_id = int(tg_val)
+    except (TypeError, ValueError):
+        return None
+    async with pool.acquire() as conn:
+        master_id = await conn.fetchval(
+            "SELECT id FROM staff WHERE tg_user_id=$1",
+            tg_id,
+        )
+    return master_id
+
+
+async def get_master_payroll_report_text(master_id: int, period: str) -> str:
+    bounds = _report_period_bounds(period)
+    if not bounds:
+        return "Неизвестный период отчёта."
+
+    start_sql, end_sql, label = bounds
+    async with pool.acquire() as conn:
+        master_row = await conn.fetchrow(
+            "SELECT id, tg_user_id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+            "FROM staff WHERE id=$1",
+            master_id,
+        )
+        if not master_row:
+            return "Мастер не найден."
+
+        rec = await conn.fetchrow(
+            f"""
+            WITH ord AS (
+              SELECT o.id
+              FROM orders o
+              WHERE o.master_id = $1
+                AND o.created_at >= {start_sql}
+                AND o.created_at <  {end_sql}
+            )
+            SELECT
+              COUNT(*)                                   AS orders,
+              COALESCE(SUM(pi.base_pay),   0)::numeric(12,2) AS base_pay,
+              COALESCE(SUM(pi.fuel_pay),   0)::numeric(12,2) AS fuel_pay,
+              COALESCE(SUM(pi.upsell_pay), 0)::numeric(12,2) AS upsell_pay,
+              COALESCE(SUM(pi.total_pay),  0)::numeric(12,2) AS total_pay
+            FROM payroll_items pi
+            JOIN ord ON ord.id = pi.order_id
+            WHERE pi.master_id = $1;
+            """,
+            master_id,
+        )
+
+    orders = rec["orders"] if rec else 0
+    base_pay = rec["base_pay"] if rec else 0
+    fuel_pay = rec["fuel_pay"] if rec else 0
+    upsell_pay = rec["upsell_pay"] if rec else 0
+    total_pay = rec["total_pay"] if rec else 0
+
+    fio = f"{master_row['fn']} {master_row['ln']}".strip()
+    tg_id = master_row["tg_user_id"]
+
+    lines = [
+        f"Зарплата мастера: {fio or '—'} (tg:{tg_id}) — {label}",
+        f"Заказов: {orders or 0}",
+        f"База: {base_pay or 0}₽",
+        f"Бензин: {fuel_pay or 0}₽",
+    ]
+    if (upsell_pay or 0) > 0:
+        lines.append(f"Доп. услуги: {upsell_pay}₽")
+    lines.append(f"Итого к выплате: {total_pay or 0}₽")
+    return "\n".join(lines)
+
+
+async def get_master_orders_payments_report_text(master_id: int, period: str) -> str:
+    bounds = _report_period_bounds(period)
+    if not bounds:
+        return "Неизвестный период отчёта."
+
+    start_sql, end_sql, label = bounds
+    async with pool.acquire() as conn:
+        master_row = await conn.fetchrow(
+            "SELECT id, tg_user_id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+            "FROM staff WHERE id=$1",
+            master_id,
+        )
+        if not master_row:
+            return "Мастер не найден."
+
+        rec = await conn.fetchrow(
+            f"""
+            WITH scope AS (
+              SELECT o.*
+              FROM orders o
+              WHERE o.master_id = $1
+                AND o.created_at >= {start_sql}
+                AND o.created_at <  {end_sql}
+            ),
+            w AS (
+              SELECT COALESCE(SUM(c.amount),0)::numeric(12,2) AS withdrawn
+              FROM cashbook_entries c
+              WHERE c.kind='withdrawal' AND c.method='cash' AND c.master_id=$1
+                AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+            )
+            SELECT
+              COUNT(*) AS cnt,
+              COALESCE(SUM(CASE WHEN payment_method='Наличные'              THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
+              COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
+              COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
+              COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
+              COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total,
+              (SELECT withdrawn FROM w) AS withdrawn
+            FROM scope;
+            """,
+            master_id,
+        )
+
+        cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
+        on_hand_now = cash_on_orders - withdrawn_total
+        if on_hand_now < Decimal(0):
+            on_hand_now = Decimal(0)
+
+        withdrawn_period = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(amount),0)::numeric(12,2)
+            FROM cashbook_entries
+            WHERE kind='expense' AND method='Наличные'
+              AND master_id=$1 AND order_id IS NULL
+              AND (comment ILIKE '[WDR]%' OR comment ILIKE 'изъят%')
+              AND happened_at >= {start_sql} AND happened_at < {end_sql}
+            """,
+            master_id,
+        )
+
+    fio = f"{master_row['fn']} {master_row['ln']}".strip()
+    tg_id = master_row["tg_user_id"]
+
+    lines = [
+        f"Мастер: {fio or '—'} (tg:{tg_id}) — {label}",
+        f"Заказов выполнено: {rec['cnt'] if rec else 0}",
+    ]
+    if rec:
+        if rec["s_cash"] > 0:
+            lines.append(f"Оплачено наличными: {rec['s_cash']}₽")
+        if rec["s_card_jenya"] > 0:
+            lines.append(f"Оплачено Карта Женя: {rec['s_card_jenya']}₽")
+        if rec["s_card_dima"] > 0:
+            lines.append(f"Оплачено Карта Дима: {rec['s_card_dima']}₽")
+        if rec["s_rs"] > 0:
+            lines.append(f"Оплачено р/с: {rec['s_rs']}₽")
+        if rec["s_gift_total"] > 0:
+            lines.append(f"Оплачено сертификатом: {rec['s_gift_total']}₽")
+        withdrawn_value = rec["withdrawn"] or Decimal(0)
+        if withdrawn_value > 0:
+            lines.append(f"Изъято у мастера: {withdrawn_value}₽")
+
+    lines.append(f"Изъято у мастера за период: {format_money(Decimal(withdrawn_period or 0))}₽")
+    lines.append(f"Итого на руках наличных: {format_money(on_hand_now)}₽")
+    return "\n".join(lines)
+
+
+async def _build_report_text(kind_raw: str | None, data: dict, period: str, state: FSMContext) -> str:
+    kind = _normalize_report_kind(kind_raw)
+    text = "Неизвестный тип отчёта."
+
+    if kind == "Касса":
+        text = await get_cash_report_text(period)
+    elif kind == "Прибыль":
+        text = await get_profit_report_text(period)
+    elif kind == "Типы оплат":
+        text = await get_payments_by_method_report_text(period)
+    elif kind == "Мастер/Заказы/Оплаты":
+        master_id = data.get("report_master_id")
+        if master_id is None:
+            master_id = await _resolve_master_id_from_state(data)
+            if master_id is not None:
+                await state.update_data(report_master_id=master_id)
+        if master_id:
+            text = await get_master_orders_payments_report_text(int(master_id), period)
+        else:
+            text = "Сначала выберите мастера."
+    elif kind == "Мастер/Зарплата":
+        master_id = data.get("report_master_id")
+        if master_id is None:
+            master_id = await _resolve_master_id_from_state(data)
+            if master_id is not None:
+                await state.update_data(report_master_id=master_id)
+        if master_id:
+            text = await get_master_payroll_report_text(int(master_id), period)
+        else:
+            text = "Сначала выберите мастера."
+
+    return text
+
+
 # ===== /profit admin command =====
 @dp.message(Command("profit"))
 async def profit_report(msg: Message, state: FSMContext):
@@ -2407,18 +2597,30 @@ async def reports_start(msg: Message, state: FSMContext):
 async def rep_master_orders_entry(msg: Message, state: FSMContext):
     async with pool.acquire() as conn:
         prompt, kb = await build_report_masters_kb(conn)
-    await msg.answer(prompt, reply_markup=kb)
-    await state.update_data(report_kind="master_orders")
+    await state.clear()
     await state.set_state(ReportsFSM.waiting_pick_master)
+    await state.update_data(
+        report_kind="Мастер/Заказы/Оплаты",
+        report_master_id=None,
+        report_master_tg=None,
+        report_master_name=None,
+    )
+    await msg.answer(prompt, reply_markup=kb)
 
 
 @dp.message(ReportsFSM.waiting_root, F.text.casefold() == "мастер/зарплата")
 async def rep_master_salary_entry(msg: Message, state: FSMContext):
     async with pool.acquire() as conn:
         prompt, kb = await build_report_masters_kb(conn)
-    await msg.answer(prompt, reply_markup=kb)
-    await state.update_data(report_kind="master_salary")
+    await state.clear()
     await state.set_state(ReportsFSM.waiting_pick_master)
+    await state.update_data(
+        report_kind="Мастер/Зарплата",
+        report_master_id=None,
+        report_master_tg=None,
+        report_master_name=None,
+    )
+    await msg.answer(prompt, reply_markup=kb)
 
 
 @dp.message(ReportsFSM.waiting_root, F.text.in_({"Касса", "Прибыль"}))
@@ -2699,227 +2901,44 @@ async def rep_master_pick(msg: Message, state: FSMContext):
         tg_id = int(txt)
     if not tg_id:
         return await msg.answer("Укажи tg id мастера (число).")
-    await state.update_data(master_tg=tg_id)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="день"),   KeyboardButton(text="неделя")],
-            [KeyboardButton(text="месяц"), KeyboardButton(text="год")],
-            [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
+    async with pool.acquire() as conn:
+        master_row = await conn.fetchrow(
+            "SELECT id, tg_user_id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+            "FROM staff WHERE tg_user_id=$1 AND role IN ('master','admin') AND is_active",
+            tg_id,
+        )
+    if not master_row:
+        return await msg.answer("Мастер с таким tg id не найден.")
+
+    master_name = f"{master_row['fn']} {master_row['ln']}".strip() or f"Мастер #{master_row['id']}"
+    await state.update_data(
+        master_tg=tg_id,
+        report_master_tg=tg_id,
+        report_master_id=master_row["id"],
+        report_master_name=master_name,
     )
-    await msg.answer("Выберите период:", reply_markup=kb)
     await state.set_state(ReportsFSM.waiting_pick_period)
+    await msg.answer(
+        f"Мастер выбран: {master_name} (tg:{tg_id}). Выберите период:",
+        reply_markup=reports_period_kb(),
+    )
 
 
-@dp.message(ReportsFSM.waiting_pick_period, ~F.text.startswith("/"))
+@dp.message(ReportsFSM.waiting_pick_period, F.text.in_({"день", "неделя", "месяц", "год"}))
 async def rep_master_period(msg: Message, state: FSMContext):
-    period = (msg.text or "").strip().lower()
-    if period not in ("день", "неделя", "месяц", "год"):
+    period_map = {
+        "день": "day",
+        "неделя": "week",
+        "месяц": "month",
+        "год": "year",
+    }
+    normalized = period_map.get((msg.text or "").strip().lower())
+    if not normalized:
         return await msg.answer("Выберите один из вариантов: день / неделя / месяц / год")
 
-    if period == "день":
-        start_sql = "date_trunc('day', NOW())"
-        end_sql = "date_trunc('day', NOW()) + interval '1 day'"
-        label = "за сегодня"
-    elif period == "неделя":
-        start_sql = "date_trunc('week', NOW())"
-        end_sql = "date_trunc('week', NOW()) + interval '1 week'"
-        label = "за неделю"
-    elif period == "месяц":
-        start_sql = "date_trunc('month', NOW())"
-        end_sql = "date_trunc('month', NOW()) + interval '1 month'"
-        label = "за месяц"
-    else:
-        start_sql = "date_trunc('year', NOW())"
-        end_sql = "date_trunc('year', NOW()) + interval '1 year'"
-        label = "за год"
-
     data = await state.get_data()
-    report_kind = data.get("report_kind", "master_orders")
-
-    if report_kind == "master_salary":
-        tg_id = int(data["master_tg"])
-        async with pool.acquire() as conn:
-            mid = await conn.fetchval("SELECT id FROM staff WHERE tg_user_id=$1", tg_id)
-            if not mid:
-                await state.clear()
-                return await msg.answer("Мастер с таким tg id не найден.")
-
-            rec = await conn.fetchrow(
-                f"""
-                WITH ord AS (
-                  SELECT o.id
-                  FROM orders o
-                  WHERE o.master_id = $1
-                    AND o.created_at >= {start_sql}
-                    AND o.created_at <  {end_sql}
-                )
-                SELECT
-                  COUNT(*)                                   AS orders,
-                  COALESCE(SUM(pi.base_pay),   0)::numeric(12,2) AS base_pay,
-                  COALESCE(SUM(pi.fuel_pay),   0)::numeric(12,2) AS fuel_pay,
-                  COALESCE(SUM(pi.upsell_pay), 0)::numeric(12,2) AS upsell_pay,
-                  COALESCE(SUM(pi.total_pay),  0)::numeric(12,2) AS total_pay
-                FROM payroll_items pi
-                JOIN ord ON ord.id = pi.order_id
-                WHERE pi.master_id = $1;
-                """,
-                mid,
-            )
-            fio = await conn.fetchval(
-                "SELECT trim(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) FROM staff WHERE id=$1",
-                mid,
-            )
-
-        lines = [
-            f"Зарплата мастера: {fio or '—'} (tg:{tg_id}) — {label}",
-            f"Заказов: {rec['orders'] or 0}",
-            f"База: {rec['base_pay'] or 0}₽",
-            f"Бензин: {rec['fuel_pay'] or 0}₽",
-        ]
-        if (rec['upsell_pay'] or 0) > 0:
-            lines.append(f"Доп. услуги: {rec['upsell_pay']}₽")
-        lines.append(f"Итого к выплате: {rec['total_pay'] or 0}₽")
-
-        await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
-        await state.clear()
-        return
-
-    if report_kind == "paytypes":
-        async with pool.acquire() as conn:
-            rec = await conn.fetchrow(
-                f"""
-                SELECT
-                  COALESCE(SUM(CASE WHEN payment_method='Наличные'     THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
-                  COALESCE(SUM(CASE WHEN payment_method='Карта Женя'   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
-                  COALESCE(SUM(CASE WHEN payment_method='Карта Дима'   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
-                  COALESCE(SUM(CASE WHEN payment_method='р/с'          THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
-                  COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total,
-                  COALESCE(SUM(CASE WHEN payment_method='Наличные'     THEN 1 ELSE 0 END),0) AS c_cash,
-                  COALESCE(SUM(CASE WHEN payment_method='Карта Женя'   THEN 1 ELSE 0 END),0) AS c_card_jenya,
-                  COALESCE(SUM(CASE WHEN payment_method='Карта Дима'   THEN 1 ELSE 0 END),0) AS c_card_dima,
-                  COALESCE(SUM(CASE WHEN payment_method='р/с'          THEN 1 ELSE 0 END),0) AS c_rs,
-                  COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN 1 ELSE 0 END),0) AS c_gift
-                FROM orders
-                WHERE created_at >= {start_sql} AND created_at < {end_sql};
-                """
-            )
-
-        lines = [f"Типы оплат — {label}:"]
-
-        total_money = (rec['s_cash'] or 0) + (rec['s_card_jenya'] or 0) + (rec['s_card_dima'] or 0) + (rec['s_rs'] or 0)
-        if rec['c_cash'] > 0:
-            lines.append(f"Наличные: {rec['s_cash']}₽ ({rec['c_cash']})")
-        if rec['c_card_jenya'] > 0:
-            lines.append(f"Карта Женя: {rec['s_card_jenya']}₽ ({rec['c_card_jenya']})")
-        if rec['c_card_dima'] > 0:
-            lines.append(f"Карта Дима: {rec['s_card_dima']}₽ ({rec['c_card_dima']})")
-        if rec['c_rs'] > 0:
-            lines.append(f"р/с: {rec['s_rs']}₽ ({rec['c_rs']})")
-        if rec['c_gift'] > 0:
-            lines.append(f"Подарочный сертификат: {rec['s_gift_total']}₽ ({rec['c_gift']})")
-
-        lines.append(f"Итого денег: {total_money}₽")
-
-        await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
-        await state.clear()
-        return
-
-    tg_id = int(data["master_tg"])
-
-    on_hand_str = None
-    withdrawn_str = None
-    async with pool.acquire() as conn:
-        mid = await conn.fetchval("SELECT id FROM staff WHERE tg_user_id=$1", tg_id)
-        if not mid:
-            await state.clear()
-            return await msg.answer("Мастер с таким tg id не найден.")
-
-        rec = await conn.fetchrow(
-            f"""
-            WITH scope AS (
-              SELECT o.*
-              FROM orders o
-              WHERE o.master_id = $1
-                AND o.created_at >= {start_sql}
-                AND o.created_at <  {end_sql}
-            ),
-            w AS (
-              SELECT COALESCE(SUM(c.amount),0)::numeric(12,2) AS withdrawn
-              FROM cashbook_entries c
-              WHERE c.kind='withdrawal' AND c.method='cash' AND c.master_id=$1
-                AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-            )
-            SELECT
-              COUNT(*) AS cnt,
-              COALESCE(SUM(CASE WHEN payment_method='Наличные'              THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
-              COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
-              COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
-              COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
-              COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total,
-              (SELECT withdrawn FROM w) AS withdrawn
-            FROM scope;
-            """,
-            mid,
-        )
-
-        fio = await conn.fetchval(
-            "SELECT trim(coalesce(first_name,'')||' '||coalesce(last_name,'')) FROM staff WHERE id=$1",
-            mid,
-        )
-
-        cash_on_orders, withdrawn_total = await get_master_wallet(conn, mid)
-        on_hand_now = cash_on_orders - withdrawn_total
-        if on_hand_now < Decimal(0):
-            on_hand_now = Decimal(0)
-        on_hand_str = format_money(on_hand_now)
-
-        dt_from = await conn.fetchval(f"SELECT {start_sql}")
-        dt_to = await conn.fetchval(f"SELECT {end_sql}")
-        # Добавляем строку с изъятиями мастера за период
-        withdrawn_period = await conn.fetchval(
-            """
-            SELECT COALESCE(SUM(amount),0)
-            FROM cashbook_entries
-            WHERE kind='expense' AND method='Наличные'
-              AND master_id=$1 AND order_id IS NULL
-              AND (comment ILIKE '[WDR]%' OR comment ILIKE 'изъят%')
-              AND happened_at >= $2 AND happened_at < $3
-            """,
-            mid, dt_from, dt_to,
-        )
-        withdrawn_period = Decimal(withdrawn_period or 0)
-        withdrawn_str = format_money(withdrawn_period)
-
-    lines = [
-        f"Мастер: {fio or '—'} ({tg_id}) — {label}",
-        f"Заказов выполнено: {rec['cnt']}"
-    ]
-    if rec["s_cash"] > 0:
-        lines.append(f"Оплачено наличными: {rec['s_cash']}₽")
-    if rec["s_card_jenya"] > 0:
-        lines.append(f"Оплачено Карта Женя: {rec['s_card_jenya']}₽")
-    if rec["s_card_dima"] > 0:
-        lines.append(f"Оплачено Карта Дима: {rec['s_card_dima']}₽")
-    if rec["s_rs"] > 0:
-        lines.append(f"Оплачено р/с: {rec['s_rs']}₽")
-    if rec["s_gift_total"] > 0:
-        lines.append(f"Оплачено сертификатом: {rec['s_gift_total']}₽")
-
-    withdrawn = rec["withdrawn"] or Decimal(0)
-    if withdrawn and withdrawn > 0:
-        lines.append(f"Изъято у мастера: {withdrawn}₽")
-    if withdrawn_str is None:
-        withdrawn_str = format_money(Decimal(0))
-    lines.append(f"Изъято у мастера за период: {withdrawn_str}₽")
-    if on_hand_str is None:
-        on_hand_str = format_money(Decimal(0))
-    lines.append(f"Итого на руках наличных: {on_hand_str}₽")
-
-    await msg.answer("\n".join(lines), reply_markup=ReplyKeyboardRemove())
-    await state.clear()
+    text = await _build_report_text(data.get("report_kind"), data, normalized, state)
+    await msg.answer(text, reply_markup=reports_period_kb())
 
 # ===== Leads import (admin) =====
 @dp.message(Command("import_leads_dryrun"))
