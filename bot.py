@@ -2748,11 +2748,18 @@ async def income_wizard_start(msg: Message, state: FSMContext):
     await msg.answer("Выберите тип оплаты:", reply_markup=admin_payment_method_kb())
 
 
+@dp.message(IncomeFSM.waiting_method, F.text.casefold() == "отмена")
+@dp.message(IncomeFSM.waiting_amount, F.text.casefold() == "отмена")
+@dp.message(IncomeFSM.waiting_comment, F.text.casefold() == "отмена")
+async def income_cancel_any(msg: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Операция отменена.")
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+
 @dp.message(IncomeFSM.waiting_method)
 async def income_wizard_pick_method(msg: Message, state: FSMContext):
-    if (msg.text or "").strip().casefold() == "отмена":
-        await state.clear()
-        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
     method = norm_pay_method_py(msg.text)
     await state.update_data(method=method)
     await state.set_state(IncomeFSM.waiting_amount)
@@ -2767,9 +2774,6 @@ async def income_wizard_pick_method(msg: Message, state: FSMContext):
 @dp.message(IncomeFSM.waiting_amount)
 async def income_wizard_amount(msg: Message, state: FSMContext):
     txt = (msg.text or "").strip().replace(" ", "").replace(",", ".")
-    if txt.casefold() == "отмена":
-        await state.clear()
-        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
     try:
         amount = Decimal(txt)
     except Exception:
@@ -2789,9 +2793,6 @@ async def income_wizard_amount(msg: Message, state: FSMContext):
 @dp.message(IncomeFSM.waiting_comment)
 async def income_wizard_comment(msg: Message, state: FSMContext):
     txt = (msg.text or "").strip()
-    if txt.casefold() == "отмена":
-        await state.clear()
-        return await msg.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
     if txt.casefold() == "без комментария" or not txt:
         txt = "поступление денег в кассу"
     data = await state.get_data()
