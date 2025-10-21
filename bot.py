@@ -29,6 +29,7 @@ class AdminMenuFSM(StatesGroup):
 
 class AdminClientsFSM(StatesGroup):
     find_wait_phone = State()
+    view_client      = State()
     edit_wait_phone = State()
     edit_pick_field = State()
     edit_wait_value = State()
@@ -440,6 +441,19 @@ def client_edit_fields_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Бонусы добавить/убавить")],
         [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
     ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def client_view_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="Редактировать")],
+        [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def client_find_phone_kb() -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
@@ -990,8 +1004,9 @@ async def admin_withdraw_entry(msg: Message, state: FSMContext):
 async def admin_clients_root(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "edit_client"):
         return await msg.answer("Только для администраторов.")
-    await state.set_state(AdminMenuFSM.clients)
-    await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
+    await state.clear()
+    await state.set_state(AdminClientsFSM.find_wait_phone)
+    await msg.answer("Введите номер телефона клиента (8/ +7/ 9...):", reply_markup=client_find_phone_kb())
 
 
 @dp.message(AdminMenuFSM.root, F.text == "Мастера")
@@ -1448,14 +1463,67 @@ async def withdraw_confirm_handler(query: CallbackQuery, state: FSMContext):
         return
 
 
-@dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Назад")
+@dp.message(
+    StateFilter(
+        AdminClientsFSM.find_wait_phone,
+        AdminClientsFSM.view_client,
+        AdminClientsFSM.edit_wait_phone,
+        AdminClientsFSM.edit_pick_field,
+        AdminClientsFSM.edit_wait_value,
+    ),
+    F.text == "Назад",
+)
 async def admin_clients_states_back(msg: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == AdminClientsFSM.edit_wait_value.state:
+        await state.set_state(AdminClientsFSM.edit_pick_field)
+        await msg.answer("Что изменить?", reply_markup=client_edit_fields_kb())
+        return
+
+    if current_state == AdminClientsFSM.edit_pick_field.state:
+        data = await state.get_data()
+        client_id = data.get("client_id")
+        if client_id:
+            async with pool.acquire() as conn:
+                rec = await conn.fetchrow(
+                    "SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1",
+                    client_id,
+                )
+            if rec:
+                await state.set_state(AdminClientsFSM.view_client)
+                await msg.answer(_fmt_client_row(rec), reply_markup=client_view_kb())
+                return
+        await state.set_state(AdminClientsFSM.find_wait_phone)
+        await msg.answer("Введите номер телефона клиента (8/ +7/ 9...):", reply_markup=client_find_phone_kb())
+        return
+
+    if current_state == AdminClientsFSM.view_client.state:
+        await state.update_data(client_id=None, edit_field=None)
+        await state.set_state(AdminClientsFSM.find_wait_phone)
+        await msg.answer("Введите номер телефона клиента (8/ +7/ 9...):", reply_markup=client_find_phone_kb())
+        return
+
+    if current_state == AdminClientsFSM.edit_wait_phone.state:
+        await state.set_state(AdminClientsFSM.find_wait_phone)
+        await msg.answer("Введите номер телефона клиента (8/ +7/ 9...):", reply_markup=client_find_phone_kb())
+        return
+
+    # find_wait_phone or fallback — выходим в меню администратора
     await state.clear()
-    await state.set_state(AdminMenuFSM.clients)
-    await msg.answer("Клиенты: выбери действие.", reply_markup=admin_clients_kb())
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
-@dp.message(StateFilter(AdminClientsFSM.find_wait_phone, AdminClientsFSM.edit_wait_phone, AdminClientsFSM.edit_pick_field, AdminClientsFSM.edit_wait_value), F.text == "Отмена")
+@dp.message(
+    StateFilter(
+        AdminClientsFSM.find_wait_phone,
+        AdminClientsFSM.view_client,
+        AdminClientsFSM.edit_wait_phone,
+        AdminClientsFSM.edit_pick_field,
+        AdminClientsFSM.edit_wait_value,
+    ),
+    F.text == "Отмена",
+)
 async def admin_clients_states_cancel(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
@@ -1467,12 +1535,25 @@ async def client_find_got_phone(msg: Message, state: FSMContext):
     async with pool.acquire() as conn:
         rec = await _find_client_by_phone(conn, msg.text)
     if not rec:
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        return await msg.answer("Клиент не найден.", reply_markup=admin_root_kb())
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    return await msg.answer(_fmt_client_row(rec), reply_markup=admin_root_kb())
+        return await msg.answer("Клиент не найден. Попробуйте ещё раз.", reply_markup=client_find_phone_kb())
+    await state.update_data(client_id=rec["id"], edit_field=None)
+    await state.set_state(AdminClientsFSM.view_client)
+    await msg.answer(f"Клиент найден:\n{_fmt_client_row(rec)}", reply_markup=client_view_kb())
+
+
+@dp.message(AdminClientsFSM.view_client, F.text.casefold() == "редактировать")
+async def client_view_edit(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    client_id = data.get("client_id")
+    if not client_id:
+        await state.set_state(AdminClientsFSM.find_wait_phone)
+        return await msg.answer(
+            "Сессия сброшена. Введите номер телефона клиента (8/ +7/ 9...):",
+            reply_markup=client_find_phone_kb(),
+        )
+    await state.update_data(edit_field=None)
+    await state.set_state(AdminClientsFSM.edit_pick_field)
+    await msg.answer("Что изменить?", reply_markup=client_edit_fields_kb())
 
 
 @dp.message(AdminClientsFSM.edit_wait_phone)
@@ -1551,11 +1632,11 @@ async def client_edit_apply(msg: Message, state: FSMContext):
                 delta = int((msg.text or "0").strip())
             except Exception:
                 return await msg.answer("Нужно целое число (можно со знаком). Введите ещё раз.")
-            rec = await conn.fetchrow(
+            bonus_row = await conn.fetchrow(
                 "SELECT bonus_balance FROM clients WHERE id=$1",
                 client_id,
             )
-            current_bonus = int(rec["bonus_balance"] or 0) if rec else 0
+            current_bonus = int(bonus_row["bonus_balance"] or 0) if bonus_row else 0
             new_bonus = current_bonus + delta
             if new_bonus < 0:
                 new_bonus = 0
@@ -1564,10 +1645,19 @@ async def client_edit_apply(msg: Message, state: FSMContext):
                 new_bonus,
                 client_id,
             )
+        updated_rec = await conn.fetchrow(
+            "SELECT id, full_name, phone, birthday, bonus_balance, status FROM clients WHERE id=$1",
+            client_id,
+        )
+    if not updated_rec:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Клиент не найден.", reply_markup=admin_root_kb())
 
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    return await msg.answer("Готово. Клиент обновлён.", reply_markup=admin_root_kb())
+    await state.update_data(client_id=client_id, edit_field=None)
+    await state.set_state(AdminClientsFSM.edit_pick_field)
+    await msg.answer(f"Клиент обновлён:\n{_fmt_client_row(updated_rec)}")
+    await msg.answer("Что изменить?", reply_markup=client_edit_fields_kb())
 
 
 @dp.message(Command("admin_panel"))
