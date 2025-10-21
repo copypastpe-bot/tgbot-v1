@@ -3,7 +3,6 @@ import csv, io
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import SkipHandler
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -2673,7 +2672,7 @@ async def reports_exit_to_admin(msg: Message, state: FSMContext):
 async def reports_pick_master_cancel_or_back(msg: Message, state: FSMContext):
     await state.set_state(ReportsFSM.waiting_root)
     await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
-    raise SkipHandler()
+    return
 
 
 @dp.message(ReportsFSM.waiting_pick_master, F.text.casefold() == "назад")
