@@ -682,7 +682,6 @@ async def build_masters_kb(conn) -> InlineKeyboardMarkup | None:
 
     builder.adjust(1)
     builder.row(
-        InlineKeyboardButton(text="Назад", callback_data="withdraw_nav:back"),
         InlineKeyboardButton(text="Отмена", callback_data="withdraw_nav:cancel"),
     )
     return builder.as_markup()
@@ -967,6 +966,7 @@ async def admin_withdraw_entry(msg: Message, state: FSMContext):
         withdraw_available=None,
         withdraw_comment="",
     )
+    await msg.answer("Скрываю клавиатуру…", reply_markup=ReplyKeyboardRemove())
     return await msg.answer(
         "Выберите мастера, у которого нужно изъять наличные:",
         reply_markup=kb,
@@ -1149,30 +1149,6 @@ def parse_amount_ru(text: str) -> tuple[Decimal | None, dict]:
     return value, dbg
 
 
-@dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "назад")
-async def withdraw_amount_back(msg: Message, state: FSMContext):
-    logging.info(f"[withdraw] step=amount_back user={msg.from_user.id} text={msg.text}")
-    async with pool.acquire() as conn:
-        kb = await build_masters_kb(conn)
-    if kb is None:
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        await msg.answer("Нет активных мастеров для изъятия.", reply_markup=admin_root_kb())
-        return
-    await state.update_data(
-        withdraw_amount=None,
-        withdraw_master_id=None,
-        withdraw_master_name=None,
-        withdraw_available=None,
-        withdraw_comment="",
-    )
-    await state.set_state(WithdrawFSM.waiting_master)
-    await msg.answer(
-        "Выберите мастера, у которого нужно изъять наличные:",
-        reply_markup=kb,
-    )
-
-
 @dp.message(WithdrawFSM.waiting_amount, F.text.lower() == "отмена")
 async def withdraw_amount_cancel(msg: Message, state: FSMContext):
     logging.info(f"[withdraw] step=amount_cancel user={msg.from_user.id} text={msg.text}")
@@ -1275,13 +1251,6 @@ async def withdraw_master_callback(query: CallbackQuery, state: FSMContext):
     logging.info(f"[withdraw] step=master_callback user={query.from_user.id} data={query.data}")
     payload = (query.data or "").strip()
 
-    if payload == "withdraw_nav:back":
-        await query.answer()
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        await query.message.answer("Меню администратора:", reply_markup=admin_root_kb())
-        return
-
     if payload == "withdraw_nav:cancel":
         await query.answer()
         await state.clear()
@@ -1359,6 +1328,7 @@ async def withdraw_master_prompt(msg: Message, state: FSMContext):
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
         return await msg.answer("Нет активных мастеров для изъятия.", reply_markup=admin_root_kb())
+    await msg.answer("Скрываю клавиатуру…", reply_markup=ReplyKeyboardRemove())
     return await msg.answer("Пожалуйста, выберите мастера кнопкой ниже.", reply_markup=kb)
 
 
