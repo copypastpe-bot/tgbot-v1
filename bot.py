@@ -2740,12 +2740,12 @@ async def adm_root_whoami(msg: Message, state: FSMContext):
     return await whoami(msg)
 
 
-@dp.message(AdminMenuFSM.root, F.text.casefold() == "приход")
+@dp.message(AdminMenuFSM.root, F.text == "Приход")
 async def income_wizard_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "record_cashflows"):
+    if not await has_permission(msg.from_user.id, "manage_income"):
         return await msg.answer("Только для администраторов.")
     await state.set_state(IncomeFSM.waiting_method)
-    await msg.answer("Выберите тип оплаты:", reply_markup=admin_payment_method_kb())
+    await msg.answer("Выберите способ оплаты:", reply_markup=admin_payment_method_kb())
 
 
 @dp.message(IncomeFSM.waiting_method, F.text.casefold() == "отмена")
@@ -2758,13 +2758,34 @@ async def income_cancel_any(msg: Message, state: FSMContext):
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
+@dp.message(IncomeFSM.waiting_amount, F.text.casefold() == "назад")
+async def income_back_to_method(msg: Message, state: FSMContext):
+    await state.set_state(IncomeFSM.waiting_method)
+    await msg.answer("Выберите способ оплаты:", reply_markup=admin_payment_method_kb())
+
+
+@dp.message(IncomeFSM.waiting_comment, F.text.casefold() == "назад")
+async def income_back_to_amount(msg: Message, state: FSMContext):
+    await state.set_state(IncomeFSM.waiting_amount)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Введите сумму прихода (например 2500 или 2 500,5):", reply_markup=kb)
+
+
 @dp.message(IncomeFSM.waiting_method)
 async def income_wizard_pick_method(msg: Message, state: FSMContext):
     method = norm_pay_method_py(msg.text)
     await state.update_data(method=method)
     await state.set_state(IncomeFSM.waiting_amount)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Отмена")]],
+        keyboard=[
+            [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -2783,7 +2804,10 @@ async def income_wizard_amount(msg: Message, state: FSMContext):
     await state.update_data(amount=str(amount))
     await state.set_state(IncomeFSM.waiting_comment)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Без комментария")], [KeyboardButton(text="Отмена")]],
+        keyboard=[
+            [KeyboardButton(text="Без комментария")],
+            [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -2807,7 +2831,7 @@ async def income_wizard_comment(msg: Message, state: FSMContext):
     )
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
-    await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    await msg.answer("Приход записан.", reply_markup=admin_root_kb())
 
 
 @dp.message(AdminMenuFSM.root, F.text.casefold() == "расход")
