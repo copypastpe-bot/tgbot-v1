@@ -136,30 +136,41 @@ async def has_permission(user_id: int, permission_name: str) -> bool:
 
 
 PERMISSIONS_CANON = [
+    "view_orders_reports",
     "view_cash_reports",
     "view_profit_reports",
     "view_payments_by_method",
+    "view_last_transactions",
     "manage_income",
     "manage_expense",
     "withdraw_cash",
+    "record_cashflows",
     "manage_clients",
+    "edit_client",
     "manage_masters",
+    "add_master",
     "create_orders_clients",
-    "view_last_transactions",
+    "view_salary_reports",
 ]
 
 ROLE_MATRIX = {
     "superadmin": PERMISSIONS_CANON,
     "admin": [
+        "view_orders_reports",
         "view_cash_reports",
         "view_profit_reports",
         "view_payments_by_method",
+        "view_last_transactions",
         "manage_income",
         "manage_expense",
         "withdraw_cash",
+        "record_cashflows",
         "manage_clients",
+        "edit_client",
         "manage_masters",
+        "add_master",
         "create_orders_clients",
+        "view_salary_reports",
     ],
     "master": [
         "create_orders_clients",
