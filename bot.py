@@ -151,6 +151,8 @@ PERMISSIONS_CANON = [
     "add_master",
     "create_orders_clients",
     "view_salary_reports",
+    "view_own_salary",
+    "view_own_income",
 ]
 
 ROLE_MATRIX = {
@@ -171,9 +173,13 @@ ROLE_MATRIX = {
         "add_master",
         "create_orders_clients",
         "view_salary_reports",
+        "view_own_salary",
+        "view_own_income",
     ],
     "master": [
         "create_orders_clients",
+        "view_own_salary",
+        "view_own_income",
     ],
 }
 
@@ -4108,7 +4114,7 @@ async def commit_order(msg: Message, state: FSMContext):
 # 🔍 Клиент — поиск клиента по номеру
 @dp.message(F.text == "🔍 Клиент")
 async def master_find_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_own_salary"):
+    if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     await state.set_state(MasterFSM.waiting_phone)
     await msg.answer("Введите номер телефона клиента:", reply_markup=cancel_kb)
@@ -4144,7 +4150,7 @@ async def master_find_phone(msg: Message, state: FSMContext):
 # 💼 Зарплата — запрос периода
 @dp.message(F.text == MASTER_SALARY_LABEL)
 async def master_salary_prompt(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_own_salary"):
+    if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     await state.set_state(MasterFSM.waiting_salary_period)
     await msg.answer(
@@ -4200,7 +4206,7 @@ async def master_salary_calc(msg: Message, state: FSMContext):
 # 💰 Приход — выручка за сегодня
 @dp.message(F.text == MASTER_INCOME_LABEL)
 async def master_income(msg: Message):
-    if not await has_permission(msg.from_user.id, "view_own_income"):
+    if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
