@@ -105,6 +105,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+# === Ignore group/supergroup/channel updates; work only in private chats ===
+from aiogram import BaseMiddleware
+
+class IgnoreNonPrivateMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        chat = data.get("event_chat")
+        # If event has no chat (rare), or chat is not private — swallow
+        if chat and getattr(chat, "type", None) != "private":
+            return
+        return await handler(event, data)
+
+# Apply to all message & callback updates
+dp.message.middleware(IgnoreNonPrivateMiddleware())
+dp.callback_query.middleware(IgnoreNonPrivateMiddleware())
+
 pool: asyncpg.Pool | None = None
 
 # ===== RBAC helpers (DB-driven) =====
