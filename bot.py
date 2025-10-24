@@ -57,9 +57,9 @@ class WithdrawFSM(StatesGroup):
 
 
 class AddMasterFSM(StatesGroup):
-    waiting_first_name = State()
-    waiting_last_name  = State()
-    waiting_phone      = State()
+    waiting_tg_id = State()
+    waiting_phone = State()
+    waiting_name  = State()
 
 
 class ReportsFSM(StatesGroup):
@@ -151,6 +151,8 @@ PERMISSIONS_CANON = [
     "add_master",
     "create_orders_clients",
     "view_salary_reports",
+    "view_own_salary",
+    "view_own_income",
 ]
 
 ROLE_MATRIX = {
@@ -171,12 +173,13 @@ ROLE_MATRIX = {
         "add_master",
         "create_orders_clients",
         "view_salary_reports",
+        "view_own_salary",
+        "view_own_income",
     ],
     "master": [
         "create_orders_clients",
-        "edit_client",
-        "manage_income",
-        "view_salary_reports",
+        "view_own_salary",
+        "view_own_income",
     ],
 }
 
@@ -445,6 +448,14 @@ def admin_clients_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def admin_cancel_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 def client_edit_fields_kb() -> ReplyKeyboardMarkup:
@@ -874,56 +885,99 @@ async def add_master(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     parts = msg.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await msg.answer("Формат: /add_master <tg_user_id>")
-    try:
-        target_id = int(parts[1].lstrip("@"))
-    except Exception:
-        return await msg.answer("Нужно указать числовой tg_user_id.")
     await state.clear()
-    await state.update_data(tg_id=target_id)
-    await state.set_state(AddMasterFSM.waiting_first_name)
-    await msg.answer("Имя мастера:")
+    if len(parts) >= 2:
+        try:
+            tg_id = int(parts[1].lstrip("@"))
+        except Exception:
+            await state.set_state(AddMasterFSM.waiting_tg_id)
+            return await msg.answer("Введите tg id мастера (число):", reply_markup=admin_cancel_kb())
+        await state.update_data(tg_id=tg_id)
+        await state.set_state(AddMasterFSM.waiting_phone)
+        return await msg.answer("Введите телефон мастера (формат: +7XXXXXXXXXX или 8/9...):", reply_markup=admin_cancel_kb())
+
+    await state.set_state(AddMasterFSM.waiting_tg_id)
+    await msg.answer("Введите tg id мастера (число):", reply_markup=admin_cancel_kb())
 
 
-@dp.message(AddMasterFSM.waiting_first_name)
-async def add_master_first(msg: Message, state: FSMContext):
-    first = (msg.text or "").strip()
-    if len(first) < 2:
-        return await msg.answer("Имя слишком короткое. Введите корректное имя (>= 2 символов).")
-    await state.update_data(first_name=first)
-    await state.set_state(AddMasterFSM.waiting_last_name)
-    await msg.answer("Фамилия мастера:")
+@dp.message(AddMasterFSM.waiting_tg_id)
+async def add_master_tg(msg: Message, state: FSMContext):
+    raw = (msg.text or "").strip()
+    if raw.lower() == "отмена":
+        return await add_master_cancel(msg, state)
 
+    candidate = raw.lstrip("@")
+    if not candidate.isdigit():
+        return await msg.answer("tg id должен быть числом. Введите ещё раз или нажмите «Отмена».", reply_markup=admin_cancel_kb())
+    tg_id = int(candidate)
+    if tg_id <= 0:
+        return await msg.answer("tg id должен быть положительным числом.", reply_markup=admin_cancel_kb())
 
-@dp.message(AddMasterFSM.waiting_last_name)
-async def add_master_last(msg: Message, state: FSMContext):
-    last = (msg.text or "").strip()
-    if len(last) < 2:
-        return await msg.answer("Фамилия слишком короткая. Введите корректную фамилию (>= 2 символов).")
-    await state.update_data(last_name=last)
+    await state.update_data(tg_id=tg_id)
     await state.set_state(AddMasterFSM.waiting_phone)
-    await msg.answer("Телефон мастера (формат: +7XXXXXXXXXX или 8/9...):")
+    await msg.answer("Введите телефон мастера (формат: +7XXXXXXXXXX или 8/9...):", reply_markup=admin_cancel_kb())
 
 
 @dp.message(AddMasterFSM.waiting_phone)
 async def add_master_phone(msg: Message, state: FSMContext):
-    phone_norm = normalize_phone_for_db(msg.text)
+    txt = (msg.text or "").strip()
+    if txt.lower() == "отмена":
+        return await add_master_cancel(msg, state)
+
+    phone_norm = normalize_phone_for_db(txt)
     if not phone_norm or not phone_norm.startswith("+7"):
-        return await msg.answer("Не распознал телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
+        return await msg.answer("Не распознал телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.", reply_markup=admin_cancel_kb())
+
+    await state.update_data(phone=phone_norm)
+    await state.set_state(AddMasterFSM.waiting_name)
+    await msg.answer("Введите имя мастера:", reply_markup=admin_cancel_kb())
+
+
+@dp.message(AddMasterFSM.waiting_name)
+async def add_master_name(msg: Message, state: FSMContext):
+    name_raw = (msg.text or "").strip()
+    if name_raw.lower() == "отмена":
+        return await add_master_cancel(msg, state)
+    if len(name_raw) < 2:
+        return await msg.answer("Имя должно содержать минимум 2 символа. Введите ещё раз.", reply_markup=admin_cancel_kb())
+
     data = await state.get_data()
-    if len((data.get("first_name") or "").strip()) < 2 or len((data.get("last_name") or "").strip()) < 2:
-        return await msg.answer("Имя/фамилия заданы некорректно. Перезапустите /add_master.")
-    tg_id = int(data["tg_id"])
+    tg_id = data.get("tg_id")
+    phone = data.get("phone")
+    if tg_id is None or phone is None:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Сессия сброшена. Начните заново.", reply_markup=admin_root_kb())
+
+    parts = name_raw.split(maxsplit=1)
+    first_name = parts[0]
+    last_name = parts[1] if len(parts) > 1 else ""
+
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO staff(tg_user_id, role, is_active, first_name, last_name, phone) "
             "VALUES ($1,'master',true,$2,$3,$4) "
             "ON CONFLICT (tg_user_id) DO UPDATE SET role='master', is_active=true, first_name=$2, last_name=$3, phone=$4",
-            tg_id, data.get("first_name"), data.get("last_name"), phone_norm
+            int(tg_id), first_name, last_name, phone,
         )
-    await msg.answer(f"✅ Мастер добавлен: {data.get('first_name','')} {data.get('last_name','')}, tg={tg_id}")
+
+    lines = [
+        "✅ Мастер добавлен",
+        f"Имя: {name_raw}",
+        f"Телефон: {phone}",
+        f"tg id: {tg_id}",
+        f"tg_user: tg://user?id={tg_id}",
+    ]
+
     await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("\n".join(lines), reply_markup=admin_root_kb())
+
+
+async def add_master_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Добавление мастера отменено.", reply_markup=admin_root_kb())
 
 
 @dp.message(Command("remove_master"))
@@ -3531,7 +3585,7 @@ async def withdraw_start(msg: Message, state: FSMContext):
 @dp.message(Command("mysalary"))
 async def my_salary(msg: Message):
     # доступ только для мастеров
-    if not await has_permission(msg.from_user.id, "view_own_salary"):
+    if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     parts = msg.text.split(maxsplit=1)
     period = parts[1].strip().lower() if len(parts) > 1 else "month"
@@ -3581,7 +3635,7 @@ async def my_salary(msg: Message):
 @dp.message(Command("myincome"))
 async def my_income(msg: Message):
     # доступ только для мастеров
-    if not await has_permission(msg.from_user.id, "view_own_income"):
+    if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -4111,7 +4165,7 @@ async def commit_order(msg: Message, state: FSMContext):
 # 🔍 Клиент — поиск клиента по номеру
 @dp.message(F.text == "🔍 Клиент")
 async def master_find_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_own_salary"):
+    if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     await state.set_state(MasterFSM.waiting_phone)
     await msg.answer("Введите номер телефона клиента:", reply_markup=cancel_kb)
@@ -4147,7 +4201,7 @@ async def master_find_phone(msg: Message, state: FSMContext):
 # 💼 Зарплата — запрос периода
 @dp.message(F.text == MASTER_SALARY_LABEL)
 async def master_salary_prompt(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "view_own_salary"):
+    if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     await state.set_state(MasterFSM.waiting_salary_period)
     await msg.answer(
@@ -4203,7 +4257,7 @@ async def master_salary_calc(msg: Message, state: FSMContext):
 # 💰 Приход — выручка за сегодня
 @dp.message(F.text == MASTER_INCOME_LABEL)
 async def master_income(msg: Message):
-    if not await has_permission(msg.from_user.id, "view_own_income"):
+    if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -4232,7 +4286,7 @@ async def unknown(msg: Message, state: FSMContext):
     cur = await state.get_state()
     if cur is not None:
         return
-    kb = master_kb if await has_permission(msg.from_user.id, "view_own_salary") else main_kb
+    kb = master_kb if await ensure_master(msg.from_user.id) else main_kb
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
