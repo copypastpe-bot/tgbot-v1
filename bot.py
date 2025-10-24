@@ -1106,12 +1106,11 @@ async def admin_masters_list(msg: Message, state: FSMContext):
 
 @dp.message(AdminMenuFSM.masters, F.text == "Добавить мастера")
 async def admin_masters_add(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "add_master"):
+        return await msg.answer("Только для администраторов.")
     await state.clear()
-    await state.set_state(AdminMenuFSM.root)
-    await msg.answer(
-        "Введите команду /add_master <tg_user_id> для начала. (Скоро сделаем диалог целиком по кнопкам)",
-        reply_markup=admin_root_kb(),
-    )
+    await state.set_state(AddMasterFSM.waiting_tg_id)
+    await msg.answer("Введите tg id мастера (число):", reply_markup=admin_cancel_kb())
 
 
 @dp.message(AdminMenuFSM.masters, F.text == "Деактивировать мастера")
