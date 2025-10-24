@@ -89,6 +89,10 @@ for part in re.split(r"[ ,;]+", _admin_ids_env.strip()):
     if part.isdigit():
         ADMIN_TG_IDS.add(int(part))
 
+# chat ids for notifications (2 чата: «Заказы подтверждения» и «Ракета деньги»)
+ORDERS_CONFIRM_CHAT_ID = int(os.getenv("ORDERS_CONFIRM_CHAT_ID", "0") or "0")  # Заказы подтверждения (в т.ч. З/П)
+MONEY_FLOW_CHAT_ID     = int(os.getenv("MONEY_FLOW_CHAT_ID", "0") or "0")      # «Ракета деньги»
+
 # env rules
 MIN_CASH = Decimal(os.getenv("MIN_CASH", "2500"))
 BONUS_RATE = Decimal(os.getenv("BONUS_RATE_PERCENT", "5")) / Decimal(100)
@@ -211,6 +215,24 @@ def only_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
 
 def normalize_phone_for_db(s: str) -> str:
+def mask_phone_last4(phone: str | None) -> str:
+    d = re.sub(r"[^0-9]", "", phone or "")
+    if len(d) >= 4:
+        return f"…{d[-4:]}"
+    return "…"
+
+def extract_street(addr: str | None) -> str | None:
+    """
+    Возвращает только название улицы из адреса, если удаётся.
+    Простая эвристика: берем фрагмент до первой запятой; если есть 'ул'/'улица', оставляем вместе с этим словом.
+    """
+    if not addr:
+        return None
+    x = (addr or "").strip()
+    part = x.split(",")[0].strip()
+    if not part:
+        return None
+    return part
     """Extract first valid RU phone subsequence from mixed text and normalize to +7XXXXXXXXXX.
     Rules:
     - If the first collected digit is '7' or '8' → take exactly 11 digits.
@@ -662,6 +684,23 @@ def format_money(amount: Decimal) -> str:
 
 
 def _withdrawal_filter_sql(alias: str = "e") -> str:
+async def get_cash_balance_excluding_withdrawals(conn) -> Decimal:
+    """
+    Остаток кассы: приход - расход, где изъятия [WDR] НЕ считаются расходом.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN kind='income' THEN amount ELSE 0 END),0) AS income_sum,
+          COALESCE(SUM(CASE WHEN kind='expense'
+                             AND NOT (comment ILIKE '[WDR]%' OR (method='Наличные' AND order_id IS NULL AND master_id IS NOT NULL))
+                            THEN amount ELSE 0 END),0) AS expense_sum
+        FROM cashbook_entries
+        """
+    )
+    inc = Decimal(row["income_sum"] or 0)
+    exp = Decimal(row["expense_sum"] or 0)
+    return inc - exp
     """SQL-предикат для строк-изъятий из наличных мастера (не расходы компании)."""
     return (
         f"({alias}.kind='expense' AND {alias}.method='Наличные' "
@@ -800,6 +839,15 @@ async def _record_income(conn: asyncpg.Connection, method: str, amount: Decimal,
         """,
         norm, amount, comment or "Приход",
     )
+    # notify money-flow chat
+    try:
+        if MONEY_FLOW_CHAT_ID:
+            balance = await get_cash_balance_excluding_withdrawals(conn)
+            line1 = f"✅-{format_money(Decimal(amount))}₽ {(comment or '').strip() or 'Приход'}"
+            line2 = f"Касса - {format_money(balance)}₽"
+            await bot.send_message(MONEY_FLOW_CHAT_ID, line1 + "\n" + line2)
+    except Exception as _e:
+        logging.warning("money-flow income notify failed: %s", _e)
     return tx
 
 
@@ -812,6 +860,15 @@ async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: st
         """,
         method, amount, comment or "Расход",
     )
+    # notify money-flow chat
+    try:
+        if MONEY_FLOW_CHAT_ID:
+            balance = await get_cash_balance_excluding_withdrawals(conn)
+            line1 = f"❎-{format_money(Decimal(amount))}₽ {(comment or '').strip() or 'Расход'}"
+            line2 = f"Касса - {format_money(balance)}₽"
+            await bot.send_message(MONEY_FLOW_CHAT_ID, line1 + "\n" + line2)
+    except Exception as _e:
+        logging.warning("money-flow expense notify failed: %s", _e)
     return tx
 
 
@@ -1448,6 +1505,18 @@ async def withdraw_confirm_handler(query: CallbackQuery, state: FSMContext):
             ]),
             reply_markup=admin_root_kb(),
         )
+        # notify orders-confirm chat (З/П = «Заказы подтверждения»)
+        try:
+            if ORDERS_CONFIRM_CHAT_ID:
+                lines = [
+                    "Изъятие наличных:",
+                    f"{master_name}",
+                    f"Сумма {amount_str}₽",
+                    f"Осталось на руках {avail_str}₽",
+                ]
+                await bot.send_message(ORDERS_CONFIRM_CHAT_ID, "\n".join(lines))
+        except Exception as _e:
+            logging.warning("withdrawal notify failed: %s", _e)
         return
 
     else:
