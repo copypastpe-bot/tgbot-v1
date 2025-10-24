@@ -231,35 +231,19 @@ def only_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
 
 def normalize_phone_for_db(s: str) -> str:
-def mask_phone_last4(phone: str | None) -> str:
-    d = re.sub(r"[^0-9]", "", phone or "")
-    if len(d) >= 4:
-        return f"…{d[-4:]}"
-    return "…"
-
-def extract_street(addr: str | None) -> str | None:
     """
-    Возвращает только название улицы из адреса, если удаётся.
-    Простая эвристика: берем фрагмент до первой запятой; если есть 'ул'/'улица', оставляем вместе с этим словом.
-    """
-    if not addr:
-        return None
-    x = (addr or "").strip()
-    part = x.split(",")[0].strip()
-    if not part:
-        return None
-    return part
-    """Extract first valid RU phone subsequence from mixed text and normalize to +7XXXXXXXXXX.
+    Extract first valid RU phone subsequence from mixed text and normalize to +7XXXXXXXXXX.
     Rules:
     - If the first collected digit is '7' or '8' → take exactly 11 digits.
     - If it's '9' → take exactly 10 digits.
     - Stop as soon as enough digits are collected; ignore everything after.
     - Return +7XXXXXXXXXX for 8XXXXXXXXXX/7XXXXXXXXXX/9XXXXXXXXX.
+    If nothing is detected, fall back to best-effort normalization of all digits.
     """
     if not s:
         return s
-    first = None
-    buf = []
+    first: str | None = None
+    buf: list[str] = []
     for ch in s:
         if ch.isdigit():
             if first is None:
@@ -273,16 +257,15 @@ def extract_street(addr: str | None) -> str | None:
                 break
             if first == '9' and len(buf) == 10:
                 break
-    if not buf:
-        return s
-    d = ''.join(buf)
-    if len(d) == 10 and d.startswith('9'):
-        return '+7' + d
-    if len(d) == 11 and d.startswith('8'):
-        return '+7' + d[1:]
-    if len(d) == 11 and d.startswith('7'):
-        return '+' + d
-    # fallback to previous behavior if nothing matched cleanly
+    if buf:
+        d = ''.join(buf)
+        if len(d) == 10 and d.startswith('9'):
+            return '+7' + d
+        if len(d) == 11 and d.startswith('8'):
+            return '+7' + d[1:]
+        if len(d) == 11 and d.startswith('7'):
+            return '+' + d
+    # Fallback: use all digits we can find
     digits_all = re.sub(r"[^0-9]", "", s)
     if len(digits_all) == 10 and digits_all.startswith('9'):
         return '+7' + digits_all
@@ -294,11 +277,29 @@ def extract_street(addr: str | None) -> str | None:
         return '+' + digits_all
     return s
 
-# Имя выглядит «плохим», если похоже на пропущенный звонок/метку или содержит телефон
+def mask_phone_last4(phone: str | None) -> str:
+    d = re.sub(r"[^0-9]", "", phone or "")
+    if len(d) >= 4:
+        return f"…{d[-4:]}"
+    return "…"
+
+def extract_street(addr: str | None) -> str | None:
+    """
+    Возвращает только название улицы из адреса, если удаётся.
+    Простая эвристика: берем фрагмент до первой запятой.
+    """
+    if not addr:
+        return None
+    x = (addr or "").strip()
+    part = x.split(",")[0].strip()
+    if not part:
+        return None
+    return part
+
 BAD_NAME_PATTERNS = [
     r"^пропущенный\b",      # Пропущенный ...
-    r"\bгугл\s*карты\b",  # (.. Гугл Карты)
-    r"\bgoogle\s*maps\b", # на случай англ. подписи
+    r"\bгугл\s*карты\b",    # (.. Гугл Карты)
+    r"\bgoogle\s*maps\b",   # на случай англ. подписи
     r"\d{10,11}",           # длинная числовая последовательность (похожая на телефон)
 ]
 
@@ -700,6 +701,13 @@ def format_money(amount: Decimal) -> str:
 
 
 def _withdrawal_filter_sql(alias: str = "e") -> str:
+    """SQL-предикат для строк-изъятий из наличных мастера (не расходы компании)."""
+    return (
+        f"({alias}.kind='expense' AND {alias}.method='Наличные' "
+        f"AND {alias}.order_id IS NULL AND {alias}.master_id IS NOT NULL "
+        f"AND ({alias}.comment ILIKE '[WDR]%' OR {alias}.comment ILIKE 'изъят%'))"
+    )
+
 async def get_cash_balance_excluding_withdrawals(conn) -> Decimal:
     """
     Остаток кассы: приход - расход, где изъятия [WDR] НЕ считаются расходом.
@@ -717,12 +725,6 @@ async def get_cash_balance_excluding_withdrawals(conn) -> Decimal:
     inc = Decimal(row["income_sum"] or 0)
     exp = Decimal(row["expense_sum"] or 0)
     return inc - exp
-    """SQL-предикат для строк-изъятий из наличных мастера (не расходы компании)."""
-    return (
-        f"({alias}.kind='expense' AND {alias}.method='Наличные' "
-        f"AND {alias}.order_id IS NULL AND {alias}.master_id IS NOT NULL "
-        f"AND ({alias}.comment ILIKE '[WDR]%' OR {alias}.comment ILIKE 'изъят%'))"
-    )
 
 
 async def build_masters_kb(conn) -> ReplyKeyboardMarkup | None:
