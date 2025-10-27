@@ -890,6 +890,34 @@ async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: st
     return tx
 
 
+# Записать приход по конкретному заказу с привязкой к мастеру.
+# ВАЖНО: обязательно передаём order_id и master_id, чтобы корректно считались наличные «на руках».
+async def _record_order_income(conn: asyncpg.Connection, method: str, amount: Decimal, order_id: int, master_id: int):
+    """
+    Записать приход по конкретному заказу с привязкой к мастеру.
+    ВАЖНО: обязательно передаём order_id и master_id, чтобы корректно считались наличные «на руках».
+    """
+    norm = norm_pay_method_py(method)
+    tx = await conn.fetchrow(
+        """
+        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+        VALUES ('income', $1, $2, $3, $4, $5, now())
+        RETURNING id, happened_at
+        """,
+        norm, amount, f"Поступление по заказу #{order_id}", order_id, master_id
+    )
+    # notify money-flow chat
+    try:
+        if MONEY_FLOW_CHAT_ID:
+            balance = await get_cash_balance_excluding_withdrawals(conn)
+            line1 = f"✅-{format_money(Decimal(amount))}₽ Поступление по заказу #{order_id}"
+            line2 = f"Касса - {format_money(balance)}₽"
+            await bot.send_message(MONEY_FLOW_CHAT_ID, line1 + "\n" + line2)
+    except Exception as _e:
+        logging.warning("money-flow order income notify failed: %s", _e)
+    return tx
+
+
 async def _record_withdrawal(conn: asyncpg.Connection, master_id: int, amount: Decimal, comment: str = "Изъятие"):
     # Изъятие — внутреннее перемещение: уменьшает наличные у мастера, но не влияет на прибыль.
     # Храним в общей таблице cashbook_entries, помечаем [WDR], чтобы исключить из P&L-отчётов.
