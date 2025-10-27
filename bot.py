@@ -4246,11 +4246,12 @@ async def commit_order(msg: Message, state: FSMContext):
                 "VALUES ($1, "
                 "       (SELECT id FROM staff WHERE tg_user_id=$2 AND is_active LIMIT 1), "
                 "       regexp_replace($3,'[^0-9]+','','g'), $4, $5, $6, $7, $8, $9) "
-                "RETURNING id",
+                "RETURNING id, master_id",
                 client_id, msg.from_user.id, phone_in, amount_total, cash_payment, upsell,
                 bonus_spent, bonus_earned, payment_method
             )
             order_id = order["id"]
+            master_db_id = order["master_id"]
 
             await conn.execute(
                 "INSERT INTO staff(tg_user_id, role, is_active) "
@@ -4275,6 +4276,14 @@ async def commit_order(msg: Message, state: FSMContext):
                 "        jsonb_build_object('cash_payment', to_jsonb(($7)::numeric), 'rules', '1000/3000 + 150 + 500/3000'))",
                 order_id, msg.from_user.id, base_pay, fuel_pay, upsell_pay, total_pay, cash_payment
             )
+            if master_db_id is None:
+                master_db_id = await conn.fetchval(
+                    "SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
+                    msg.from_user.id,
+                )
+            if master_db_id is None:
+                raise RuntimeError("Не удалось определить master_id для записи кассы.")
+            await _record_order_income(conn, payment_method, cash_payment, order_id, int(master_db_id))
         try:
             await post_order_bonus_delta(conn, order_id)
         except Exception as e:  # noqa: BLE001
