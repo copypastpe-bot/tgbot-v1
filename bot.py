@@ -898,13 +898,28 @@ async def _record_order_income(conn: asyncpg.Connection, method: str, amount: De
     ВАЖНО: обязательно передаём order_id и master_id, чтобы корректно считались наличные «на руках».
     """
     norm = norm_pay_method_py(method)
+    return await _record_order_income(conn, method, amount, order_id, master_id)
+
+
+async def _record_order_income(
+    conn: asyncpg.Connection,
+    method: str,
+    amount: Decimal,
+    order_id: int,
+    master_id: int,
+):
+    norm = norm_pay_method_py(method)
     tx = await conn.fetchrow(
         """
         INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
         VALUES ('income', $1, $2, $3, $4, $5, now())
         RETURNING id, happened_at
         """,
-        norm, amount, f"Поступление по заказу #{order_id}", order_id, master_id
+        norm,
+        amount,
+        f"Поступление по заказу #{order_id}",
+        order_id,
+        master_id,
     )
     # notify money-flow chat
     try:
