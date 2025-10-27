@@ -4367,6 +4367,7 @@ async def commit_order(msg: Message, state: FSMContext):
                 f"Бонусами {bonus_spent} | Итого: {format_money(amount_total)}₽"
             )
             lines.append(pay_line)
+            lines.append(f"Доп. продажа: {format_money(upsell)}₽")
             lines.append(f"Бонусов начислено {bonus_earned}")
             lines.append(f"Мастер: {master_display_name}")
             await bot.send_message(ORDERS_CONFIRM_CHAT_ID, "\n".join(lines))
