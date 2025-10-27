@@ -1269,10 +1269,6 @@ async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
     cash_on_hand = «Наличных у мастера»
     withdrawn_total = «Изъято у мастера»
     """
-    try:
-        await backfill_cash_incomes_from_orders(conn)
-    except Exception as e:  # noqa: BLE001
-        logging.warning("backfill cash incomes in wallet skipped: %s", e)
     cash_on_orders = await get_master_cash_on_orders(conn, master_id)
     withdrawn = await conn.fetchval(
         """
@@ -2591,7 +2587,7 @@ async def payments_report(msg: Message, state: FSMContext):
 
 @dp.message(Command("orders"))
 async def orders_report(msg: Message):
-    if not await has_permission(msg.from_user.id, "view_orders_report"):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
         return await msg.answer("Только для администраторов.")
 
     # Форматы:
@@ -3476,8 +3472,6 @@ async def wipe_test_data(msg: Message):
     await msg.answer("Тестовые данные удалены. RBAC-таблицы сохранены.")
 
 # ===== Admin: UPLOAD CSV TO clients_raw =====
-from aiogram.types import ContentType, FSInputFile
-from aiogram import types
 
 
 class UploadFSM(StatesGroup):
