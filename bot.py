@@ -4362,11 +4362,12 @@ async def commit_order(msg: Message, state: FSMContext):
             ]
             if client_address_val:
                 lines.append(f"Адрес: {client_address_val}")
-            lines.append(f"Оплата: {payment_method} | Наличными {format_money(cash_payment)}₽ | Итого {format_money(amount_total)}₽")
-            if bonus_spent or bonus_earned:
-                lines.append(f"Бонусы: списано {bonus_spent}, начислить {bonus_earned}")
-            if upsell > 0:
-                lines.append(f"Upsell: {format_money(upsell)}₽")
+            pay_line = (
+                f"Оплата: {payment_method} {format_money(cash_payment)}₽ | "
+                f"Бонусами {bonus_spent} | Итого: {format_money(amount_total)}₽"
+            )
+            lines.append(pay_line)
+            lines.append(f"Бонусов начислено {bonus_earned}")
             lines.append(f"Мастер: {master_display_name}")
             await bot.send_message(ORDERS_CONFIRM_CHAT_ID, "\n".join(lines))
         except Exception as e:  # noqa: BLE001
