@@ -890,23 +890,13 @@ async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: st
     return tx
 
 
-# Записать приход по конкретному заказу с привязкой к мастеру.
-# ВАЖНО: обязательно передаём order_id и master_id, чтобы корректно считались наличные «на руках».
-async def _record_order_income(conn: asyncpg.Connection, method: str, amount: Decimal, order_id: int, master_id: int):
-    """
-    Записать приход по конкретному заказу с привязкой к мастеру.
-    ВАЖНО: обязательно передаём order_id и master_id, чтобы корректно считались наличные «на руках».
-    """
-    norm = norm_pay_method_py(method)
-    return await _record_order_income(conn, method, amount, order_id, master_id)
-
-
 async def _record_order_income(
     conn: asyncpg.Connection,
     method: str,
     amount: Decimal,
     order_id: int,
     master_id: int,
+    notify_label: str | None = None,
 ):
     norm = norm_pay_method_py(method)
     comment = f"Поступление по заказу #{order_id}"
@@ -954,7 +944,11 @@ async def _record_order_income(
     try:
         if MONEY_FLOW_CHAT_ID:
             balance = await get_cash_balance_excluding_withdrawals(conn)
-            line1 = f"✅-{format_money(Decimal(amount))}₽ Поступление по заказу #{order_id}"
+            if notify_label:
+                display = f"{notify_label} / Заказ №{order_id}"
+            else:
+                display = comment
+            line1 = f"✅-{format_money(Decimal(amount))}₽ {display}"
             line2 = f"Касса - {format_money(balance)}₽"
             await bot.send_message(MONEY_FLOW_CHAT_ID, line1 + "\n" + line2)
     except Exception as _e:
@@ -4255,6 +4249,16 @@ async def commit_order(msg: Message, state: FSMContext):
     name = data.get("client_name")
     new_bday = data.get("new_birthday")  # date|None
 
+    order_id: int | None = None
+    master_display_name: str | None = None
+    master_db_id: int | None = None
+    client_full_name_val: str | None = None
+    client_phone_val: str | None = phone_in
+    client_address_val: str | None = None
+    client_display_masked: str | None = None
+    notify_label: str | None = None
+    street_label: str | None = None
+
     async with pool.acquire() as conn:
         async with conn.transaction():
             client = await conn.fetchrow(
@@ -4264,10 +4268,13 @@ async def commit_order(msg: Message, state: FSMContext):
                 "  full_name = COALESCE(EXCLUDED.full_name, clients.full_name), "
                 "  birthday  = COALESCE(EXCLUDED.birthday, clients.birthday), "
                 "  status='client' "
-                "RETURNING id, bonus_balance",
+                "RETURNING id, bonus_balance, full_name, phone, address",
                 name, phone_in, new_bday
             )
             client_id = client["id"]
+            client_full_name_val = (client["full_name"] or name or "").strip() or None
+            client_phone_val = client["phone"] or phone_in
+            client_address_val = client.get("address")
 
             order = await conn.fetchrow(
                 "INSERT INTO orders (client_id, master_id, phone_digits, amount_total, amount_cash, amount_upsell, "
@@ -4288,6 +4295,27 @@ async def commit_order(msg: Message, state: FSMContext):
                 msg.from_user.id
             )
 
+            if master_db_id is None:
+                master_db_id = await conn.fetchval(
+                    "SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
+                    msg.from_user.id,
+                )
+                if master_db_id is not None:
+                    await conn.execute(
+                        "UPDATE orders SET master_id=$1 WHERE id=$2",
+                        master_db_id,
+                        order_id,
+                    )
+
+            if master_db_id is not None:
+                master_row = await conn.fetchrow(
+                    "SELECT COALESCE(first_name,'') AS first_name, COALESCE(last_name,'') AS last_name "
+                    "FROM staff WHERE id=$1",
+                    master_db_id,
+                )
+                if master_row:
+                    master_display_name = f"{master_row['first_name']} {master_row['last_name']}".strip() or None
+
             if bonus_spent > 0:
                 await conn.execute(
                     "INSERT INTO bonus_transactions (client_id, delta, reason, order_id) VALUES ($1, $2, 'spend', $3)",
@@ -4305,18 +4333,44 @@ async def commit_order(msg: Message, state: FSMContext):
                 "        jsonb_build_object('cash_payment', to_jsonb(($7)::numeric), 'rules', '1000/3000 + 150 + 500/3000'))",
                 order_id, msg.from_user.id, base_pay, fuel_pay, upsell_pay, total_pay, cash_payment
             )
-            if master_db_id is None:
-                master_db_id = await conn.fetchval(
-                    "SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
-                    msg.from_user.id,
-                )
+
+            street_label = extract_street(client_address_val)
+            base_name_for_label = (client_full_name_val or name or "Клиент").strip() or "Клиент"
+            masked_phone = mask_phone_last4(client_phone_val)
+            client_display_masked = f"{base_name_for_label} {masked_phone}".strip()
+            if street_label:
+                notify_label = street_label
+            else:
+                notify_label = client_display_masked
+
             if master_db_id is None:
                 raise RuntimeError("Не удалось определить master_id для записи кассы.")
-            await _record_order_income(conn, payment_method, cash_payment, order_id, int(master_db_id))
+            await _record_order_income(conn, payment_method, cash_payment, order_id, int(master_db_id), notify_label)
         try:
             await post_order_bonus_delta(conn, order_id)
         except Exception as e:  # noqa: BLE001
             logging.warning("post_order_bonus_delta failed for order_id=%s: %s", order_id, e)
+
+    master_display_name = master_display_name or (msg.from_user.full_name or msg.from_user.username or f"tg:{msg.from_user.id}")
+    client_display_masked = client_display_masked or f"{(name or 'Клиент').strip() or 'Клиент'} {mask_phone_last4(client_phone_val)}".strip()
+
+    if ORDERS_CONFIRM_CHAT_ID:
+        try:
+            lines = [
+                f"🧾 Заказ №{order_id}",
+                f"Клиент: {client_display_masked}",
+            ]
+            if client_address_val:
+                lines.append(f"Адрес: {client_address_val}")
+            lines.append(f"Оплата: {payment_method} | Наличными {format_money(cash_payment)}₽ | Итого {format_money(amount_total)}₽")
+            if bonus_spent or bonus_earned:
+                lines.append(f"Бонусы: списано {bonus_spent}, начислить {bonus_earned}")
+            if upsell > 0:
+                lines.append(f"Upsell: {format_money(upsell)}₽")
+            lines.append(f"Мастер: {master_display_name}")
+            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, "\n".join(lines))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("order confirm notify failed for order_id=%s: %s", order_id, e)
 
     await state.clear()
     await msg.answer("Готово ✅ Заказ сохранён.\nСпасибо!", reply_markup=master_kb)
