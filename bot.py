@@ -1026,8 +1026,17 @@ async def list_masters(msg: Message):
         return await msg.answer("Только для администраторов.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT s.id, s.tg_user_id, COALESCE(s.first_name,'') AS fn, COALESCE(s.last_name,'') AS ln, COALESCE(s.phone,'') AS phone "
-            "FROM staff s WHERE role='master' AND is_active=true ORDER BY fn, ln, id"
+            """
+            SELECT s.id,
+                   s.tg_user_id,
+                   COALESCE(s.first_name, '') AS fn,
+                   COALESCE(s.last_name, '')  AS ln,
+                   COALESCE(s.phone, '')      AS phone
+            FROM staff s
+            WHERE s.role = 'master'
+              AND s.is_active = true
+            ORDER BY fn, ln, id
+            """
         )
     if not rows:
         return await msg.answer("Активных мастеров нет.")
