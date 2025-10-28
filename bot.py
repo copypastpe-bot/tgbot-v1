@@ -752,11 +752,11 @@ async def build_masters_kb(conn) -> ReplyKeyboardMarkup | None:
         available = cash_on_orders - withdrawn_total
         if available < Decimal(0):
             available = Decimal(0)
-        display_name = f"{r['fn']} {r['ln']}".strip() or f"Мастер {r['id']}"
-        surname = (r["ln"] or "").strip()
-        label_base = surname or display_name
+        display_name = f"{r['fn']} {r['ln']}".strip()
+        if not display_name:
+            display_name = f"Мастер #{r['id']}"
         amount_str = format_money(available)
-        label = f"{label_base} #{r['id']} {amount_str}₽"
+        label = f"{display_name} — {amount_str}₽"
         if len(label) > 62:
             label = label[:59] + "…"
         rows.append([KeyboardButton(text=label)])
