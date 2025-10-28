@@ -8,6 +8,7 @@ from aiogram.types import (
     CallbackQuery,
     BotCommand,
     BotCommandScopeDefault,
+    BotCommandScopeChat,
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
@@ -1002,13 +1003,36 @@ async def set_commands():
     cmds = [
         BotCommand(command="start", description="Старт"),
         BotCommand(command="help",  description="Помощь"),
-        BotCommand(command="order", description="Добавить заказ (мастер-меню)"),
-        BotCommand(command="daily_cash", description="Касса за сегодня"),
-        BotCommand(command="daily_profit", description="Прибыль за сегодня"),
-        BotCommand(command="daily_orders", description="Заказы за сегодня"),
-        BotCommand(command="my_daily", description="Моя сводка за сегодня"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
+
+
+async def set_chat_commands(chat_id: int, role: str | None):
+    if role in ("admin", "superadmin"):
+        cmds = [
+            BotCommand(command="start", description="Старт"),
+            BotCommand(command="help",  description="Помощь"),
+            BotCommand(command="order", description="Добавить заказ"),
+            BotCommand(command="daily_cash", description="Касса за сегодня"),
+            BotCommand(command="daily_profit", description="Прибыль за сегодня"),
+            BotCommand(command="daily_orders", description="Заказы за сегодня"),
+            BotCommand(command="tx_last", description="Последние транзакции"),
+        ]
+    elif role == "master":
+        cmds = [
+            BotCommand(command="start", description="Старт"),
+            BotCommand(command="help",  description="Помощь"),
+            BotCommand(command="order", description="Добавить заказ"),
+            BotCommand(command="myincome", description="Мои оплаты за сегодня"),
+            BotCommand(command="mysalary", description="Моя зарплата"),
+            BotCommand(command="my_daily", description="Моя сводка за сегодня"),
+        ]
+    else:
+        cmds = [
+            BotCommand(command="start", description="Старт"),
+            BotCommand(command="help",  description="Помощь"),
+        ]
+    await bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id))
 
 # ===== Admin commands (must be defined after dp is created) =====
 @dp.message(Command("list_masters"))
@@ -1819,6 +1843,7 @@ async def help_cmd(msg: Message):
             msg.from_user.id,
         )
     role = rec["role"] if rec else None
+    await set_chat_commands(msg.chat.id, role)
 
     if role in ("admin", "superadmin"):
         text = (
@@ -4173,6 +4198,7 @@ async def start_handler(msg: Message, state: FSMContext):
     global pool
     async with pool.acquire() as conn:
         role = await get_user_role(conn, msg.from_user.id)
+    await set_chat_commands(msg.chat.id, role)
 
     if role in ("admin", "superadmin"):
         await admin_menu_start(msg, state)
