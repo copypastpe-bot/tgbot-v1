@@ -1285,18 +1285,27 @@ async def admin_masters_list(msg: Message, state: FSMContext):
         return await msg.answer("Только для администраторов.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT s.id, s.tg_user_id, s.role, s.is_active, COALESCE(s.first_name,'') AS fn, COALESCE(s.last_name,'') AS ln "
-            "FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id"
+            """
+            SELECT s.id,
+                   s.tg_user_id,
+                   COALESCE(s.first_name,'') AS fn,
+                   COALESCE(s.last_name,'')  AS ln,
+                   COALESCE(s.phone,'')      AS phone
+            FROM staff s
+            WHERE s.role = 'master'
+              AND s.is_active = true
+            ORDER BY fn, ln, id
+            """
         )
     if not rows:
-        await msg.answer("Список пуст.", reply_markup=admin_root_kb())
-    else:
-        lines = [
-            f"#{r['id']} {r['role']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} {'✅' if r['is_active'] else '⛔️'}"
-            for r in rows
-        ]
-        await msg.answer("Мастера/админы:\n" + "\n".join(lines), reply_markup=admin_root_kb())
-    await state.set_state(AdminMenuFSM.root)
+        await msg.answer("Активных мастеров нет.", reply_markup=admin_masters_kb())
+        return
+
+    lines = [
+        f"#{r['id']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} | {r['phone'] or 'без телефона'}"
+        for r in rows
+    ]
+    await msg.answer("Активные мастера:\n" + "\n".join(lines), reply_markup=admin_masters_kb())
 
 
 @dp.message(AdminMenuFSM.masters, F.text == "Добавить мастера")
