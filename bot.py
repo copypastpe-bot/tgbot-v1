@@ -497,6 +497,13 @@ def admin_cancel_kb() -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
+def admin_masters_remove_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
 
 def client_edit_fields_kb() -> ReplyKeyboardMarkup:
     rows = [
@@ -1008,6 +1015,7 @@ async def set_commands():
         BotCommand(command="daily_profit", description="Прибыль за сегодня"),
         BotCommand(command="daily_orders", description="Заказы за сегодня"),
         BotCommand(command="my_daily", description="Моя сводка за сегодня"),
+        BotCommand(command="masters_all", description="Полный список мастеров"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -1018,13 +1026,45 @@ async def list_masters(msg: Message):
         return await msg.answer("Только для администраторов.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT s.id, s.tg_user_id, s.role, s.is_active, COALESCE(s.first_name,'') AS fn, COALESCE(s.last_name,'') AS ln "
-            "FROM staff s WHERE role IN ('master','admin') ORDER BY role DESC, id"
+            "SELECT s.id, s.tg_user_id, COALESCE(s.first_name,'') AS fn, COALESCE(s.last_name,'') AS ln, COALESCE(s.phone,'') AS phone "
+            "FROM staff s WHERE role='master' AND is_active=true ORDER BY fn, ln, id"
         )
     if not rows:
-        return await msg.answer("Список пуст.")
-    lines = [f"#{r['id']} {r['role']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} {'✅' if r['is_active'] else '⛔️'}" for r in rows]
-    await msg.answer("Мастера/админы:\n" + "\n".join(lines))
+        return await msg.answer("Активных мастеров нет.")
+    lines = [
+        f"#{r['id']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} | {r['phone'] or 'без телефона'}"
+        for r in rows
+    ]
+    await msg.answer("Активные мастера:\n" + "\n".join(lines))
+
+
+@dp.message(Command("masters_all"))
+async def masters_all(msg: Message):
+    if not await has_permission(msg.from_user.id, "add_master"):
+        return await msg.answer("Только для администраторов.")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, tg_user_id, is_active, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln, COALESCE(phone,'') AS phone "
+            "FROM staff WHERE role='master' ORDER BY is_active DESC, fn, ln, id"
+        )
+    if not rows:
+        return await msg.answer("В базе мастеров не найдено.")
+    active = [r for r in rows if r["is_active"]]
+    inactive = [r for r in rows if not r["is_active"]]
+
+    def fmt(r):
+        return f"#{r['id']} {r['fn']} {r['ln']} | tg={r['tg_user_id']} | {r['phone'] or 'без телефона'}"
+
+    parts: list[str] = []
+    if active:
+        parts.append("Активные:")
+        parts.extend(fmt(r) for r in active)
+    if inactive:
+        if active:
+            parts.append("")
+        parts.append("Неактивные:")
+        parts.extend(fmt(r) for r in inactive)
+    await msg.answer("\n".join(parts))
 
 @dp.message(Command("add_master"))
 async def add_master(msg: Message, state: FSMContext):
@@ -1264,7 +1304,7 @@ async def admin_masters_remove_start(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "add_master"):
         return await msg.answer("Только для администраторов.")
     await state.set_state(AdminMastersFSM.remove_wait_phone)
-    await msg.answer("Введите телефон мастера (8/+7/9...):")
+    await msg.answer("Введите телефон мастера (8/+7/9...) или нажмите «Назад».", reply_markup=admin_masters_remove_kb())
 
 
 @dp.message(AdminMastersFSM.remove_wait_phone)
@@ -1273,9 +1313,17 @@ async def admin_masters_remove_phone(msg: Message, state: FSMContext):
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
         return await msg.answer("Только для администраторов.", reply_markup=admin_root_kb())
+    text = (msg.text or "").strip().lower()
+    if text == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    if text == "назад":
+        await state.set_state(AdminMenuFSM.masters)
+        return await msg.answer("Раздел «Мастера»:", reply_markup=admin_masters_kb())
     phone = normalize_phone_for_db(msg.text)
     if not phone or not phone.startswith("+7"):
-        return await msg.answer("Неверный телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.")
+        return await msg.answer("Неверный телефон. Пример: +7XXXXXXXXXX. Введите ещё раз.", reply_markup=admin_masters_remove_kb())
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
             "SELECT id FROM staff WHERE phone=$1 AND role='master' LIMIT 1",
@@ -1841,6 +1889,8 @@ async def help_cmd(msg: Message):
             "/daily_profit — сводка по прибыли за сегодня и всё время\n"
             "\n"
             "/daily_orders — сводка по заказам мастеров за сегодня\n"
+            "\n"
+            "/masters_all — полный список мастеров\n"
             "\n"
             "/order — открыть добавление заказа (клавиатура мастера)\n"
         )
