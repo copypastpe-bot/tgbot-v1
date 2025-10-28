@@ -1003,6 +1003,10 @@ async def set_commands():
         BotCommand(command="start", description="Старт"),
         BotCommand(command="help",  description="Помощь"),
         BotCommand(command="order", description="Добавить заказ (мастер-меню)"),
+        BotCommand(command="daily_cash", description="Касса за сегодня"),
+        BotCommand(command="daily_profit", description="Прибыль за сегодня"),
+        BotCommand(command="daily_orders", description="Заказы за сегодня"),
+        BotCommand(command="my_daily", description="Моя сводка за сегодня"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -1831,12 +1835,24 @@ async def help_cmd(msg: Message):
             "\n"
             "/payments day — приход по типам оплаты за день\n"
             "\n"
+            "/daily_cash — сводка по кассе за сегодня\n"
+            "\n"
+            "/daily_profit — сводка по прибыли за сегодня и всё время\n"
+            "\n"
+            "/daily_orders — сводка по заказам мастеров за сегодня\n"
+            "\n"
             "/order — открыть добавление заказа (клавиатура мастера)\n"
         )
     else:
         text = (
             "Команды мастера:\n"
             "/whoami — кто я, мои права\n"
+            "\n"
+            "/mysalary [period] — моя зарплата (day/week/month/year)\n"
+            "\n"
+            "/myincome — мои оплаты за сегодня по типам\n"
+            "\n"
+            "/my_daily — ежедневная сводка (заказы, оплаты, ЗП, наличка)\n"
             "\n"
             "Для оформления заказа используйте кнопки внизу."
         )
@@ -2380,6 +2396,250 @@ def _report_period_bounds(period: str) -> tuple[str, str, str] | None:
     return mapping.get(period)
 
 
+def _format_payment_summary(method_totals: dict[str, Decimal]) -> str:
+    """
+    Собрать строку с разбивкой по типам оплат. Показываем только ненулевые значения.
+    """
+    if not method_totals:
+        return "нет данных"
+    ordered = list(PAYMENT_METHODS) + [GIFT_CERT_LABEL]
+    seen = set()
+    parts: list[str] = []
+    for label in ordered:
+        value = method_totals.get(label)
+        if value and value != Decimal(0):
+            parts.append(f"{label}: {format_money(value)}₽")
+            seen.add(label)
+    for label in sorted(method_totals.keys()):
+        if label in seen:
+            continue
+        value = method_totals[label]
+        if value and value != Decimal(0):
+            parts.append(f"{label}: {format_money(Decimal(value))}₽")
+    return "; ".join(parts) if parts else "нет данных"
+
+
+async def build_daily_cash_summary_text() -> str:
+    start_sql = "date_trunc('day', NOW())"
+    end_sql = "date_trunc('day', NOW()) + interval '1 day'"
+    async with pool.acquire() as conn:
+        totals = await conn.fetchrow(
+            f"""
+            SELECT
+              COALESCE(SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END),0)::numeric(12,2) AS income,
+              COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
+            FROM cashbook_entries c
+            WHERE c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+            """
+        )
+        pay_rows = await conn.fetch(
+            f"""
+            SELECT COALESCE(method,'прочее') AS method,
+                   COALESCE(SUM(amount),0)::numeric(12,2) AS total
+            FROM cashbook_entries
+            WHERE kind='income'
+              AND happened_at >= {start_sql} AND happened_at < {end_sql}
+            GROUP BY 1
+            """
+        )
+        balance = await get_cash_balance_excluding_withdrawals(conn)
+
+    income = Decimal(totals["income"] or 0)
+    expense = Decimal(totals["expense"] or 0)
+    method_totals: dict[str, Decimal] = {}
+    for row in pay_rows:
+        method = row["method"] or "прочее"
+        method_totals[method] = Decimal(row["total"] or 0)
+    lines = [
+        "📊 Касса — за сегодня",
+        f"Приход: {format_money(income)}₽",
+        f"Расход: {format_money(expense)}₽",
+        f"Остаток: {format_money(balance)}₽",
+    ]
+    lines.append("Типы оплат: " + _format_payment_summary(method_totals))
+    return "\n".join(lines)
+
+
+async def build_profit_summary_text() -> str:
+    start_sql = "date_trunc('day', NOW())"
+    end_sql = "date_trunc('day', NOW()) + interval '1 day'"
+    async with pool.acquire() as conn:
+        revenue_day = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(o.amount_cash), 0)::numeric(12,2)
+            FROM orders o
+            WHERE o.created_at >= {start_sql} AND o.created_at < {end_sql}
+            """
+        )
+        expense_day = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(c.amount), 0)::numeric(12,2)
+            FROM cashbook_entries c
+            WHERE c.kind='expense'
+              AND NOT ({_withdrawal_filter_sql("c")})
+              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+            """
+        )
+        revenue_total = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount_cash), 0)::numeric(12,2) FROM orders"
+        )
+        expense_total = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(amount), 0)::numeric(12,2)
+            FROM cashbook_entries c
+            WHERE c.kind='expense'
+              AND NOT ({_withdrawal_filter_sql("c")})
+            """
+        )
+
+    revenue_day = Decimal(revenue_day or 0)
+    expense_day = Decimal(expense_day or 0)
+    revenue_total = Decimal(revenue_total or 0)
+    expense_total = Decimal(expense_total or 0)
+    profit_day = revenue_day - expense_day
+    profit_total = revenue_total - expense_total
+    return "\n".join([
+        "📈 Прибыль",
+        f"За сегодня: {format_money(profit_day)}₽ (выручка {format_money(revenue_day)}₽, расходы {format_money(expense_day)}₽)",
+        f"За всё время: {format_money(profit_total)}₽ (выручка {format_money(revenue_total)}₽, расходы {format_money(expense_total)}₽)",
+    ])
+
+
+async def build_daily_orders_admin_summary_text() -> str:
+    start_sql = "date_trunc('day', NOW())"
+    end_sql = "date_trunc('day', NOW()) + interval '1 day'"
+    async with pool.acquire() as conn:
+        masters = await conn.fetch(
+            "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+            "FROM staff WHERE role='master' AND is_active=true ORDER BY fn, ln, id"
+        )
+        if not masters:
+            return "Мастеров в активном статусе нет."
+
+        total_orders = 0
+        total_method_totals: dict[str, Decimal] = {}
+        total_on_hand = Decimal(0)
+        lines = ["📋 Заказы по мастерам — за сегодня"]
+
+        for m in masters:
+            stats = await conn.fetchrow(
+                f"""
+                SELECT
+                  COUNT(*) AS cnt,
+                  COALESCE(SUM(CASE WHEN payment_method='Наличные'              THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
+                  COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
+                  COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
+                  COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
+                  COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total
+                FROM orders o
+                WHERE o.master_id = $1
+                  AND o.created_at >= {start_sql}
+                  AND o.created_at <  {end_sql}
+                """,
+                m["id"],
+            )
+            method_totals = {
+                "Наличные": Decimal(stats["s_cash"] or 0),
+                "Карта Женя": Decimal(stats["s_card_jenya"] or 0),
+                "Карта Дима": Decimal(stats["s_card_dima"] or 0),
+                "р/с": Decimal(stats["s_rs"] or 0),
+                GIFT_CERT_LABEL: Decimal(stats["s_gift_total"] or 0),
+            }
+            total_orders += int(stats["cnt"] or 0)
+            for key, value in method_totals.items():
+                total_method_totals[key] = total_method_totals.get(key, Decimal(0)) + value
+
+            cash_on_orders, withdrawn_total = await get_master_wallet(conn, m["id"])
+            on_hand = cash_on_orders - withdrawn_total
+            if on_hand < Decimal(0):
+                on_hand = Decimal(0)
+            total_on_hand += on_hand
+
+            name = f"{m['fn']} {m['ln']}".strip() or f"Мастер #{m['id']}"
+            payments_text = _format_payment_summary(method_totals)
+            lines.append(f"- {name}: {stats['cnt'] or 0} заказ(ов); оплаты — {payments_text}; на руках {format_money(on_hand)}₽")
+
+        lines.append("")
+        lines.append(f"Всего заказов за день: {total_orders}")
+        lines.append("Оплаты всего: " + _format_payment_summary(total_method_totals))
+        lines.append(f"Наличными у мастеров: {format_money(total_on_hand)}₽")
+    return "\n".join(lines)
+
+
+async def build_master_daily_summary_text(user_id: int) -> str:
+    start_sql = "date_trunc('day', NOW())"
+    end_sql = "date_trunc('day', NOW()) + interval '1 day'"
+    async with pool.acquire() as conn:
+        master_row = await conn.fetchrow(
+            "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+            "FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
+            user_id,
+        )
+        if not master_row:
+            return "Вы не зарегистрированы как активный мастер."
+
+        master_id = master_row["id"]
+        stats = await conn.fetchrow(
+            f"""
+            SELECT
+              COUNT(*) AS cnt,
+              COALESCE(SUM(CASE WHEN payment_method='Наличные'              THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
+              COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
+              COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
+              COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
+              COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total,
+              COALESCE(SUM(o.amount_total),0)::numeric(12,2) AS total_amount
+            FROM orders o
+            WHERE o.master_id = $1
+              AND o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+            """,
+            master_id,
+        )
+        payroll = await conn.fetchrow(
+            f"""
+            SELECT
+              COALESCE(SUM(pi.base_pay),0)::numeric(12,2) AS base_pay,
+              COALESCE(SUM(pi.fuel_pay),0)::numeric(12,2) AS fuel_pay,
+              COALESCE(SUM(pi.upsell_pay),0)::numeric(12,2) AS upsell_pay,
+              COALESCE(SUM(pi.total_pay),0)::numeric(12,2) AS total_pay
+            FROM payroll_items pi
+            JOIN orders o ON o.id = pi.order_id
+            WHERE pi.master_id = $1
+              AND o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+            """,
+            master_id,
+        )
+        cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
+        on_hand = cash_on_orders - withdrawn_total
+        if on_hand < Decimal(0):
+            on_hand = Decimal(0)
+
+    method_totals = {
+        "Наличные": Decimal(stats["s_cash"] or 0),
+        "Карта Женя": Decimal(stats["s_card_jenya"] or 0),
+        "Карта Дима": Decimal(stats["s_card_dima"] or 0),
+        "р/с": Decimal(stats["s_rs"] or 0),
+        GIFT_CERT_LABEL: Decimal(stats["s_gift_total"] or 0),
+    }
+    total_pay = Decimal(payroll["total_pay"] or 0)
+    base_pay = Decimal(payroll["base_pay"] or 0)
+    fuel_pay = Decimal(payroll["fuel_pay"] or 0)
+    upsell_pay = Decimal(payroll["upsell_pay"] or 0)
+    name = f"{master_row['fn']} {master_row['ln']}".strip() or f"Мастер #{master_id}"
+
+    lines = [
+        f"🧾 Сводка за сегодня — {name}",
+        f"Заказов: {int(stats['cnt'] or 0)}",
+        f"Счёт на сумму: {format_money(Decimal(stats['total_amount'] or 0))}₽",
+        "Типы оплат: " + _format_payment_summary(method_totals),
+        f"ЗП: база {format_money(base_pay)}₽ + бензин {format_money(fuel_pay)}₽ + доп {format_money(upsell_pay)}₽ = {format_money(total_pay)}₽",
+        f"Наличных на руках: {format_money(on_hand)}₽",
+    ]
+    return "\n".join(lines)
+
+
 async def _resolve_master_id_from_state(data: dict) -> int | None:
     tg_val = data.get("report_master_tg") or data.get("master_tg")
     if tg_val is None:
@@ -2605,6 +2865,30 @@ async def payments_report(msg: Message, state: FSMContext):
         return await msg.answer("Типы оплат: выбери период.", reply_markup=reports_period_kb())
     period = parts[1].strip().lower()
     text = await get_payments_by_method_report_text(period)
+    await msg.answer(text)
+
+
+@dp.message(Command("daily_cash"))
+async def daily_cash_report(msg: Message):
+    if not await has_permission(msg.from_user.id, "view_cash_reports"):
+        return await msg.answer("Только для администраторов.")
+    text = await build_daily_cash_summary_text()
+    await msg.answer(text)
+
+
+@dp.message(Command("daily_profit"))
+async def daily_profit_report(msg: Message):
+    if not await has_permission(msg.from_user.id, "view_profit_reports"):
+        return await msg.answer("Только для администраторов.")
+    text = await build_profit_summary_text()
+    await msg.answer(text)
+
+
+@dp.message(Command("daily_orders"))
+async def daily_orders_report(msg: Message):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    text = await build_daily_orders_admin_summary_text()
     await msg.answer(text)
 
 
@@ -3801,6 +4085,15 @@ async def my_income(msg: Message):
         return await msg.answer("Нет данных за сегодня.")
     lines = [f"{row['method']}: {row['total']}₽" for row in rows]
     await msg.answer("Сегодняшний приход по типам оплаты:\n" + "\n".join(lines))
+
+
+@dp.message(Command("my_daily"))
+async def my_daily_report(msg: Message):
+    if not await ensure_master(msg.from_user.id):
+        return await msg.answer("Доступно только мастерам.")
+    text = await build_master_daily_summary_text(msg.from_user.id)
+    await msg.answer(text)
+
 
 MASTER_SALARY_LABEL = "💼 Зарплата"
 MASTER_INCOME_LABEL = "💰 Приход"
