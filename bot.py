@@ -1843,7 +1843,7 @@ async def help_cmd(msg: Message):
             "\n"
             "/order — открыть добавление заказа (клавиатура мастера)\n"
         )
-    else:
+    elif role == "master":
         text = (
             "Команды мастера:\n"
             "/whoami — кто я, мои права\n"
@@ -1855,6 +1855,13 @@ async def help_cmd(msg: Message):
             "/my_daily — ежедневная сводка (заказы, оплаты, ЗП, наличка)\n"
             "\n"
             "Для оформления заказа используйте кнопки внизу."
+        )
+    else:
+        text = (
+            "Доступные команды:\n"
+            "/whoami — кто я, мои права\n"
+            "\n"
+            "Если вы мастер или администратор и не видите нужные команды — обратитесь к менеджеру для выдачи прав."
         )
 
     await msg.answer(text)
@@ -2545,7 +2552,8 @@ async def build_daily_orders_admin_summary_text() -> str:
                 "р/с": Decimal(stats["s_rs"] or 0),
                 GIFT_CERT_LABEL: Decimal(stats["s_gift_total"] or 0),
             }
-            total_orders += int(stats["cnt"] or 0)
+            master_orders = int(stats["cnt"] or 0)
+            total_orders += master_orders
             for key, value in method_totals.items():
                 total_method_totals[key] = total_method_totals.get(key, Decimal(0)) + value
 
@@ -2556,8 +2564,11 @@ async def build_daily_orders_admin_summary_text() -> str:
             total_on_hand += on_hand
 
             name = f"{m['fn']} {m['ln']}".strip() or f"Мастер #{m['id']}"
-            payments_text = _format_payment_summary(method_totals)
-            lines.append(f"- {name}: {stats['cnt'] or 0} заказ(ов); оплаты — {payments_text}; на руках {format_money(on_hand)}₽")
+            if master_orders > 0:
+                payments_text = _format_payment_summary(method_totals)
+                lines.append(f"- {name}: {master_orders} заказ(ов); оплаты — {payments_text}; на руках {format_money(on_hand)}₽")
+            else:
+                lines.append(f"- {name}: на руках {format_money(on_hand)}₽")
 
         lines.append("")
         lines.append(f"Всего заказов за день: {total_orders}")
@@ -2611,6 +2622,18 @@ async def build_master_daily_summary_text(user_id: int) -> str:
             """,
             master_id,
         )
+        payroll_month = await conn.fetchrow(
+            """
+            SELECT
+              COALESCE(SUM(pi.total_pay),0)::numeric(12,2) AS total_pay
+            FROM payroll_items pi
+            JOIN orders o ON o.id = pi.order_id
+            WHERE pi.master_id = $1
+              AND o.created_at >= date_trunc('month', NOW())
+              AND o.created_at <  date_trunc('month', NOW()) + interval '1 month'
+            """,
+            master_id,
+        )
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
         on_hand = cash_on_orders - withdrawn_total
         if on_hand < Decimal(0):
@@ -2627,6 +2650,7 @@ async def build_master_daily_summary_text(user_id: int) -> str:
     base_pay = Decimal(payroll["base_pay"] or 0)
     fuel_pay = Decimal(payroll["fuel_pay"] or 0)
     upsell_pay = Decimal(payroll["upsell_pay"] or 0)
+    total_pay_month = Decimal(payroll_month["total_pay"] or 0)
     name = f"{master_row['fn']} {master_row['ln']}".strip() or f"Мастер #{master_id}"
 
     lines = [
@@ -2634,7 +2658,8 @@ async def build_master_daily_summary_text(user_id: int) -> str:
         f"Заказов: {int(stats['cnt'] or 0)}",
         f"Счёт на сумму: {format_money(Decimal(stats['total_amount'] or 0))}₽",
         "Типы оплат: " + _format_payment_summary(method_totals),
-        f"ЗП: база {format_money(base_pay)}₽ + бензин {format_money(fuel_pay)}₽ + доп {format_money(upsell_pay)}₽ = {format_money(total_pay)}₽",
+        f"ЗП за сегодня: база {format_money(base_pay)}₽ + бензин {format_money(fuel_pay)}₽ + доп {format_money(upsell_pay)}₽ = {format_money(total_pay)}₽",
+        f"ЗП за месяц: {format_money(total_pay_month)}₽",
         f"Наличных на руках: {format_money(on_hand)}₽",
     ]
     return "\n".join(lines)
