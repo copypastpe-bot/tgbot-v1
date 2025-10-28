@@ -1,7 +1,7 @@
 import asyncio, os, re, logging
 import csv, io
 from decimal import Decimal, ROUND_DOWN
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
@@ -122,6 +122,7 @@ dp.message.middleware(IgnoreNonPrivateMiddleware())
 dp.callback_query.middleware(IgnoreNonPrivateMiddleware())
 
 pool: asyncpg.Pool | None = None
+daily_reports_task: asyncio.Task | None = None
 
 # ===== RBAC helpers (DB-driven) =====
 async def get_user_role(conn: asyncpg.Connection, user_id: int) -> str | None:
@@ -2681,6 +2682,51 @@ async def _resolve_master_id_from_state(data: dict) -> int | None:
     return master_id
 
 
+async def send_daily_reports():
+    try:
+        cash_text = await build_daily_cash_summary_text()
+        if MONEY_FLOW_CHAT_ID:
+            await bot.send_message(MONEY_FLOW_CHAT_ID, cash_text)
+        profit_text = await build_profit_summary_text()
+        if MONEY_FLOW_CHAT_ID:
+            await bot.send_message(MONEY_FLOW_CHAT_ID, profit_text)
+        orders_text = await build_daily_orders_admin_summary_text()
+        if ORDERS_CONFIRM_CHAT_ID:
+            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, orders_text)
+    except Exception as exc:
+        logging.exception("Failed to send admin daily reports: %s", exc)
+
+    async with pool.acquire() as conn:
+        master_rows = await conn.fetch(
+            "SELECT tg_user_id FROM staff WHERE role='master' AND is_active AND tg_user_id IS NOT NULL"
+        )
+    for row in master_rows:
+        tg_id = row["tg_user_id"]
+        if not tg_id:
+            continue
+        try:
+            text = await build_master_daily_summary_text(int(tg_id))
+            await bot.send_message(tg_id, text)
+        except Exception as exc:
+            logging.exception("Failed to send master daily report to %s: %s", tg_id, exc)
+
+
+async def daily_reports_scheduler():
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=22, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logging.info("Next daily reports dispatch scheduled in %.0f seconds", wait_seconds)
+        try:
+            await asyncio.sleep(wait_seconds)
+            await send_daily_reports()
+        except Exception as exc:
+            logging.exception("Daily reports scheduler iteration failed: %s", exc)
+            await asyncio.sleep(60)
+
+
 async def get_master_payroll_report_text(master_id: int, period: str) -> str:
     bounds = _report_period_bounds(period)
     if not bounds:
@@ -4825,12 +4871,14 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool
+    global pool, daily_reports_task
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
         await init_permissions(_conn)
         await _ensure_bonus_posted_column(_conn)
     await set_commands()
+    if daily_reports_task is None:
+        daily_reports_task = asyncio.create_task(daily_reports_scheduler())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
