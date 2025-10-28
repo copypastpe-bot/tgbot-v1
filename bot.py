@@ -3256,6 +3256,7 @@ async def rep_period_back(msg: Message, state: FSMContext):
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "Выйти")
 async def reports_exit_to_admin(msg: Message, state: FSMContext):
     await state.clear()
+    await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
@@ -3275,6 +3276,7 @@ async def rep_master_back(msg: Message, state: FSMContext):
 @dp.message(ReportsFSM.waiting_root, F.text == "Назад")
 async def reports_root_back(msg: Message, state: FSMContext):
     await state.clear()
+    await state.set_state(AdminMenuFSM.root)
     await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
 
@@ -3282,6 +3284,7 @@ async def reports_root_back(msg: Message, state: FSMContext):
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "Отмена")
 async def reports_cancel(msg: Message, state: FSMContext):
     await state.clear()
+    await state.set_state(AdminMenuFSM.root)
     await msg.answer("Отменено. Возврат в меню администратора.", reply_markup=admin_root_kb())
 
 
@@ -4954,7 +4957,12 @@ async def unknown(msg: Message, state: FSMContext):
     cur = await state.get_state()
     if cur is not None:
         return
-    kb = master_kb if await ensure_master(msg.from_user.id) else main_kb
+    if await has_permission(msg.from_user.id, "view_orders_reports"):
+        kb = admin_root_kb()
+    elif await ensure_master(msg.from_user.id):
+        kb = master_kb
+    else:
+        kb = main_kb
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
