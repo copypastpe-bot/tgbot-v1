@@ -4264,9 +4264,28 @@ cancel_kb = ReplyKeyboardMarkup(
 
 @dp.message(F.text.lower() == "отмена")
 async def cancel_any(msg: Message, state: FSMContext):
+    current_state = await state.get_state()
     await state.clear()
-    # возвращаем клавиатуру мастера
-    return await msg.answer("Отменено.", reply_markup=master_kb)
+
+    admin_prefixes = {
+        "AdminMenuFSM",
+        "AdminClientsFSM",
+        "AdminMastersFSM",
+        "AddMasterFSM",
+        "WithdrawFSM",
+        "IncomeFSM",
+        "ExpenseFSM",
+        "UploadFSM",
+        "ReportsFSM",
+    }
+    prefix = current_state.split(":")[0] if current_state else ""
+    if prefix in admin_prefixes or await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Отменено.", reply_markup=admin_root_kb())
+
+    if await ensure_master(msg.from_user.id):
+        return await msg.answer("Отменено.", reply_markup=master_kb)
+
+    return await msg.answer("Отменено.", reply_markup=main_kb)
 
 
 @dp.message(AdminMenuFSM.root, F.text, ~F.text.startswith("/"))
