@@ -4525,8 +4525,16 @@ async def import_amocrm_file(msg: Message, state: FSMContext):
         await state.set_state(AdminMenuFSM.root)
         return await msg.answer("Файл должен быть в кодировке UTF-8.", reply_markup=admin_root_kb())
 
+    await msg.answer("Файл получен, выполняю импорт…")
+
     async with pool.acquire() as conn:
-        counters, errors = await process_amocrm_csv(conn, csv_text)
+        try:
+            counters, errors = await process_amocrm_csv(conn, csv_text)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("AmoCRM import failed")
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            return await msg.answer(f"Ошибка во время импорта: {exc}", reply_markup=admin_root_kb())
 
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
