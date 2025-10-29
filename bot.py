@@ -817,6 +817,20 @@ def _ensure_dt_aware(dt: datetime | None) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _format_amocrm_counters(counters: dict[str, int]) -> list[str]:
+    return [
+        f"Всего строк в файле: {counters['rows']}",
+        f"Уникальных телефонов: {counters['phones']}",
+        f"Клиентов добавлено: {counters['clients_inserted']}",
+        f"Клиентов обновлено: {counters['clients_updated']}",
+        f"Клиентов переведено из leads: {counters['clients_promoted']}",
+        f"Лидов добавлено: {counters['leads_inserted']}",
+        f"Лидов обновлено: {counters['leads_updated']}",
+        f"Лидов удалено: {counters['leads_deleted']}",
+        f"Пропущено без телефонов: {counters['skipped_no_phone']}",
+    ]
     value = value.strip()
     if not value:
         return None
@@ -877,7 +891,11 @@ def _amo_merge_services(existing: str | None, new_services: set[str]) -> tuple[s
     return ", ".join(merged), changed
 
 
-async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[dict[str, int], list[str]]:
+async def process_amocrm_csv(
+    conn: asyncpg.Connection,
+    csv_text: str,
+    dry_run: bool = False,
+) -> tuple[dict[str, int], list[str]]:
     stream = io.StringIO(csv_text)
     reader = csv.DictReader(stream, delimiter=";")
     if reader.fieldnames:
@@ -1009,7 +1027,9 @@ async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[d
     }
     errors: list[str] = []
 
-    async with conn.transaction():
+    txn = conn.transaction()
+    await txn.start()
+    try:
         for digits, entry in entries.items():
             normalized_phone = entry["normalized_phone"] or ("+7" + digits[-10:] if len(digits) >= 10 else None)
             best_row = entry["best_order_row"] or entry["first_row"]
@@ -1227,6 +1247,12 @@ async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[d
                 _ensure_dt_aware(last_updated_value),
             )
             counters["leads_inserted"] += 1
+
+    finally:
+        if dry_run:
+            await txn.rollback()
+        else:
+            await txn.commit()
 
     counters["skipped_no_phone"] = skipped_no_phone
     return counters, errors
@@ -4553,18 +4579,7 @@ async def import_amocrm_file(msg: Message, state: FSMContext):
     await state.update_data(import_preview=(preview_counters, preview_errors))
     await state.set_state(AmoImportFSM.waiting_confirm)
 
-    lines = [
-        "Подтвердить импорт?",
-        f"Всего строк в файле: {preview_counters['rows']}",
-        f"Уникальных телефонов: {preview_counters['phones']}",
-        f"Клиентов добавлено: {preview_counters['clients_inserted']}",
-        f"Клиентов обновлено: {preview_counters['clients_updated']}",
-        f"Клиентов переведено из leads: {preview_counters['clients_promoted']}",
-        f"Лидов добавлено: {preview_counters['leads_inserted']}",
-        f"Лидов обновлено: {preview_counters['leads_updated']}",
-        f"Лидов удалено: {preview_counters['leads_deleted']}",
-        f"Пропущено без телефонов: {preview_counters['skipped_no_phone']}",
-    ]
+    lines = ["Подтвердить импорт?"] + _format_amocrm_counters(preview_counters)
     if preview_errors:
         lines.append("\nОшибки (первые 10):")
         for err in preview_errors[:10]:
@@ -4586,6 +4601,52 @@ async def import_amocrm_file(msg: Message, state: FSMContext):
 @dp.message(AmoImportFSM.waiting_file)
 async def import_amocrm_waiting(msg: Message, state: FSMContext):
     await msg.answer("Нужен CSV-файл. Отправьте документ или нажмите Отмена.")
+
+
+@dp.message(AmoImportFSM.waiting_confirm, F.text.casefold() == "да")
+async def import_amocrm_confirm_yes(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    csv_text = data.get("import_csv")
+    if not csv_text:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Не найден файл для импорта. Повторите загрузку.", reply_markup=admin_root_kb())
+
+    await msg.answer("Выполняю импорт…", reply_markup=admin_cancel_kb())
+
+    async with pool.acquire() as conn:
+        try:
+            counters, errors = await process_amocrm_csv(conn, csv_text, dry_run=False)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("AmoCRM import failed")
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            return await msg.answer(f"Ошибка во время импорта: {exc}", reply_markup=admin_root_kb())
+
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+
+    lines = ["Импорт AmoCRM завершён:"] + _format_amocrm_counters(counters)
+    if errors:
+        lines.append("\nОшибки:")
+        for err in errors[:10]:
+            lines.append(f"- {err}")
+        if len(errors) > 10:
+            lines.append(f"… ещё {len(errors) - 10} строк с ошибками")
+
+    await msg.answer("\n".join(lines), reply_markup=admin_root_kb())
+
+
+@dp.message(AmoImportFSM.waiting_confirm, F.text.casefold().in_({"нет", "отмена"}))
+async def import_amocrm_confirm_no(msg: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Импорт отменён.", reply_markup=admin_root_kb())
+
+
+@dp.message(AmoImportFSM.waiting_confirm)
+async def import_amocrm_confirm_wait(msg: Message, state: FSMContext):
+    await msg.answer("Ответьте «Да», чтобы подтвердить, или «Нет», чтобы отменить.")
 
 # ===== /income admin command =====
 @dp.message(Command("income"))
