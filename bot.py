@@ -1,7 +1,7 @@
 import asyncio, os, re, logging
 import csv, io
 from decimal import Decimal, ROUND_DOWN
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta, time
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
@@ -768,6 +768,454 @@ async def build_masters_kb(conn) -> ReplyKeyboardMarkup | None:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def _amo_get_cell(row: dict[str, str], key: str) -> str:
+    val = row.get(key)
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    return str(val).strip()
+
+
+def _amo_normalize_phone(raw: str) -> tuple[str | None, str | None]:
+    if not raw:
+        return None, None
+    cleaned = raw.replace("'", "").replace('"', "").strip()
+    normalized = normalize_phone_for_db(cleaned)
+    digits = only_digits(normalized)
+    if len(digits) == 10:
+        normalized = "+7" + digits
+    elif len(digits) == 11 and digits.startswith("8"):
+        normalized = "+7" + digits[1:]
+        digits = "7" + digits[1:]
+    elif len(digits) == 11 and digits.startswith("7"):
+        normalized = "+" + digits
+    elif not digits:
+        return None, None
+    return normalized, digits
+
+
+def _amo_parse_decimal(value: str) -> Decimal | None:
+    if not value:
+        return None
+    try:
+        return Decimal(value.replace(" ", "").replace(",", "."))
+    except Exception:
+        return None
+
+
+def _amo_parse_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if fmt == "%d.%m.%Y":
+                dt = datetime.combine(dt.date(), time())
+            return dt
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(value)
+        return dt
+    except ValueError:
+        return None
+
+
+def _amo_split_services(value: str) -> set[str]:
+    if not value:
+        return set()
+    raw = value.replace("\r", "\n").replace(";", "\n")
+    parts = []
+    for chunk in raw.split("\n"):
+        if not chunk:
+            continue
+        parts.extend(filter(None, [p.strip() for p in chunk.split(",")]))
+    return {p for p in parts if p}
+
+
+def _amo_merge_services(existing: str | None, new_services: set[str]) -> tuple[str | None, bool]:
+    if not new_services:
+        return existing, False
+    normalized_map: dict[str, str] = {}
+    merged: list[str] = []
+    if existing:
+        for part in [p.strip() for p in re.split(r"[;,]", existing) if p.strip()]:
+            key = re.sub(r"\s+", " ", part).lower()
+            if key not in normalized_map:
+                normalized_map[key] = part
+                merged.append(part)
+    changed = False
+    for service in new_services:
+        clean = re.sub(r"\s+", " ", service).strip()
+        if not clean:
+            continue
+        key = clean.lower()
+        if key not in normalized_map:
+            normalized_map[key] = clean
+            merged.append(clean)
+            changed = True
+    if not merged:
+        return None, changed
+    return ", ".join(merged), changed
+
+
+async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[dict[str, int], list[str]]:
+    stream = io.StringIO(csv_text)
+    reader = csv.DictReader(stream, delimiter=";")
+    if reader.fieldnames:
+        reader.fieldnames = [fn.strip().lstrip("\ufeff") for fn in reader.fieldnames]
+
+    entries: dict[str, dict] = {}
+    skipped_no_phone = 0
+    total_rows = 0
+
+    for idx, row in enumerate(reader, start=2):
+        total_rows += 1
+        sanitized = {k: (_amo_get_cell(row, k)) for k in reader.fieldnames or []}
+
+        phone_raw = ""
+        for key in [
+            "Рабочий телефон (контакт)",
+            "Телефон",
+            "Мобильный телефон (контакт)",
+            "Рабочий прямой телефон (контакт)",
+            "Другой телефон (контакт)",
+            "Домашний телефон (контакт)",
+        ]:
+            phone_raw = sanitized.get(key, "")
+            if phone_raw:
+                break
+
+        normalized_phone, digits = _amo_normalize_phone(phone_raw)
+        if not digits:
+            skipped_no_phone += 1
+            continue
+
+        entry = entries.get(digits)
+        if not entry:
+            fallback_phone = None
+            if not normalized_phone and len(digits) >= 10:
+                fallback_phone = "+7" + digits[-10:]
+            elif not normalized_phone:
+                fallback_phone = "+" + digits
+
+            entry = {
+                "digits": digits,
+                "normalized_phone": normalized_phone or fallback_phone,
+                "best_order_dt": None,
+                "best_order_row": None,
+                "max_closed_at": None,
+                "first_row": None,
+                "full_name": None,
+                "bonus_balance": None,
+                "birthday_str": None,
+                "services": set(),
+                "order_address": None,
+                "district": None,
+                "address_contact": None,
+                "source_contact": None,
+                "source_deal": None,
+                "deal_name": None,
+                "last_contact_dt": None,
+                "rows": [],
+            }
+            entries[digits] = entry
+
+        entry["rows"].append((idx, sanitized))
+        if entry["first_row"] is None:
+            entry["first_row"] = sanitized
+
+        full_name = sanitized.get("Основной контакт")
+        if full_name and not entry["full_name"]:
+            entry["full_name"] = full_name
+
+        bonus_str = sanitized.get("Бонусные баллы (контакт)")
+        if bonus_str and entry["bonus_balance"] is None:
+            entry["bonus_balance"] = _amo_parse_decimal(bonus_str)
+
+        birthday_val = sanitized.get("День рождения (контакт)")
+        if birthday_val and not entry["birthday_str"]:
+            entry["birthday_str"] = birthday_val
+
+        service_val = sanitized.get("Услуга")
+        entry["services"].update(_amo_split_services(service_val))
+
+        order_address = sanitized.get("Адрес")
+        if order_address:
+            entry["order_address"] = order_address
+
+        district_val = sanitized.get("Район города")
+        if district_val:
+            entry["district"] = district_val
+
+        address_contact = sanitized.get("Адрес (контакт)")
+        if address_contact:
+            entry["address_contact"] = address_contact
+
+        if sanitized.get("Источник трафика (контакт)"):
+            entry["source_contact"] = sanitized["Источник трафика (контакт)"]
+        elif sanitized.get("Источник траффика"):
+            entry["source_contact"] = entry["source_contact"] or sanitized["Источник траффика"]
+
+        if sanitized.get("Источник сделки"):
+            entry["source_deal"] = sanitized["Источник сделки"]
+
+        deal_name = sanitized.get("Основной контакт") or sanitized.get("Название сделки")
+        if deal_name and not entry["deal_name"]:
+            entry["deal_name"] = deal_name
+
+        order_dt = _amo_parse_datetime(sanitized.get("Дата и время заказа"))
+        if order_dt:
+            entry["last_contact_dt"] = order_dt if entry["last_contact_dt"] is None or order_dt > entry["last_contact_dt"] else entry["last_contact_dt"]
+            if entry["best_order_dt"] is None or order_dt > entry["best_order_dt"]:
+                entry["best_order_dt"] = order_dt
+                entry["best_order_row"] = sanitized
+        elif entry["best_order_row"] is None:
+            entry["best_order_row"] = sanitized
+
+        closed_dt = _amo_parse_datetime(sanitized.get("Дата закрытия"))
+        if closed_dt and (entry["max_closed_at"] is None or closed_dt > entry["max_closed_at"]):
+            entry["max_closed_at"] = closed_dt
+
+    now_ts = datetime.now(timezone.utc)
+    counters = {
+        "rows": total_rows,
+        "phones": len(entries),
+        "clients_updated": 0,
+        "clients_inserted": 0,
+        "clients_promoted": 0,
+        "leads_inserted": 0,
+        "leads_updated": 0,
+        "leads_deleted": 0,
+        "skipped_no_phone": skipped_no_phone,
+    }
+    errors: list[str] = []
+
+    async with conn.transaction():
+        for digits, entry in entries.items():
+            normalized_phone = entry["normalized_phone"] or ("+7" + digits[-10:] if len(digits) >= 10 else None)
+            best_row = entry["best_order_row"] or entry["first_row"]
+            if not best_row:
+                errors.append(f"{digits}: нет данных по строке")
+                continue
+
+            has_address_or_order = bool(entry["order_address"] or entry["address_contact"] or entry["best_order_dt"])
+
+            bonus_val = entry["bonus_balance"]
+            birthday_val = parse_birthday_str(entry["birthday_str"]) if entry["birthday_str"] else None
+
+            services_set = entry["services"]
+            new_service_str = ", ".join(services_set) if services_set else None
+
+            lead_source = entry["source_contact"] or entry["source_deal"] or ""
+            lead_name = entry["full_name"] or entry["deal_name"] or "Без имени"
+            last_address = entry["order_address"] or entry["address_contact"]
+            last_contact_dt = entry["last_contact_dt"]
+            max_closed_dt = entry["max_closed_at"]
+
+            client_row = await conn.fetchrow(
+                "SELECT * FROM clients WHERE phone_digits=$1",
+                digits,
+            )
+            if client_row is None:
+                client_row = await conn.fetchrow(
+                    "SELECT * FROM clients WHERE regexp_replace(phone, '[^0-9]+', '', 'g') = $1 LIMIT 1",
+                    digits,
+                )
+
+            if client_row:
+                updates: dict[str, object] = {}
+                changed = False
+
+                if client_row.get("phone_digits") != digits:
+                    updates["phone_digits"] = digits
+                if normalized_phone and client_row.get("phone") != normalized_phone:
+                    updates["phone"] = normalized_phone
+
+                if bonus_val is not None and client_row.get("bonus_balance") is None:
+                    updates["bonus_balance"] = int(bonus_val)
+                    changed = True
+
+                if birthday_val and client_row.get("birthday") is None:
+                    updates["birthday"] = birthday_val
+                    changed = True
+
+                if entry["best_order_dt"]:
+                    existing_order = client_row.get("last_order_at")
+                    if existing_order is None or entry["best_order_dt"] > existing_order:
+                        updates["last_order_at"] = entry["best_order_dt"]
+                        changed = True
+
+                if services_set:
+                    merged_services, merge_changed = _amo_merge_services(client_row.get("last_service"), services_set)
+                    if merge_changed:
+                        updates["last_service"] = merged_services
+                        changed = True
+                    elif client_row.get("last_service") is None and merged_services:
+                        updates["last_service"] = merged_services
+                        changed = True
+
+                if entry["order_address"]:
+                    if client_row.get("last_order_addr") != entry["order_address"]:
+                        updates["last_order_addr"] = entry["order_address"]
+                        changed = True
+
+                if entry["district"]:
+                    if client_row.get("district") != entry["district"]:
+                        updates["district"] = entry["district"]
+                        changed = True
+
+                address_contact = entry["address_contact"]
+                if address_contact:
+                    if client_row.get("address") != address_contact:
+                        updates["address"] = address_contact
+                        changed = True
+
+                promote = client_row.get("status") != "client" and has_address_or_order
+                if promote:
+                    updates["status"] = "client"
+                    if entry["full_name"]:
+                        updates["full_name"] = entry["full_name"]
+                    changed = True
+
+                if changed or promote:
+                    updates["last_updated"] = now_ts
+                    set_clauses = ", ".join(f"{col} = ${idx}" for idx, col in enumerate(updates.keys(), start=1))
+                    values = list(updates.values())
+                    values.append(client_row["id"])
+                    await conn.execute(
+                        f"UPDATE clients SET {set_clauses} WHERE id=${len(values)}",
+                        *values,
+                    )
+                    counters["clients_updated"] += 1
+                    if promote:
+                        counters["clients_promoted"] += 1
+
+                if promote:
+                    lead_row = await conn.fetchrow(
+                        "SELECT id FROM leads WHERE regexp_replace(phone, '[^0-9]+', '', 'g') = $1 LIMIT 1",
+                        digits,
+                    )
+                    if lead_row:
+                        await conn.execute("DELETE FROM leads WHERE id=$1", lead_row["id"])
+                        counters["leads_deleted"] += 1
+
+                continue
+
+            lead_row = await conn.fetchrow(
+                "SELECT * FROM leads WHERE regexp_replace(phone, '[^0-9]+', '', 'g') = $1 LIMIT 1",
+                digits,
+            )
+
+            if has_address_or_order:
+                service_str = ", ".join(sorted(services_set)) if services_set else None
+                await conn.fetchval(
+                    """
+                    INSERT INTO clients (
+                        full_name, phone, phone_digits, bonus_balance, birthday,
+                        status, last_updated, last_order_at, last_service,
+                        last_order_addr, district, address
+                    )
+                    VALUES ($1, $2, $3, $4, $5, 'client', $6, $7, $8, $9, $10, $11)
+                    RETURNING id
+                    """,
+                    entry["full_name"],
+                    normalized_phone or (f"+7{digits[-10:]}" if len(digits) >= 10 else f"+{digits}"),
+                    digits,
+                    int(bonus_val) if bonus_val is not None else 0,
+                    birthday_val,
+                    now_ts,
+                    entry["best_order_dt"],
+                    service_str,
+                    entry["order_address"],
+                    entry["district"],
+                    entry["address_contact"] or entry["order_address"],
+                )
+                counters["clients_inserted"] += 1
+
+                if lead_row:
+                    await conn.execute("DELETE FROM leads WHERE id=$1", lead_row["id"])
+                    counters["leads_deleted"] += 1
+                continue
+
+            lead_updates: dict[str, object] = {}
+            lead_changed = False
+            last_updated_value = max_closed_dt or now_ts
+
+            if lead_row:
+                if normalized_phone and lead_row.get("phone") != normalized_phone:
+                    lead_updates["phone"] = normalized_phone
+                if lead_row.get("name") != lead_name:
+                    lead_updates["name"] = lead_name
+                    lead_changed = True
+                if entry["full_name"] and lead_row.get("full_name") != entry["full_name"]:
+                    lead_updates["full_name"] = entry["full_name"]
+                    lead_changed = True
+                if lead_source and lead_row.get("source") != lead_source:
+                    lead_updates["source"] = lead_source
+                    lead_changed = True
+                if services_set:
+                    service_str = ", ".join(sorted(services_set))
+                    if lead_row.get("last_service") != service_str:
+                        lead_updates["last_service"] = service_str
+                        lead_changed = True
+                if entry["district"] and lead_row.get("district") != entry["district"]:
+                    lead_updates["district"] = entry["district"]
+                    lead_changed = True
+                if last_address and lead_row.get("last_address") != last_address:
+                    lead_updates["last_address"] = last_address
+                    lead_changed = True
+                if last_contact_dt:
+                    existing_contact = lead_row.get("last_contact_at")
+                    if existing_contact is None or last_contact_dt > existing_contact:
+                        lead_updates["last_contact_at"] = last_contact_dt
+                        lead_changed = True
+                existing_updated = lead_row.get("last_updated")
+                if existing_updated is None or last_updated_value > existing_updated:
+                    lead_updates["last_updated"] = last_updated_value
+                    lead_changed = True
+
+                if lead_updates:
+                    set_clauses = ", ".join(f"{col} = ${idx}" for idx, col in enumerate(lead_updates.keys(), start=1))
+                    values = list(lead_updates.values())
+                    values.append(lead_row["id"])
+                    await conn.execute(
+                        f"UPDATE leads SET {set_clauses} WHERE id=${len(values)}",
+                        *values,
+                    )
+                    counters["leads_updated"] += 1
+                continue
+
+            service_str = ", ".join(sorted(services_set)) if services_set else None
+            await conn.execute(
+                """
+                INSERT INTO leads (
+                    name, phone, source, status, created_at,
+                    full_name, last_contact_at, last_service,
+                    district, last_address, last_updated
+                )
+                VALUES ($1, $2, $3, 'lead', $4, $5, $6, $7, $8, $9, $10)
+                """,
+                lead_name,
+                normalized_phone or (f"+7{digits[-10:]}" if len(digits) >= 10 else f"+{digits}"),
+                lead_source or None,
+                now_ts,
+                entry["full_name"],
+                last_contact_dt,
+                service_str,
+                entry["district"],
+                last_address,
+                last_updated_value,
+            )
+            counters["leads_inserted"] += 1
+
+    counters["skipped_no_phone"] = skipped_no_phone
+    return counters, errors
+
 def withdraw_nav_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
@@ -1016,6 +1464,7 @@ async def set_commands():
         BotCommand(command="daily_orders", description="Заказы за сегодня"),
         BotCommand(command="my_daily", description="Моя сводка за сегодня"),
         BotCommand(command="masters_all", description="Полный список мастеров"),
+        BotCommand(command="import_amocrm", description="Импорт AmoCRM CSV"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -1907,6 +2356,8 @@ async def help_cmd(msg: Message):
             "/daily_profit — сводка по прибыли за сегодня и всё время\n"
             "\n"
             "/daily_orders — сводка по заказам мастеров за сегодня\n"
+            "\n"
+            "/import_amocrm — загрузить CSV выгрузку из AmoCRM\n"
             "\n"
             "/masters_all — полный список мастеров\n"
             "\n"
@@ -3926,6 +4377,9 @@ async def wipe_test_data(msg: Message):
 class UploadFSM(StatesGroup):
     waiting_csv = State()
 
+class AmoImportFSM(StatesGroup):
+    waiting_file = State()
+
 @dp.message(Command("upload_clients"))
 async def upload_clients_start(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "import_leads"):
@@ -4017,6 +4471,90 @@ async def upload_clients_file(msg: Message, state: FSMContext):
             await conn.executemany(insert_sql, args)
     await state.clear()
     return await msg.answer(f"Загружено строк в staging (clients_raw): {len(rows)}.\nТеперь выполните /import_leads_dryrun, затем /import_leads.")
+
+
+@dp.message(Command("import_amocrm"))
+async def import_amocrm_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "import_leads"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(AmoImportFSM.waiting_file)
+    await msg.answer(
+        "Отправьте CSV-файл выгрузки AmoCRM (UTF-8, разделитель ';').\n"
+        "Файл должен содержать столбцы из шаблона (телефоны, услуга, адрес и т.д.).",
+        reply_markup=admin_cancel_kb(),
+    )
+
+
+@dp.message(AmoImportFSM.waiting_file, F.text.casefold() == "отмена")
+async def import_amocrm_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await msg.answer("Импорт отменён.", reply_markup=admin_root_kb())
+
+
+@dp.message(AmoImportFSM.waiting_file, F.document)
+async def import_amocrm_file(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "import_leads"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Только для администраторов.", reply_markup=admin_root_kb())
+
+    document = msg.document
+    if not document.file_name.lower().endswith(".csv"):
+        return await msg.answer("Нужен CSV-файл (расширение .csv). Попробуйте ещё раз или нажмите Отмена.")
+
+    try:
+        file = await bot.get_file(document.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        data = file_bytes.read()
+    except Exception as exc:  # noqa: BLE001
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer(f"Не удалось получить файл: {exc}", reply_markup=admin_root_kb())
+
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            csv_text = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            csv_text = None
+    if csv_text is None:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Файл должен быть в кодировке UTF-8.", reply_markup=admin_root_kb())
+
+    async with pool.acquire() as conn:
+        counters, errors = await process_amocrm_csv(conn, csv_text)
+
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+
+    lines = [
+        "Импорт AmoCRM завершён:",
+        f"Всего строк в файле: {counters['rows']}",
+        f"Уникальных телефонов: {counters['phones']}",
+        f"Клиентов добавлено: {counters['clients_inserted']}",
+        f"Клиентов обновлено: {counters['clients_updated']}",
+        f"Клиентов переведено из leads: {counters['clients_promoted']}",
+        f"Лидов добавлено: {counters['leads_inserted']}",
+        f"Лидов обновлено: {counters['leads_updated']}",
+        f"Лидов удалено: {counters['leads_deleted']}",
+        f"Пропущено без телефонов: {counters['skipped_no_phone']}",
+    ]
+
+    if errors:
+        lines.append("\nОшибки:")
+        for err in errors[:10]:
+            lines.append(f"- {err}")
+        if len(errors) > 10:
+            lines.append(f"… ещё {len(errors) - 10} строк с ошибками")
+
+    await msg.answer("\n".join(lines), reply_markup=admin_root_kb())
+
+
+@dp.message(AmoImportFSM.waiting_file)
+async def import_amocrm_waiting(msg: Message, state: FSMContext):
+    await msg.answer("Нужен CSV-файл. Отправьте документ или нажмите Отмена.")
 
 # ===== /income admin command =====
 @dp.message(Command("income"))
