@@ -42,11 +42,13 @@ class IncomeFSM(StatesGroup):
     waiting_method = State()
     waiting_amount = State()
     waiting_comment = State()
+    waiting_confirm = State()
 
 
 class ExpenseFSM(StatesGroup):
     waiting_amount = State()
     waiting_comment = State()
+    waiting_confirm = State()
 
 
 class WithdrawFSM(StatesGroup):
@@ -1273,6 +1275,14 @@ def withdraw_confirm_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Подтвердить", callback_data="withdraw_confirm:yes")
     kb.button(text="Отмена", callback_data="withdraw_confirm:cancel")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def confirm_inline_kb(prefix: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Подтвердить", callback_data=f"{prefix}:yes")
+    kb.button(text="Отмена", callback_data=f"{prefix}:cancel")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -3911,13 +3921,15 @@ async def income_wizard_comment(msg: Message, state: FSMContext):
     data = await state.get_data()
     method = data.get("method")
     amount = Decimal(data.get("amount"))
-    async with pool.acquire() as conn:
-        tx = await _record_income(conn, method, amount, txt)
-    when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
-    await msg.answer(
-        f"Приход №{tx['id']}: {amount}₽ | {method} — {when}\nКомментарий: {txt}",
-        reply_markup=admin_root_kb(),
-    )
+    await state.update_data(comment=txt)
+    await state.set_state(IncomeFSM.waiting_confirm)
+    lines = [
+        "Подтвердите приход:",
+        f"Сумма: {format_money(amount)}₽",
+        f"Метод: {method}",
+        f"Комментарий: {txt}",
+    ]
+    await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("income_confirm"))
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
 
@@ -3972,15 +3984,14 @@ async def expense_wizard_comment(msg: Message, state: FSMContext):
         txt = "Расход"
     data = await state.get_data()
     amount = Decimal(data.get("amount"))
-    async with pool.acquire() as conn:
-        tx = await _record_expense(conn, amount, txt, method="прочее")
-    when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
-    await msg.answer(
-        f"Расход №{tx['id']}: {amount}₽ — {when}\nКомментарий: {txt}",
-        reply_markup=admin_root_kb(),
-    )
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
+    await state.update_data(comment=txt)
+    await state.set_state(ExpenseFSM.waiting_confirm)
+    lines = [
+        "Подтвердите расход:",
+        f"Сумма: {format_money(amount)}₽",
+        f"Комментарий: {txt}",
+    ]
+    await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("expense_confirm"))
 
 
 @dp.message(ReportsFSM.waiting_pick_master, ~F.text.startswith("/"))
@@ -4651,6 +4662,98 @@ async def import_amocrm_confirm_no(msg: Message, state: FSMContext):
 @dp.message(AmoImportFSM.waiting_confirm)
 async def import_amocrm_confirm_wait(msg: Message, state: FSMContext):
     await msg.answer("Ответьте «Да», чтобы подтвердить, или «Нет», чтобы отменить.")
+
+@dp.callback_query(IncomeFSM.waiting_confirm)
+async def income_confirm_handler(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+    if data not in {"income_confirm:yes", "income_confirm:cancel"}:
+        await query.answer()
+        return
+
+    await query.answer()
+    await query.message.edit_reply_markup(None)
+
+    if data.endswith("cancel"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Приход отменён.", reply_markup=admin_root_kb())
+        return
+
+    payload = await state.get_data()
+    try:
+        method = payload.get("method") or "прочее"
+        amount = Decimal(payload.get("amount") or "0")
+        comment = payload.get("comment") or "поступление денег в кассу"
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("income confirm payload error: %s", exc)
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Не удалось прочитать данные прихода. Попробуйте оформить заново.", reply_markup=admin_root_kb())
+        return
+
+    async with pool.acquire() as conn:
+        try:
+            tx = await _record_income(conn, method, amount, comment)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("income confirm failed: %s", exc)
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            await query.message.answer(f"Ошибка при проведении прихода: {exc}", reply_markup=admin_root_kb())
+            return
+
+    when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
+    await query.message.answer(
+        f"Приход №{tx['id']}: {format_money(amount)}₽ | {method} — {when}\nКомментарий: {comment}",
+        reply_markup=admin_root_kb(),
+    )
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+
+
+@dp.callback_query(ExpenseFSM.waiting_confirm)
+async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+    if data not in {"expense_confirm:yes", "expense_confirm:cancel"}:
+        await query.answer()
+        return
+
+    await query.answer()
+    await query.message.edit_reply_markup(None)
+
+    if data.endswith("cancel"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Расход отменён.", reply_markup=admin_root_kb())
+        return
+
+    payload = await state.get_data()
+    try:
+        amount = Decimal(payload.get("amount") or "0")
+        comment = payload.get("comment") or "Расход"
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("expense confirm payload error: %s", exc)
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Не удалось прочитать данные расхода. Попробуйте оформить заново.", reply_markup=admin_root_kb())
+        return
+
+    async with pool.acquire() as conn:
+        try:
+            tx = await _record_expense(conn, amount, comment, method="прочее")
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("expense confirm failed: %s", exc)
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            await query.message.answer(f"Ошибка при проведении расхода: {exc}", reply_markup=admin_root_kb())
+            return
+
+    when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
+    await query.message.answer(
+        f"Расход №{tx['id']}: {format_money(amount)}₽ — {when}\nКомментарий: {comment}",
+        reply_markup=admin_root_kb(),
+    )
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
 
 # ===== /income admin command =====
 @dp.message(Command("income"))
