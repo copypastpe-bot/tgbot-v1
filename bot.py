@@ -809,6 +809,14 @@ def _amo_parse_decimal(value: str) -> Decimal | None:
 def _amo_parse_datetime(value: str) -> datetime | None:
     if not value:
         return None
+
+
+def _ensure_dt_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
     value = value.strip()
     if not value:
         return None
@@ -817,11 +825,15 @@ def _amo_parse_datetime(value: str) -> datetime | None:
             dt = datetime.strptime(value, fmt)
             if fmt == "%d.%m.%Y":
                 dt = datetime.combine(dt.date(), time())
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             return dt
         except ValueError:
             continue
     try:
         dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt
     except ValueError:
         return None
@@ -1047,9 +1059,10 @@ async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[d
                     changed = True
 
                 if entry["best_order_dt"]:
-                    existing_order = client_row.get("last_order_at")
-                    if existing_order is None or entry["best_order_dt"] > existing_order:
-                        updates["last_order_at"] = entry["best_order_dt"]
+                    existing_order = _ensure_dt_aware(client_row.get("last_order_at"))
+                    candidate_dt = _ensure_dt_aware(entry["best_order_dt"])
+                    if candidate_dt and (existing_order is None or candidate_dt > existing_order):
+                        updates["last_order_at"] = candidate_dt
                         changed = True
 
                 if services_set:
@@ -1172,13 +1185,15 @@ async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[d
                     lead_updates["last_address"] = last_address
                     lead_changed = True
                 if last_contact_dt:
-                    existing_contact = lead_row.get("last_contact_at")
-                    if existing_contact is None or last_contact_dt > existing_contact:
-                        lead_updates["last_contact_at"] = last_contact_dt
+                    existing_contact = _ensure_dt_aware(lead_row.get("last_contact_at"))
+                    candidate_contact = _ensure_dt_aware(last_contact_dt)
+                    if candidate_contact and (existing_contact is None or candidate_contact > existing_contact):
+                        lead_updates["last_contact_at"] = candidate_contact
                         lead_changed = True
-                existing_updated = lead_row.get("last_updated")
-                if existing_updated is None or last_updated_value > existing_updated:
-                    lead_updates["last_updated"] = last_updated_value
+                existing_updated = _ensure_dt_aware(lead_row.get("last_updated"))
+                candidate_updated = _ensure_dt_aware(last_updated_value)
+                if candidate_updated and (existing_updated is None or candidate_updated > existing_updated):
+                    lead_updates["last_updated"] = candidate_updated
                     lead_changed = True
 
                 if lead_updates:
@@ -1207,11 +1222,11 @@ async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[d
                 lead_source or None,
                 now_ts,
                 entry["full_name"],
-                last_contact_dt,
+                _ensure_dt_aware(last_contact_dt),
                 service_str,
                 entry["district"],
                 last_address,
-                last_updated_value,
+                _ensure_dt_aware(last_updated_value),
             )
             counters["leads_inserted"] += 1
 
