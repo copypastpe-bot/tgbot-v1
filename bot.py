@@ -3879,6 +3879,9 @@ async def income_back_to_amount(msg: Message, state: FSMContext):
 @dp.message(IncomeFSM.waiting_method)
 async def income_wizard_pick_method(msg: Message, state: FSMContext):
     method = norm_pay_method_py(msg.text)
+    if method not in PAYMENT_METHODS + [GIFT_CERT_LABEL]:
+        kb = admin_payment_method_kb()
+        return await msg.answer("Используйте кнопки для выбора способа оплаты.", reply_markup=kb)
     await state.update_data(method=method)
     await state.set_state(IncomeFSM.waiting_amount)
     kb = ReplyKeyboardMarkup(
@@ -3930,8 +3933,6 @@ async def income_wizard_comment(msg: Message, state: FSMContext):
         f"Комментарий: {txt}",
     ]
     await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("income_confirm"))
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
 
 
 @dp.message(AdminMenuFSM.root, F.text.casefold() == "расход")
