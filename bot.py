@@ -758,9 +758,13 @@ async def build_masters_kb(conn) -> ReplyKeyboardMarkup | None:
         if not display_name:
             display_name = f"Мастер #{r['id']}"
         amount_str = format_money(available)
-        label = f"{display_name} — {amount_str}₽"
-        if len(label) > 62:
-            label = label[:59] + "…"
+        label_core = f"{display_name} — {amount_str}₽"
+        suffix = f" id:{r['id']}"
+        max_len = 62
+        if len(label_core) + len(suffix) > max_len:
+            available_len = max_len - len(suffix) - 1  # reserve space and ellipsis
+            label_core = label_core[:max(0, available_len)] + "…"
+        label = label_core + suffix
         rows.append([KeyboardButton(text=label)])
 
     if not rows:
