@@ -1045,8 +1045,6 @@ async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[d
                 updates: dict[str, object] = {}
                 changed = False
 
-                if client_row.get("phone_digits") != digits:
-                    updates["phone_digits"] = digits
                 if normalized_phone and client_row.get("phone") != normalized_phone:
                     updates["phone"] = normalized_phone
 
@@ -1131,20 +1129,19 @@ async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[d
                 await conn.fetchval(
                     """
                     INSERT INTO clients (
-                        full_name, phone, phone_digits, bonus_balance, birthday,
+                        full_name, phone, bonus_balance, birthday,
                         status, last_updated, last_order_at, last_service,
                         last_order_addr, district, address
                     )
-                    VALUES ($1, $2, $3, $4, $5, 'client', $6, $7, $8, $9, $10, $11)
+                    VALUES ($1, $2, $3, $4, 'client', $5, $6, $7, $8, $9, $10)
                     RETURNING id
                     """,
                     entry["full_name"],
                     normalized_phone or (f"+7{digits[-10:]}" if len(digits) >= 10 else f"+{digits}"),
-                    digits,
                     int(bonus_val) if bonus_val is not None else 0,
                     birthday_val,
                     now_ts,
-                    entry["best_order_dt"],
+                    _ensure_dt_aware(entry["best_order_dt"]),
                     service_str,
                     entry["order_address"],
                     entry["district"],
