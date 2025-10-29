@@ -174,6 +174,7 @@ PERMISSIONS_CANON = [
     "view_salary_reports",
     "view_own_salary",
     "view_own_income",
+    "import_leads",
 ]
 
 ROLE_MATRIX = {
@@ -196,6 +197,7 @@ ROLE_MATRIX = {
         "view_salary_reports",
         "view_own_salary",
         "view_own_income",
+        "import_leads",
     ],
     "master": [
         "create_orders_clients",
