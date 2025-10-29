@@ -1152,6 +1152,7 @@ async def process_amocrm_csv(conn: asyncpg.Connection, csv_text: str) -> tuple[d
                 if lead_row:
                     await conn.execute("DELETE FROM leads WHERE id=$1", lead_row["id"])
                     counters["leads_deleted"] += 1
+                    counters["clients_promoted"] += 1
                 continue
 
             lead_updates: dict[str, object] = {}
@@ -4393,6 +4394,7 @@ class UploadFSM(StatesGroup):
 
 class AmoImportFSM(StatesGroup):
     waiting_file = State()
+    waiting_confirm = State()
 
 @dp.message(Command("upload_clients"))
 async def upload_clients_start(msg: Message, state: FSMContext):
@@ -4537,41 +4539,48 @@ async def import_amocrm_file(msg: Message, state: FSMContext):
         await state.set_state(AdminMenuFSM.root)
         return await msg.answer("Файл должен быть в кодировке UTF-8.", reply_markup=admin_root_kb())
 
-    await msg.answer("Файл получен, выполняю импорт…")
+    await state.update_data(import_csv=csv_text)
 
     async with pool.acquire() as conn:
         try:
-            counters, errors = await process_amocrm_csv(conn, csv_text)
+            preview_counters, preview_errors = await process_amocrm_csv(conn, csv_text, dry_run=True)
         except Exception as exc:  # noqa: BLE001
-            logging.exception("AmoCRM import failed")
+            logging.exception("AmoCRM preview failed")
             await state.clear()
             await state.set_state(AdminMenuFSM.root)
-            return await msg.answer(f"Ошибка во время импорта: {exc}", reply_markup=admin_root_kb())
+            return await msg.answer(f"Ошибка при анализе файла: {exc}", reply_markup=admin_root_kb())
 
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
+    await state.update_data(import_preview=(preview_counters, preview_errors))
+    await state.set_state(AmoImportFSM.waiting_confirm)
 
     lines = [
-        "Импорт AmoCRM завершён:",
-        f"Всего строк в файле: {counters['rows']}",
-        f"Уникальных телефонов: {counters['phones']}",
-        f"Клиентов добавлено: {counters['clients_inserted']}",
-        f"Клиентов обновлено: {counters['clients_updated']}",
-        f"Клиентов переведено из leads: {counters['clients_promoted']}",
-        f"Лидов добавлено: {counters['leads_inserted']}",
-        f"Лидов обновлено: {counters['leads_updated']}",
-        f"Лидов удалено: {counters['leads_deleted']}",
-        f"Пропущено без телефонов: {counters['skipped_no_phone']}",
+        "Подтвердить импорт?",
+        f"Всего строк в файле: {preview_counters['rows']}",
+        f"Уникальных телефонов: {preview_counters['phones']}",
+        f"Клиентов добавлено: {preview_counters['clients_inserted']}",
+        f"Клиентов обновлено: {preview_counters['clients_updated']}",
+        f"Клиентов переведено из leads: {preview_counters['clients_promoted']}",
+        f"Лидов добавлено: {preview_counters['leads_inserted']}",
+        f"Лидов обновлено: {preview_counters['leads_updated']}",
+        f"Лидов удалено: {preview_counters['leads_deleted']}",
+        f"Пропущено без телефонов: {preview_counters['skipped_no_phone']}",
     ]
-
-    if errors:
-        lines.append("\nОшибки:")
-        for err in errors[:10]:
+    if preview_errors:
+        lines.append("\nОшибки (первые 10):")
+        for err in preview_errors[:10]:
             lines.append(f"- {err}")
-        if len(errors) > 10:
-            lines.append(f"… ещё {len(errors) - 10} строк с ошибками")
+        if len(preview_errors) > 10:
+            lines.append(f"… ещё {len(preview_errors) - 10} строк с ошибками")
 
-    await msg.answer("\n".join(lines), reply_markup=admin_root_kb())
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Да")],
+            [KeyboardButton(text="Нет")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("\n".join(lines), reply_markup=kb)
 
 
 @dp.message(AmoImportFSM.waiting_file)
