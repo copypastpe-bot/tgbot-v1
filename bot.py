@@ -2,6 +2,7 @@ import asyncio, os, re, logging
 import csv, io
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone, timedelta, time
+from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
@@ -103,6 +104,9 @@ FUEL_PAY = Decimal(os.getenv("FUEL_PAY", "150"))
 MASTER_PER_3000 = Decimal(os.getenv("MASTER_RATE_PER_3000", "1000"))
 UPSELL_PER_3000 = Decimal(os.getenv("UPSELL_RATE_PER_3000", "500"))
 
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+BONUS_BIRTHDAY_VALUE = Decimal("300")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
@@ -125,6 +129,7 @@ dp.callback_query.middleware(IgnoreNonPrivateMiddleware())
 
 pool: asyncpg.Pool | None = None
 daily_reports_task: asyncio.Task | None = None
+birthday_task: asyncio.Task | None = None
 
 # ===== RBAC helpers (DB-driven) =====
 async def get_user_role(conn: asyncpg.Connection, user_id: int) -> str | None:
@@ -815,6 +820,26 @@ def _amo_parse_decimal(value: str) -> Decimal | None:
 def _amo_parse_datetime(value: str) -> datetime | None:
     if not value:
         return None
+    value = value.strip()
+    if not value:
+        return None
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if fmt == "%d.%m.%Y":
+                dt = datetime.combine(dt.date(), time())
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
 
 
 def _ensure_dt_aware(dt: datetime | None) -> datetime | None:
@@ -837,26 +862,6 @@ def _format_amocrm_counters(counters: dict[str, int]) -> list[str]:
         f"Лидов удалено: {counters['leads_deleted']}",
         f"Пропущено без телефонов: {counters['skipped_no_phone']}",
     ]
-    value = value.strip()
-    if not value:
-        return None
-    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
-        try:
-            dt = datetime.strptime(value, fmt)
-            if fmt == "%d.%m.%Y":
-                dt = datetime.combine(dt.date(), time())
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except ValueError:
-            continue
-    try:
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        return None
 
 
 def _amo_split_services(value: str) -> set[str]:
@@ -895,6 +900,20 @@ def _amo_merge_services(existing: str | None, new_services: set[str]) -> tuple[s
     if not merged:
         return None, changed
     return ", ".join(merged), changed
+
+
+def _format_amocrm_counters(counters: dict[str, int]) -> list[str]:
+    return [
+        f"Всего строк в файле: {counters['rows']}",
+        f"Уникальных телефонов: {counters['phones']}",
+        f"Клиентов добавлено: {counters['clients_inserted']}",
+        f"Клиентов обновлено: {counters['clients_updated']}",
+        f"Клиентов переведено из leads: {counters['clients_promoted']}",
+        f"Лидов добавлено: {counters['leads_inserted']}",
+        f"Лидов обновлено: {counters['leads_updated']}",
+        f"Лидов удалено: {counters['leads_deleted']}",
+        f"Пропущено без телефонов: {counters['skipped_no_phone']}",
+    ]
 
 
 async def process_amocrm_csv(
@@ -1262,6 +1281,165 @@ async def process_amocrm_csv(
 
     counters["skipped_no_phone"] = skipped_no_phone
     return counters, errors
+
+
+async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str]]:
+    today_local = datetime.now(MOSCOW_TZ).date()
+    errors: list[str] = []
+
+    rows = await conn.fetch(
+        """
+        SELECT id, full_name, phone, bonus_balance, birthday
+        FROM clients
+        WHERE birthday IS NOT NULL
+          AND EXTRACT(MONTH FROM birthday) = $1
+          AND EXTRACT(DAY FROM birthday) = $2
+        """,
+        today_local.month,
+        today_local.day,
+    )
+
+    if not rows:
+        return 0, errors
+
+    processed = 0
+    for row in rows:
+        client_id = row["id"]
+        existing = await conn.fetchval(
+            """
+            SELECT 1
+            FROM bonus_transactions
+            WHERE client_id=$1
+              AND reason='birthday'
+              AND date(happened_at AT TIME ZONE 'Europe/Moscow') = $2
+            LIMIT 1
+            """,
+            client_id,
+            today_local,
+        )
+        if existing:
+            continue
+
+        amount = BONUS_BIRTHDAY_VALUE.quantize(Decimal("1"))
+        expires_at = (datetime.now(MOSCOW_TZ) + timedelta(days=365)).astimezone(timezone.utc)
+        try:
+            await conn.execute(
+                """
+                INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, expires_at, meta)
+                VALUES ($1, $2, 'birthday', NOW(), NOW(), $3, jsonb_build_object('bonus_type','birthday'))
+                """,
+                client_id,
+                int(amount),
+                expires_at,
+            )
+            await conn.execute(
+                "UPDATE clients SET bonus_balance = COALESCE(bonus_balance,0) + $1, last_updated = NOW() WHERE id=$2",
+                int(amount),
+                client_id,
+            )
+            processed += 1
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Birthday accrual failed for client %s: %s", client_id, exc)
+            errors.append(f"client {client_id}: {exc}")
+
+    return processed, errors
+
+
+async def _expire_old_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str]]:
+    now_utc = datetime.now(timezone.utc)
+    rows = await conn.fetch(
+        """
+        SELECT t.id, t.client_id, t.delta
+        FROM bonus_transactions t
+        WHERE t.delta > 0
+          AND t.expires_at IS NOT NULL
+          AND t.expires_at <= $1
+          AND NOT EXISTS (
+                SELECT 1 FROM bonus_transactions e
+                WHERE e.meta ->> 'expires_source' = t.id::text
+          )
+        """,
+        now_utc,
+    )
+
+    if not rows:
+        return 0, []
+
+    expired = 0
+    errors: list[str] = []
+    for row in rows:
+        client_id = row["client_id"]
+        if client_id is None:
+            continue
+        delta = int(row["delta"])
+        if delta <= 0:
+            continue
+        try:
+            balance = await conn.fetchval("SELECT COALESCE(bonus_balance,0) FROM clients WHERE id=$1", client_id) or 0
+            expire_amount = min(balance, delta)
+            if expire_amount <= 0:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, meta)
+                VALUES ($1, $2, 'expire', NOW(), NOW(), jsonb_build_object('expires_source', $3))
+                """,
+                client_id,
+                -expire_amount,
+                str(row["id"]),
+            )
+            await conn.execute(
+                "UPDATE clients SET bonus_balance = bonus_balance - $1, last_updated = NOW() WHERE id=$2",
+                expire_amount,
+                client_id,
+            )
+            expired += 1
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Bonus expire failed for client %s: %s", client_id, exc)
+            errors.append(f"client {client_id}: {exc}")
+
+    return expired, errors
+
+
+async def run_birthday_jobs() -> None:
+    async with pool.acquire() as conn:
+        accrued, accrual_errors = await _accrue_birthday_bonuses(conn)
+        expired, expire_errors = await _expire_old_bonuses(conn)
+
+    lines = [
+        "🎉 Итоги по бонусам:",
+        f"Начислено именинникам: {accrued}",
+        f"Списано по сроку: {expired}",
+    ]
+    errors = (accrual_errors + expire_errors)
+    if errors:
+        lines.append("\nОшибки:")
+        for err in errors[:10]:
+            lines.append(f"- {err}")
+        if len(errors) > 10:
+            lines.append(f"… ещё {len(errors) - 10} строк")
+
+    if MONEY_FLOW_CHAT_ID:
+        try:
+            await bot.send_message(MONEY_FLOW_CHAT_ID, "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Failed to send birthday bonus summary: %s", exc)
+
+
+async def schedule_daily_job(hour_msk: int, minute_msk: int, job_coro, job_name: str) -> None:
+    while True:
+        now_local = datetime.now(MOSCOW_TZ)
+        target = now_local.replace(hour=hour_msk, minute=minute_msk, second=0, microsecond=0)
+        if target <= now_local:
+            target += timedelta(days=1)
+        wait_seconds = (target - now_local).total_seconds()
+        logging.info("Next %s run scheduled in %.0f seconds", job_name, wait_seconds)
+        await asyncio.sleep(wait_seconds)
+        try:
+            await job_coro()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Daily job %s failed: %s", job_name, exc)
+            await asyncio.sleep(60)
 
 def withdraw_nav_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -5704,14 +5882,20 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task
+    global pool, daily_reports_task, birthday_task
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
         await init_permissions(_conn)
         await _ensure_bonus_posted_column(_conn)
     await set_commands()
     if daily_reports_task is None:
-        daily_reports_task = asyncio.create_task(daily_reports_scheduler())
+        daily_reports_task = asyncio.create_task(
+            schedule_daily_job(22, 0, send_daily_reports, "reports")
+        )
+    if birthday_task is None:
+        birthday_task = asyncio.create_task(
+            schedule_daily_job(12, 0, run_birthday_jobs, "birthday_bonuses")
+        )
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
