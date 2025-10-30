@@ -864,6 +864,32 @@ def _format_amocrm_counters(counters: dict[str, int]) -> list[str]:
     ]
 
 
+def _last_birthday_date(birthday: date, today: date) -> date:
+    year = today.year
+    while True:
+        try:
+            candidate = birthday.replace(year=year)
+        except ValueError:
+            candidate = date(year, 2, 28)
+        if candidate <= today:
+            return candidate
+        year -= 1
+
+
+def _format_amocrm_counters(counters: dict[str, int]) -> list[str]:
+    return [
+        f"Всего строк в файле: {counters['rows']}",
+        f"Уникальных телефонов: {counters['phones']}",
+        f"Клиентов добавлено: {counters['clients_inserted']}",
+        f"Клиентов обновлено: {counters['clients_updated']}",
+        f"Клиентов переведено из leads: {counters['clients_promoted']}",
+        f"Лидов добавлено: {counters['leads_inserted']}",
+        f"Лидов обновлено: {counters['leads_updated']}",
+        f"Лидов удалено: {counters['leads_deleted']}",
+        f"Пропущено без телефонов: {counters['skipped_no_phone']}",
+    ]
+
+
 def _amo_split_services(value: str) -> set[str]:
     if not value:
         return set()
@@ -1698,6 +1724,7 @@ async def set_commands():
         BotCommand(command="my_daily", description="Моя сводка за сегодня"),
         BotCommand(command="masters_all", description="Полный список мастеров"),
         BotCommand(command="import_amocrm", description="Импорт AmoCRM CSV"),
+        BotCommand(command="bonus_backfill", description="Пересчитать бонусы"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -2591,6 +2618,8 @@ async def help_cmd(msg: Message):
             "/daily_orders — сводка по заказам мастеров за сегодня\n"
             "\n"
             "/import_amocrm — загрузить CSV выгрузку из AmoCRM\n"
+            "\n"
+            "/bonus_backfill — пересчитать историю бонусов (только суперадмин)\n"
             "\n"
             "/masters_all — полный список мастеров\n"
             "\n"
@@ -4842,6 +4871,108 @@ async def import_amocrm_confirm_no(msg: Message, state: FSMContext):
 async def import_amocrm_confirm_wait(msg: Message, state: FSMContext):
     await msg.answer("Ответьте «Да», чтобы подтвердить, или «Нет», чтобы отменить.")
 
+
+@dp.message(Command("bonus_backfill"))
+async def bonus_backfill(msg: Message):
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+    if role != "superadmin":
+        return await msg.answer("Команда доступна только суперадмину.")
+
+    await msg.answer("Пересчитываю историю бонусов…")
+
+    today_local = datetime.now(MOSCOW_TZ).date()
+
+    async with pool.acquire() as conn:
+        client_rows = await conn.fetch(
+            """
+            SELECT id, COALESCE(bonus_balance,0) AS balance, birthday
+            FROM clients
+            WHERE COALESCE(bonus_balance,0) > 0
+            ORDER BY id
+            """
+        )
+        existing = await conn.fetch(
+            "SELECT DISTINCT client_id FROM bonus_transactions WHERE delta > 0"
+        )
+        existing_ids = {row["client_id"] for row in existing if row["client_id"] is not None}
+
+        processed = 0
+        skipped_existing = 0
+        birthday_used = 0
+        records_created = 0
+        errors: list[str] = []
+
+        async with conn.transaction():
+            for row in client_rows:
+                client_id = row["id"]
+                balance = int(row["balance"] or 0)
+                if balance <= 0:
+                    continue
+                if client_id in existing_ids:
+                    skipped_existing += 1
+                    continue
+
+                remaining = balance
+                birthday = row["birthday"]
+
+                try:
+                    if birthday and remaining > 0:
+                        last_bd = _last_birthday_date(birthday, today_local)
+                        amount_bd = min(int(BONUS_BIRTHDAY_VALUE), remaining)
+                        if amount_bd > 0:
+                            bd_local = datetime.combine(last_bd, time(hour=12, minute=0), tzinfo=MOSCOW_TZ)
+                            bd_utc = bd_local.astimezone(timezone.utc)
+                            expires_bd = (bd_local + timedelta(days=365)).astimezone(timezone.utc)
+                            await conn.execute(
+                                """
+                                INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, expires_at, meta)
+                                VALUES ($1, $2, 'birthday', $3, $3, $4, jsonb_build_object('backfill', true))
+                                """,
+                                client_id,
+                                amount_bd,
+                                bd_utc,
+                                expires_bd,
+                            )
+                            remaining -= amount_bd
+                            birthday_used += 1
+                            records_created += 1
+
+                    if remaining > 0:
+                        now_local = datetime.now(MOSCOW_TZ)
+                        now_utc = now_local.astimezone(timezone.utc)
+                        expires = (now_local + timedelta(days=365)).astimezone(timezone.utc)
+                        await conn.execute(
+                            """
+                            INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, expires_at, meta)
+                            VALUES ($1, $2, 'accrual', $3, $3, $4, jsonb_build_object('backfill', true))
+                            """,
+                            client_id,
+                            remaining,
+                            now_utc,
+                            expires,
+                        )
+                        records_created += 1
+
+                    processed += 1
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("bonus backfill failed for client %s: %s", client_id, exc)
+                    errors.append(f"client {client_id}: {exc}")
+
+    lines = [
+        "Бонусы перерасчитаны:",
+        f"Клиентов обработано: {processed}",
+        f"Пропущено (уже есть история): {skipped_existing}",
+        f"Создано записей: {records_created}",
+        f"Использован день рождения: {birthday_used}",
+    ]
+    if errors:
+        lines.append("\nОшибки:")
+        for err in errors[:10]:
+            lines.append(f"- {err}")
+        if len(errors) > 10:
+            lines.append(f"… ещё {len(errors) - 10} строк")
+    await msg.answer("\n".join(lines), reply_markup=admin_root_kb())
 @dp.callback_query(IncomeFSM.waiting_confirm)
 async def income_confirm_handler(query: CallbackQuery, state: FSMContext):
     data = (query.data or "").strip()
