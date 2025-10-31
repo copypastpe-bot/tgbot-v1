@@ -58,6 +58,11 @@ class WithdrawFSM(StatesGroup):
     waiting_comment = State()
     waiting_confirm = State()
 
+class TxDeleteFSM(StatesGroup):
+    waiting_date = State()
+    waiting_pick = State()
+    waiting_confirm = State()
+
 
 class AddMasterFSM(StatesGroup):
     waiting_tg_id = State()
@@ -1491,6 +1496,27 @@ def confirm_inline_kb(prefix: str) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def _is_withdraw_entry(row) -> bool:
+    if row["kind"] != "expense":
+        return False
+    if row.get("method") != "Наличные":
+        return False
+    if row.get("order_id") is not None:
+        return False
+    if row.get("master_id") is None:
+        return False
+    comment = (row.get("comment") or "").strip().lower()
+    return comment.startswith("[wdr]") or comment.startswith("изъят")
+
+
+def _tx_type_label(row) -> str:
+    if _is_withdraw_entry(row):
+        return "Изъятие"
+    if row["kind"] == "income":
+        return "Приход"
+    return "Расход"
+
+
 @dp.message(F.text == "Отчёты")
 async def reports_root(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_orders_reports"):
@@ -1725,6 +1751,7 @@ async def set_commands():
         BotCommand(command="masters_all", description="Полный список мастеров"),
         BotCommand(command="import_amocrm", description="Импорт AmoCRM CSV"),
         BotCommand(command="bonus_backfill", description="Пересчитать бонусы"),
+        BotCommand(command="tx_remove", description="Удалить транзакцию"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -2620,6 +2647,8 @@ async def help_cmd(msg: Message):
             "/import_amocrm — загрузить CSV выгрузку из AmoCRM\n"
             "\n"
             "/bonus_backfill — пересчитать историю бонусов (только суперадмин)\n"
+            "\n"
+            "/tx_remove — удалить приход/расход/изъятие (только суперадмин)\n"
             "\n"
             "/masters_all — полный список мастеров\n"
             "\n"
@@ -4870,6 +4899,180 @@ async def import_amocrm_confirm_no(msg: Message, state: FSMContext):
 @dp.message(AmoImportFSM.waiting_confirm)
 async def import_amocrm_confirm_wait(msg: Message, state: FSMContext):
     await msg.answer("Ответьте «Да», чтобы подтвердить, или «Нет», чтобы отменить.")
+
+
+@dp.message(Command("tx_remove"))
+async def tx_remove_start(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+    if role != "superadmin":
+        return await msg.answer("Команда доступна только суперадмину.")
+    await state.set_state(TxDeleteFSM.waiting_date)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Введите дату транзакций (ДД.ММ.ГГГГ):", reply_markup=kb)
+
+
+@dp.message(TxDeleteFSM.waiting_date)
+async def tx_remove_pick_date(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+    if txt.lower() == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Операция отменена.", reply_markup=admin_root_kb())
+
+    dt = parse_birthday_str(txt)
+    if not dt:
+        return await msg.answer("Дата должна быть в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД. Попробуйте снова или нажмите Отмена.")
+
+    start_local = datetime.combine(dt, time.min, tzinfo=MOSCOW_TZ)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, happened_at, kind, method, amount, comment, master_id, order_id
+            FROM cashbook_entries
+            WHERE happened_at >= $1 AND happened_at < $2
+              AND COALESCE(is_deleted,false)=FALSE
+            ORDER BY happened_at, id
+            """,
+            start_utc,
+            end_utc,
+        )
+
+    if not rows:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("За указанную дату активных транзакций не найдено.", reply_markup=admin_root_kb())
+
+    candidates = []
+    lines = [f"Транзакции за {dt:%d.%m.%Y}:"]
+    for row in rows:
+        tx_type = _tx_type_label(row)
+        dt_local = row["happened_at"].astimezone(MOSCOW_TZ)
+        amount_str = format_money(Decimal(row["amount"] or 0))
+        comment = (row["comment"] or "").strip()
+        if len(comment) > 80:
+            comment = comment[:77] + "…"
+        lines.append(
+            f"#{row['id']} {dt_local:%H:%M} {tx_type} {amount_str}₽ — {row['method']}" + (f" — {comment}" if comment else "")
+        )
+        candidates.append(row["id"])
+
+    await state.update_data(
+        tx_period={"start": start_utc.isoformat(), "end": end_utc.isoformat()},
+        tx_candidates=candidates,
+    )
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    lines.append("\nВведите ID транзакции для удаления или нажмите Отмена.")
+    await state.set_state(TxDeleteFSM.waiting_pick)
+    await msg.answer("\n".join(lines), reply_markup=kb)
+
+
+@dp.message(TxDeleteFSM.waiting_pick)
+async def tx_remove_choose(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+    if txt.lower() == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Операция отменена.", reply_markup=admin_root_kb())
+
+    if not txt.isdigit():
+        return await msg.answer("Введите числовой ID из списка или нажмите Отмена.")
+    target_id = int(txt)
+    data = await state.get_data()
+    candidates = set(data.get("tx_candidates") or [])
+    if target_id not in candidates:
+        return await msg.answer("Этот ID не в списке. Укажите ID из перечня или Отмена.")
+
+    period = data.get("tx_period") or {}
+    start = datetime.fromisoformat(period.get("start"))
+    end = datetime.fromisoformat(period.get("end"))
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, happened_at, kind, method, amount, comment, master_id, order_id
+            FROM cashbook_entries
+            WHERE id=$1 AND COALESCE(is_deleted,false)=FALSE
+              AND happened_at >= $2 AND happened_at < $3
+            """,
+            target_id,
+            start,
+            end,
+        )
+
+    if not row:
+        return await msg.answer("Транзакция уже удалена или не принадлежит выбранной дате.")
+
+    tx_type = _tx_type_label(row)
+    dt_local = row["happened_at"].astimezone(MOSCOW_TZ)
+    amount_str = format_money(Decimal(row["amount"] or 0))
+    comment = (row["comment"] or "").strip() or "—"
+
+    await state.update_data(tx_target_id=target_id)
+    await state.set_state(TxDeleteFSM.waiting_confirm)
+
+    lines = [
+        "Удалить транзакцию?",
+        f"ID: {target_id}",
+        f"Дата: {dt_local:%d.%m.%Y %H:%M}",
+        f"Тип: {tx_type}",
+        f"Метод: {row['method']}",
+        f"Сумма: {amount_str}₽",
+        f"Комментарий: {comment}",
+    ]
+    await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("tx_remove"))
+
+
+@dp.callback_query(TxDeleteFSM.waiting_confirm)
+async def tx_remove_confirm(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+    if data not in {"tx_remove:yes", "tx_remove:cancel"}:
+        await query.answer()
+        return
+
+    await query.answer()
+    await query.message.edit_reply_markup(None)
+
+    if data.endswith("cancel"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Удаление отменено.", reply_markup=admin_root_kb())
+        return
+
+    payload = await state.get_data()
+    target_id = payload.get("tx_target_id")
+    if not target_id:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Не удалось получить ID транзакции. Попробуйте снова.", reply_markup=admin_root_kb())
+        return
+
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE cashbook_entries SET is_deleted=TRUE, deleted_at=NOW() WHERE id=$1 AND COALESCE(is_deleted,false)=FALSE",
+            target_id,
+        )
+    if res.split()[-1] == "0":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Транзакция уже была удалена ранее.", reply_markup=admin_root_kb())
+        return
+
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+    await query.message.answer(f"Транзакция #{target_id} удалена.", reply_markup=admin_root_kb())
 
 
 @dp.message(Command("bonus_backfill"))
