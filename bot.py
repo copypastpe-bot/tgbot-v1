@@ -610,6 +610,7 @@ async def get_master_cash_on_orders(conn, master_id: int) -> Decimal:
         FROM cashbook_entries
         WHERE kind='income' AND method='Наличные'
           AND master_id=$1 AND order_id IS NOT NULL
+          AND COALESCE(is_deleted,false)=FALSE
         """,
         master_id,
     )
@@ -742,6 +743,7 @@ async def get_cash_balance_excluding_withdrawals(conn) -> Decimal:
                              AND NOT (comment ILIKE '[WDR]%' OR (method='Наличные' AND order_id IS NULL AND master_id IS NOT NULL))
                             THEN amount ELSE 0 END),0) AS expense_sum
         FROM cashbook_entries
+        WHERE COALESCE(is_deleted,false)=FALSE
         """
     )
     inc = Decimal(row["income_sum"] or 0)
@@ -2119,6 +2121,7 @@ async def get_master_wallet(conn, master_id: int) -> tuple[Decimal, Decimal]:
         FROM cashbook_entries
         WHERE kind='expense' AND method='Наличные'
           AND master_id=$1 AND order_id IS NULL
+          AND COALESCE(is_deleted,false)=FALSE
           AND (comment ILIKE '[WDR]%' OR comment ILIKE 'изъят%')
         """,
         master_id,
