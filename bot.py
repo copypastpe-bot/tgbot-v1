@@ -1697,9 +1697,22 @@ async def _record_order_income(
     return tx
 
 
-async def _record_withdrawal(conn: asyncpg.Connection, master_id: int, amount: Decimal, comment: str = "Изъятие"):
+async def _record_withdrawal(
+    conn: asyncpg.Connection,
+    master_id: int,
+    amount: Decimal,
+    comment: str = "Изъятие",
+    master_label: str | None = None,
+):
     # Изъятие — внутреннее перемещение: уменьшает наличные у мастера, но не влияет на прибыль.
     # Храним в общей таблице cashbook_entries, помечаем [WDR], чтобы исключить из P&L-отчётов.
+    note_parts = ["[WDR]"]
+    if master_label:
+        note_parts.append(master_label.strip())
+    if comment:
+        note_parts.append(comment.strip())
+    final_comment = " — ".join(filter(None, note_parts))
+
     tx = await conn.fetchrow(
         """
         INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
@@ -1707,7 +1720,7 @@ async def _record_withdrawal(conn: asyncpg.Connection, master_id: int, amount: D
         RETURNING id, happened_at
         """,
         amount,
-        ("[WDR] " + (comment or "Изъятие")).strip(),
+        final_comment,
         master_id,
     )
     return tx
@@ -2367,7 +2380,8 @@ async def withdraw_confirm_handler(query: CallbackQuery, state: FSMContext):
                 )
                 return
 
-            tx = await _record_withdrawal(conn, master_id, amount, comment)
+            master_label = f"{master_name} (id:{master_id})"
+            tx = await _record_withdrawal(conn, master_id, amount, comment, master_label)
 
             cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
 
