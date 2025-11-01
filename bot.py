@@ -1359,7 +1359,7 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
             await conn.execute(
                 """
                 INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, expires_at, meta)
-                VALUES ($1, $2, 'birthday', NOW(), NOW(), $3, jsonb_build_object('bonus_type','birthday'))
+                VALUES ($1, $2, 'birthday', NOW(), NOW(), $3::timestamptz, jsonb_build_object('bonus_type','birthday'))
                 """,
                 client_id,
                 int(amount),
@@ -1415,7 +1415,7 @@ async def _expire_old_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str]]
             await conn.execute(
                 """
                 INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, meta)
-                VALUES ($1, $2, 'expire', NOW(), NOW(), jsonb_build_object('expires_source', $3))
+                VALUES ($1, $2, 'expire', NOW(), NOW(), jsonb_build_object('expires_source', $3::text))
                 """,
                 client_id,
                 -expire_amount,
@@ -5147,7 +5147,7 @@ async def bonus_backfill(msg: Message):
                             await conn.execute(
                                 """
                                 INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, expires_at, meta)
-                                VALUES ($1, $2, 'birthday', $3, $3, $4, jsonb_build_object('backfill', true))
+                                VALUES ($1, $2, 'birthday', $3, $3, $4::timestamptz, jsonb_build_object('backfill', true))
                                 """,
                                 client_id,
                                 amount_bd,
@@ -5165,7 +5165,7 @@ async def bonus_backfill(msg: Message):
                         await conn.execute(
                             """
                             INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, expires_at, meta)
-                            VALUES ($1, $2, 'accrual', $3, $3, $4, jsonb_build_object('backfill', true))
+                            VALUES ($1, $2, 'accrual', $3, $3, $4::timestamptz, jsonb_build_object('backfill', true))
                             """,
                             client_id,
                             remaining,
