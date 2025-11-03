@@ -737,6 +737,21 @@ def _withdrawal_filter_sql(alias: str = "e") -> str:
         f"AND ({alias}.comment ILIKE '[WDR]%' OR {alias}.comment ILIKE 'изъят%'))"
     )
 
+
+def _cashbook_daily_aggregates_sql(start_sql: str, end_sql: str) -> str:
+    """Собирает SQL для агрегации кассовых движений по дням в заданном диапазоне."""
+    return f"""
+        SELECT
+            date_trunc('day', c.happened_at) AS day,
+            SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END) AS income,
+            SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END) AS expense
+        FROM cashbook_entries c
+        WHERE c.happened_at >= {start_sql}
+          AND c.happened_at < {end_sql}
+          AND COALESCE(c.is_deleted,false)=FALSE
+        GROUP BY 1
+    """
+
 async def get_cash_balance_excluding_withdrawals(conn) -> Decimal:
     """
     Остаток кассы: приход - расход, где изъятия [WDR] НЕ считаются расходом.
@@ -2966,56 +2981,57 @@ async def get_cash_report_text(period: str) -> str:
         else:
             return "Формат: /cash [day|month|year|YYYY-MM|YYYY-MM-DD]"
 
+    detail_label = "Детализация по месяцам (последние):" if detail_by_months else "Детализация по дням (последние):"
+    daily_sql = _cashbook_daily_aggregates_sql(start_sql, end_sql)
+
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
             f"""
+            WITH daily AS ({daily_sql})
             SELECT
-              COALESCE(SUM(income),  0)::numeric(12,2) AS income,
-              COALESCE(SUM(expense), 0)::numeric(12,2) AS expense,
-              COALESCE(SUM(delta),   0)::numeric(12,2) AS delta
-            FROM v_cash_summary
-            WHERE day >= {start_sql} AND day < {end_sql};
+              COALESCE(SUM(income),0)::numeric(12,2)  AS income,
+              COALESCE(SUM(expense),0)::numeric(12,2) AS expense,
+              COALESCE(SUM(income - expense),0)::numeric(12,2) AS delta
+            FROM daily
             """
         )
         if detail_by_months:
             rows = await conn.fetch(
                 f"""
+                WITH daily AS ({daily_sql})
                 SELECT date_trunc('month', day) AS g,
-                       COALESCE(SUM(income),0)::numeric(12,2)  AS income,
-                       COALESCE(SUM(expense),0)::numeric(12,2) AS expense,
-                       COALESCE(SUM(delta),0)::numeric(12,2)   AS delta
-                FROM v_cash_summary
-                WHERE day >= {start_sql} AND day < {end_sql}
+                       COALESCE(SUM(income),0)::numeric(12,2)    AS income,
+                       COALESCE(SUM(expense),0)::numeric(12,2)   AS expense,
+                       COALESCE(SUM(income - expense),0)::numeric(12,2) AS delta
+                FROM daily
                 GROUP BY 1
                 ORDER BY 1 DESC
-                LIMIT 12;
+                LIMIT 12
                 """
             )
-            detail_label = "Детализация по месяцам (последние):"
         else:
             rows = await conn.fetch(
                 f"""
-                SELECT day::date AS g,
+                WITH daily AS ({daily_sql})
+                SELECT day AS g,
                        COALESCE(income,0)::numeric(12,2)  AS income,
                        COALESCE(expense,0)::numeric(12,2) AS expense,
-                       COALESCE(delta,0)::numeric(12,2)   AS delta
-                FROM v_cash_summary
-                WHERE day >= {start_sql} AND day < {end_sql}
+                       (COALESCE(income,0) - COALESCE(expense,0))::numeric(12,2) AS delta
+                FROM daily
                 ORDER BY day DESC
-                LIMIT 31;
+                LIMIT 31
                 """
             )
-            detail_label = "Детализация по дням (последние):"
 
-    income  = rec["income"] or 0
-    expense = rec["expense"] or 0
-    delta   = rec["delta"] or 0
+    income  = Decimal(rec["income"] or 0) if rec else Decimal(0)
+    expense = Decimal(rec["expense"] or 0) if rec else Decimal(0)
+    delta   = Decimal(rec["delta"] or 0) if rec else Decimal(0)
 
     lines = [
         f"Касса за {period_label}:",
-        f"➕ Приход: {income}₽",
-        f"➖ Расход: {expense}₽",
-        f"= Дельта: {delta}₽",
+        f"➕ Приход: {format_money(income)}₽",
+        f"➖ Расход: {format_money(expense)}₽",
+        f"= Дельта: {format_money(delta)}₽",
     ]
     if rows:
         lines.append(f"\n{detail_label}")
@@ -3024,10 +3040,13 @@ async def get_cash_report_text(period: str) -> str:
             # g can be date/datetime
             try:
                 # choose format by detail type
-                label = g.strftime("%Y-%m") if "месяц" in detail_label else g.strftime("%Y-%m-%d")
+                label = g.strftime("%Y-%m") if detail_by_months else g.strftime("%Y-%m-%d")
             except Exception:
                 label = str(g)
-            lines.append(f"{label}: +{r['income']} / -{r['expense']} = {r['delta']}₽")
+            inc = format_money(Decimal(r["income"] or 0))
+            exp = format_money(Decimal(r["expense"] or 0))
+            dlt = format_money(Decimal(r["delta"] or 0))
+            lines.append(f"{label}: +{inc} / -{exp} = {dlt}₽")
     return "\n".join(lines)
 
 # ===== /cash admin command =====
@@ -3081,67 +3100,55 @@ async def get_profit_report_text(period: str) -> str:
         else:
             return "Формат: /profit [day|month|year|YYYY-MM|YYYY-MM-DD]"
 
-    group_sql = "date_trunc('month', day)" if by_months else "date_trunc('day', day)"
     detail_label = "По месяцам (последние):" if by_months else "По дням (последние):"
+    daily_sql = _cashbook_daily_aggregates_sql(start_sql, end_sql)
 
     async with pool.acquire() as conn:
-        rev = await conn.fetchval(
+        summary = await conn.fetchrow(
             f"""
-            SELECT COALESCE(SUM(o.amount_cash), 0)::numeric(12,2)
-            FROM orders o
-            WHERE o.created_at >= {start_sql} AND o.created_at < {end_sql}
+            WITH daily AS ({daily_sql})
+            SELECT
+              COALESCE(SUM(income),0)::numeric(12,2)  AS income,
+              COALESCE(SUM(expense),0)::numeric(12,2) AS expense
+            FROM daily
             """
         )
-        # Исключаем изъятия из расходов компании, так как это внутреннее движение (наличные мастеров → касса)
-        exp = await conn.fetchval(
-            f"""
-            SELECT COALESCE(SUM(c.amount), 0)::numeric(12,2)
-            FROM cashbook_entries c
-            WHERE c.kind='expense'
-              AND NOT ({_withdrawal_filter_sql("c")})
-              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-            """
-        )
-        rows = await conn.fetch(
-            f"""
-            WITH
-            r AS (
-              SELECT date_trunc('day', o.created_at) AS day, SUM(o.amount_cash) AS revenue
-              FROM orders o
-              WHERE o.created_at >= {start_sql} AND o.created_at < {end_sql}
-              GROUP BY 1
-            ),
-            e AS (
-              SELECT date_trunc('day', c.happened_at) AS day, SUM(c.amount) AS expense
-              FROM cashbook_entries c
-              WHERE c.kind='expense'
-                AND NOT ({_withdrawal_filter_sql("c")})
-                AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-              GROUP BY 1
-            ),
-            d AS (
-              SELECT COALESCE(r.day, e.day) AS day,
-                     COALESCE(r.revenue, 0)   AS revenue,
-                     COALESCE(e.expense, 0)   AS expense
-              FROM r FULL OUTER JOIN e ON r.day = e.day
+        if by_months:
+            rows = await conn.fetch(
+                f"""
+                WITH daily AS ({daily_sql})
+                SELECT date_trunc('month', day) AS g,
+                       COALESCE(SUM(income),0)::numeric(12,2)  AS income,
+                       COALESCE(SUM(expense),0)::numeric(12,2) AS expense,
+                       (COALESCE(SUM(income),0) - COALESCE(SUM(expense),0))::numeric(12,2) AS profit
+                FROM daily
+                GROUP BY 1
+                ORDER BY 1 DESC
+                LIMIT 12
+                """
             )
-            SELECT {group_sql} AS g,
-                   COALESCE(SUM(revenue),0)::numeric(12,2) AS revenue,
-                   COALESCE(SUM(expense),0)::numeric(12,2) AS expense,
-                   (COALESCE(SUM(revenue),0) - COALESCE(SUM(expense),0))::numeric(12,2) AS profit
-            FROM d
-            GROUP BY 1
-            ORDER BY 1 DESC
-            LIMIT 31;
-            """
-        )
+        else:
+            rows = await conn.fetch(
+                f"""
+                WITH daily AS ({daily_sql})
+                SELECT day AS g,
+                       COALESCE(income,0)::numeric(12,2)  AS income,
+                       COALESCE(expense,0)::numeric(12,2) AS expense,
+                       (COALESCE(income,0) - COALESCE(expense,0))::numeric(12,2) AS profit
+                FROM daily
+                ORDER BY day DESC
+                LIMIT 31
+                """
+            )
 
-    profit = (rev or 0) - (exp or 0)
+    income = Decimal(summary["income"] or 0) if summary else Decimal(0)
+    expense = Decimal(summary["expense"] or 0) if summary else Decimal(0)
+    profit = income - expense
     lines = [
         f"Прибыль за {period_label}:",
-        f"💰 Выручка: {rev or 0}₽",
-        f"💸 Расходы: {exp or 0}₽",
-        f"= Прибыль: {profit}₽",
+        f"💰 Выручка: {format_money(income)}₽",
+        f"💸 Расходы: {format_money(expense)}₽",
+        f"= Прибыль: {format_money(profit)}₽",
     ]
     if rows:
         lines.append(f"\n{detail_label}")
@@ -3151,7 +3158,10 @@ async def get_profit_report_text(period: str) -> str:
                 s = g.strftime("%Y-%m") if by_months else g.strftime("%Y-%m-%d")
             except Exception:
                 s = str(g)
-            lines.append(f"{s}: выручка {r['revenue']} / расходы {r['expense']} → прибыль {r['profit']}₽")
+            inc = format_money(Decimal(r["income"] or 0))
+            exp = format_money(Decimal(r["expense"] or 0))
+            prf = format_money(Decimal(r["profit"] or 0))
+            lines.append(f"{s}: выручка {inc} / расходы {exp} → прибыль {prf}₽")
     return "\n".join(lines)
 
 
@@ -3195,6 +3205,7 @@ async def get_payments_by_method_report_text(period: str) -> str:
             FROM cashbook_entries
             WHERE kind='income'
               AND happened_at >= {start_sql} AND happened_at < {end_sql}
+              AND COALESCE(is_deleted,false)=FALSE
             GROUP BY 1
             ORDER BY total DESC, method
             """
@@ -3205,16 +3216,19 @@ async def get_payments_by_method_report_text(period: str) -> str:
             FROM cashbook_entries
             WHERE kind='income'
               AND happened_at >= {start_sql} AND happened_at < {end_sql}
+              AND COALESCE(is_deleted,false)=FALSE
             """
         )
 
     if not rows:
         return f"Типы оплат за {period_label}: данных нет."
 
-    lines = [f"Типы оплат за {period_label}: (итого {total_income}₽)"]
+    total_income_dec = Decimal(total_income or 0)
+    lines = [f"Типы оплат за {period_label}: (итого {format_money(total_income_dec)}₽)"]
     for r in rows:
         method = r["method"]
-        lines.append(f"- {method}: {r['total']}₽ ({r['cnt']} шт.)")
+        amount = format_money(Decimal(r["total"] or 0))
+        lines.append(f"- {method}: {amount}₽ ({r['cnt']} шт.)")
     return "\n".join(lines)
 
 
@@ -3274,6 +3288,7 @@ async def build_daily_cash_summary_text() -> str:
               COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
             FROM cashbook_entries c
             WHERE c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+              AND COALESCE(c.is_deleted,false)=FALSE
             """
         )
         pay_rows = await conn.fetch(
@@ -3283,6 +3298,7 @@ async def build_daily_cash_summary_text() -> str:
             FROM cashbook_entries
             WHERE kind='income'
               AND happened_at >= {start_sql} AND happened_at < {end_sql}
+              AND COALESCE(is_deleted,false)=FALSE
             GROUP BY 1
             """
         )
@@ -3307,45 +3323,37 @@ async def build_daily_cash_summary_text() -> str:
 async def build_profit_summary_text() -> str:
     start_sql = "date_trunc('day', NOW())"
     end_sql = "date_trunc('day', NOW()) + interval '1 day'"
+    daily_sql = _cashbook_daily_aggregates_sql(start_sql, end_sql)
     async with pool.acquire() as conn:
-        revenue_day = await conn.fetchval(
+        daily_row = await conn.fetchrow(
             f"""
-            SELECT COALESCE(SUM(o.amount_cash), 0)::numeric(12,2)
-            FROM orders o
-            WHERE o.created_at >= {start_sql} AND o.created_at < {end_sql}
+            WITH daily AS ({daily_sql})
+            SELECT
+              COALESCE(SUM(income),0)::numeric(12,2)  AS income,
+              COALESCE(SUM(expense),0)::numeric(12,2) AS expense
+            FROM daily
             """
         )
-        expense_day = await conn.fetchval(
+        total_row = await conn.fetchrow(
             f"""
-            SELECT COALESCE(SUM(c.amount), 0)::numeric(12,2)
+            SELECT
+              COALESCE(SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END),0)::numeric(12,2)  AS income,
+              COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
             FROM cashbook_entries c
-            WHERE c.kind='expense'
-              AND NOT ({_withdrawal_filter_sql("c")})
-              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-            """
-        )
-        revenue_total = await conn.fetchval(
-            "SELECT COALESCE(SUM(amount_cash), 0)::numeric(12,2) FROM orders"
-        )
-        expense_total = await conn.fetchval(
-            f"""
-            SELECT COALESCE(SUM(amount), 0)::numeric(12,2)
-            FROM cashbook_entries c
-            WHERE c.kind='expense'
-              AND NOT ({_withdrawal_filter_sql("c")})
+            WHERE COALESCE(c.is_deleted,false)=FALSE
             """
         )
 
-    revenue_day = Decimal(revenue_day or 0)
-    expense_day = Decimal(expense_day or 0)
-    revenue_total = Decimal(revenue_total or 0)
-    expense_total = Decimal(expense_total or 0)
-    profit_day = revenue_day - expense_day
-    profit_total = revenue_total - expense_total
+    income_day = Decimal(daily_row["income"] or 0)
+    expense_day = Decimal(daily_row["expense"] or 0)
+    income_total = Decimal(total_row["income"] or 0)
+    expense_total = Decimal(total_row["expense"] or 0)
+    profit_day = income_day - expense_day
+    profit_total = income_total - expense_total
     return "\n".join([
         "📈 Прибыль",
-        f"За сегодня: {format_money(profit_day)}₽ (выручка {format_money(revenue_day)}₽, расходы {format_money(expense_day)}₽)",
-        f"За всё время: {format_money(profit_total)}₽ (выручка {format_money(revenue_total)}₽, расходы {format_money(expense_total)}₽)",
+        f"За сегодня: {format_money(profit_day)}₽ (выручка {format_money(income_day)}₽, расходы {format_money(expense_day)}₽)",
+        f"За всё время: {format_money(profit_total)}₽ (выручка {format_money(income_total)}₽, расходы {format_money(expense_total)}₽)",
     ])
 
 
