@@ -5311,105 +5311,116 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
 
     order_info: dict | None = None
     status = "ok"
+    error_text: str | None = None
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                """
-                SELECT o.id,
-                       o.created_at,
-                       o.amount_total,
-                       o.amount_cash,
-                       o.payment_method,
-                       o.bonus_spent,
-                       o.bonus_earned,
-                       o.client_id,
-                       COALESCE(c.full_name, '') AS client_name,
-                       c.phone AS client_phone
-                FROM orders o
-                LEFT JOIN clients c ON c.id = o.client_id
-                WHERE o.id = $1
-                FOR UPDATE
-                """,
-                target_id,
-            )
-
-            if not row:
-                status = "missing"
-            else:
-                client_id = row["client_id"]
-                client_name = (row["client_name"] or "Без имени").strip() or "Без имени"
-                phone_mask = mask_phone_last4(row["client_phone"])
-                payment_method = row["payment_method"] or "—"
-                amount_cash = Decimal(row["amount_cash"] or 0)
-                amount_total = Decimal(row["amount_total"] or 0)
-                bonus_spent = Decimal(row["bonus_spent"] or 0)
-                bonus_earned = Decimal(row["bonus_earned"] or 0)
-                bonus_delta = bonus_earned - bonus_spent
-
-                cash_rows = await conn.fetch(
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
                     """
-                    UPDATE cashbook_entries
-                    SET is_deleted = TRUE, deleted_at = NOW()
-                    WHERE order_id = $1 AND COALESCE(is_deleted, FALSE) = FALSE
-                    RETURNING id, amount, method, comment
+                    SELECT o.id,
+                           o.created_at,
+                           o.amount_total,
+                           o.amount_cash,
+                           o.payment_method,
+                           o.bonus_spent,
+                           o.bonus_earned,
+                           o.client_id,
+                           COALESCE(c.full_name, '') AS client_name,
+                           c.phone AS client_phone
+                    FROM orders o
+                    LEFT JOIN clients c ON c.id = o.client_id
+                    WHERE o.id = $1
+                    FOR UPDATE
                     """,
                     target_id,
                 )
-                cash_removed = sum(Decimal(r["amount"] or 0) for r in cash_rows) if cash_rows else Decimal(0)
-                cash_methods = sorted({r["method"] for r in cash_rows if r["method"]})
 
-                payroll_delete_res = await conn.execute(
-                    "DELETE FROM payroll_items WHERE order_id = $1",
-                    target_id,
-                )
-                payroll_deleted = int(payroll_delete_res.split()[-1])
+                if not row:
+                    status = "missing"
+                else:
+                    client_id = row["client_id"]
+                    client_name = (row["client_name"] or "Без имени").strip() or "Без имени"
+                    phone_mask = mask_phone_last4(row["client_phone"])
+                    payment_method = row["payment_method"] or "—"
+                    amount_cash = Decimal(row["amount_cash"] or 0)
+                    amount_total = Decimal(row["amount_total"] or 0)
+                    bonus_spent = Decimal(row["bonus_spent"] or 0)
+                    bonus_earned = Decimal(row["bonus_earned"] or 0)
+                    bonus_delta = bonus_earned - bonus_spent
 
-                bonus_delete_res = await conn.execute(
-                    "DELETE FROM bonus_transactions WHERE order_id = $1",
-                    target_id,
-                )
-                bonus_deleted = int(bonus_delete_res.split()[-1])
-
-                bonus_adjusted = False
-                if client_id and bonus_delta != 0:
-                    await conn.execute(
+                    cash_rows = await conn.fetch(
                         """
-                        UPDATE clients
-                        SET bonus_balance = GREATEST(COALESCE(bonus_balance,0) - $1, 0),
-                            last_updated = NOW()
-                        WHERE id = $2
+                        UPDATE cashbook_entries
+                        SET is_deleted = TRUE,
+                            deleted_at = NOW(),
+                            order_id = NULL
+                        WHERE order_id = $1 AND COALESCE(is_deleted, FALSE) = FALSE
+                        RETURNING id, amount, method, comment
                         """,
-                        bonus_delta,
-                        client_id,
+                        target_id,
                     )
-                    bonus_adjusted = True
+                    cash_removed = sum(Decimal(r["amount"] or 0) for r in cash_rows) if cash_rows else Decimal(0)
+                    cash_methods = sorted({r["method"] for r in cash_rows if r["method"]})
 
-                await conn.execute(
-                    "DELETE FROM orders WHERE id = $1",
-                    target_id,
-                )
+                    payroll_delete_res = await conn.execute(
+                        "DELETE FROM payroll_items WHERE order_id = $1",
+                        target_id,
+                    )
+                    payroll_deleted = int(payroll_delete_res.split()[-1])
 
-                balance = await get_cash_balance_excluding_withdrawals(conn)
+                    bonus_delete_res = await conn.execute(
+                        "DELETE FROM bonus_transactions WHERE order_id = $1",
+                        target_id,
+                    )
+                    bonus_deleted = int(bonus_delete_res.split()[-1])
 
-                order_info = {
-                    "order_id": target_id,
-                    "client_name": client_name,
-                    "phone_mask": phone_mask,
-                    "payment_method": payment_method,
-                    "cash_removed": cash_removed,
-                    "cash_methods": cash_methods,
-                    "amount_total": amount_total,
-                    "bonus_delta": bonus_delta,
-                    "bonus_adjusted": bonus_adjusted,
-                    "bonus_deleted": bonus_deleted,
-                    "payroll_deleted": payroll_deleted,
-                    "cash_entry_ids": [r["id"] for r in cash_rows],
-                    "balance": balance,
-                }
+                    bonus_adjusted = False
+                    if client_id and bonus_delta != 0:
+                        await conn.execute(
+                            """
+                            UPDATE clients
+                            SET bonus_balance = GREATEST(COALESCE(bonus_balance,0) - $1, 0),
+                                last_updated = NOW()
+                            WHERE id = $2
+                            """,
+                            bonus_delta,
+                            client_id,
+                        )
+                        bonus_adjusted = True
 
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
+                    await conn.execute(
+                        "DELETE FROM orders WHERE id = $1",
+                        target_id,
+                    )
+
+                    balance = await get_cash_balance_excluding_withdrawals(conn)
+
+                    order_info = {
+                        "order_id": target_id,
+                        "client_name": client_name,
+                        "phone_mask": phone_mask,
+                        "payment_method": payment_method,
+                        "cash_removed": cash_removed,
+                        "cash_methods": cash_methods,
+                        "amount_total": amount_total,
+                        "bonus_delta": bonus_delta,
+                        "bonus_adjusted": bonus_adjusted,
+                        "bonus_deleted": bonus_deleted,
+                        "payroll_deleted": payroll_deleted,
+                        "cash_entry_ids": [r["id"] for r in cash_rows],
+                        "balance": balance,
+                    }
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("order_remove failed for order_id=%s", target_id)
+        error_text = str(exc)
+    finally:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+
+    if error_text:
+        await query.message.answer(f"Не удалось удалить заказ: {error_text}", reply_markup=admin_root_kb())
+        return
 
     if status == "missing":
         await query.message.answer("Заказ уже был удалён ранее.", reply_markup=admin_root_kb())
@@ -5422,6 +5433,7 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
     cash_methods = order_info["cash_methods"]
     method_display = ", ".join(cash_methods) if cash_methods else order_info["payment_method"]
     cash_removed = order_info["cash_removed"]
+    cash_adjustment = -cash_removed
     client_label = f"{order_info['client_name']} {order_info['phone_mask']}".strip()
     bonus_delta = order_info["bonus_delta"]
     bonus_adjustment = -bonus_delta
@@ -5430,7 +5442,7 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
         f"Заказ #{order_info['order_id']} удалён.",
         f"Клиент: {client_label}",
         f"Оплата: {order_info['payment_method']} (касса: {method_display})",
-        f"Наличные скорректированы на {format_money(cash_removed)}₽",
+        f"Наличные скорректированы на {format_money(cash_adjustment)}₽",
     ]
 
     if order_info["cash_entry_ids"]:
@@ -5453,7 +5465,7 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
 
     if MONEY_FLOW_CHAT_ID:
         try:
-            cash_line = format_money(cash_removed)
+            cash_line = format_money(cash_adjustment)
             balance_line = format_money(order_info["balance"])
             msg_lines = [
                 "Транзакция удалена",
