@@ -5085,11 +5085,27 @@ async def tx_remove_confirm(query: CallbackQuery, state: FSMContext):
         await query.message.answer("Не удалось получить ID транзакции. Попробуйте снова.", reply_markup=admin_root_kb())
         return
 
+    row: asyncpg.Record | None = None
+    balance_after: Decimal | None = None
     async with pool.acquire() as conn:
-        res = await conn.execute(
-            "UPDATE cashbook_entries SET is_deleted=TRUE, deleted_at=NOW() WHERE id=$1 AND COALESCE(is_deleted,false)=FALSE",
-            target_id,
-        )
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE cashbook_entries
+                SET is_deleted=TRUE, deleted_at=NOW()
+                WHERE id=$1 AND COALESCE(is_deleted,false)=FALSE
+                RETURNING id, kind, method, amount, comment
+                """,
+                target_id,
+            )
+            if row:
+                balance_after = await get_cash_balance_excluding_withdrawals(conn)
+
+    if not row:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Транзакция уже была удалена ранее.", reply_markup=admin_root_kb())
+        return
     if res.split()[-1] == "0":
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
@@ -5098,7 +5114,34 @@ async def tx_remove_confirm(query: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
-    await query.message.answer(f"Транзакция #{target_id} удалена.", reply_markup=admin_root_kb())
+
+    amount = Decimal(row["amount"] or 0)
+    amount_display = format_money(amount)
+    method = row["method"] or "—"
+    kind = _tx_type_label(row)
+    comment = (row["comment"] or "").strip() or "—"
+    balance_line = format_money(balance_after or Decimal(0))
+
+    lines = [
+        f"Транзакция #{target_id} удалена.",
+        f"Тип: {kind}",
+        f"Метод: {method}",
+        f"Сумма: {amount_display}₽",
+        f"Комментарий: {comment}",
+        f"Остаток кассы: {balance_line}₽",
+    ]
+    await query.message.answer("\n".join(lines), reply_markup=admin_root_kb())
+
+    if MONEY_FLOW_CHAT_ID:
+        try:
+            notify_lines = [
+                "Транзакция удалена",
+                f"#{target_id} — {kind} {method} {amount_display}₽",
+                f"Касса - {balance_line}₽",
+            ]
+            await bot.send_message(MONEY_FLOW_CHAT_ID, "\n".join(notify_lines))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("tx_remove notify failed for entry_id=%s: %s", target_id, exc)
 
 
 @dp.message(Command("order_remove"))
