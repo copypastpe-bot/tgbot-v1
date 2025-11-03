@@ -64,6 +64,12 @@ class TxDeleteFSM(StatesGroup):
     waiting_confirm = State()
 
 
+class OrderDeleteFSM(StatesGroup):
+    waiting_date = State()
+    waiting_pick = State()
+    waiting_confirm = State()
+
+
 class AddMasterFSM(StatesGroup):
     waiting_tg_id = State()
     waiting_phone = State()
@@ -1767,6 +1773,7 @@ async def set_commands():
         BotCommand(command="import_amocrm", description="Импорт AmoCRM CSV"),
         BotCommand(command="bonus_backfill", description="Пересчитать бонусы"),
         BotCommand(command="tx_remove", description="Удалить транзакцию"),
+        BotCommand(command="order_remove", description="Удалить заказ"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -2666,6 +2673,8 @@ async def help_cmd(msg: Message):
             "/bonus_backfill — пересчитать историю бонусов (только суперадмин)\n"
             "\n"
             "/tx_remove — удалить приход/расход/изъятие (только суперадмин)\n"
+            "\n"
+            "/order_remove — удалить заказ (только суперадмин)\n"
             "\n"
             "/masters_all — полный список мастеров\n"
             "\n"
@@ -5090,6 +5099,370 @@ async def tx_remove_confirm(query: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
     await query.message.answer(f"Транзакция #{target_id} удалена.", reply_markup=admin_root_kb())
+
+
+@dp.message(Command("order_remove"))
+async def order_remove_start(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+    if role != "superadmin":
+        return await msg.answer("Команда доступна только суперадмину.")
+    await state.set_state(OrderDeleteFSM.waiting_date)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Введите дату заказов (ДД.ММ.ГГГГ):", reply_markup=kb)
+
+
+@dp.message(OrderDeleteFSM.waiting_date)
+async def order_remove_pick_date(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+    if txt.lower() == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Операция отменена.", reply_markup=admin_root_kb())
+
+    dt = parse_birthday_str(txt)
+    if not dt:
+        return await msg.answer("Дата должна быть в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД. Попробуйте снова или нажмите Отмена.")
+
+    start_local = datetime.combine(dt, time.min, tzinfo=MOSCOW_TZ)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT o.id,
+                   o.created_at,
+                   o.amount_total,
+                   o.amount_cash,
+                   o.payment_method,
+                   o.bonus_spent,
+                   o.bonus_earned,
+                   COALESCE(c.full_name, '') AS client_name,
+                   c.phone AS client_phone
+            FROM orders o
+            LEFT JOIN clients c ON c.id = o.client_id
+            WHERE o.created_at >= $1 AND o.created_at < $2
+            ORDER BY o.created_at, o.id
+            """,
+            start_utc,
+            end_utc,
+        )
+
+    if not rows:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("За указанную дату заказы не найдены.", reply_markup=admin_root_kb())
+
+    candidates: list[int] = []
+    lines = [f"Заказы за {dt:%d.%m.%Y}:"]
+    for row in rows:
+        created_at = row["created_at"]
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        created_local = created_at.astimezone(MOSCOW_TZ)
+        client_label = (row["client_name"] or "Без имени").strip() or "Без имени"
+        phone_mask = mask_phone_last4(row["client_phone"])
+        method = row["payment_method"] or "—"
+        cash_amount = format_money(Decimal(row["amount_cash"] or 0))
+        total_amount = format_money(Decimal(row["amount_total"] or 0))
+        lines.append(
+            f"#{row['id']} {created_local:%H:%M} {client_label} {phone_mask} — "
+            f"{method} {cash_amount}₽ (итого {total_amount}₽)"
+        )
+        candidates.append(row["id"])
+
+    await state.update_data(
+        order_period={"start": start_utc.isoformat(), "end": end_utc.isoformat()},
+        order_candidates=candidates,
+    )
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    lines.append("\nВведите ID заказа для удаления или нажмите Отмена.")
+    await state.set_state(OrderDeleteFSM.waiting_pick)
+    await msg.answer("\n".join(lines), reply_markup=kb)
+
+
+@dp.message(OrderDeleteFSM.waiting_pick)
+async def order_remove_choose(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+    if txt.lower() == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Операция отменена.", reply_markup=admin_root_kb())
+
+    if not txt.isdigit():
+        return await msg.answer("Введите числовой ID из списка или нажмите Отмена.")
+    target_id = int(txt)
+    data = await state.get_data()
+    candidates = set(data.get("order_candidates") or [])
+    if target_id not in candidates:
+        return await msg.answer("Этот ID не в списке. Укажите ID из перечня или Отмена.")
+
+    period = data.get("order_period") or {}
+    start_raw = period.get("start")
+    end_raw = period.get("end")
+    if not start_raw or not end_raw:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Не удалось определить период. Попробуйте снова.", reply_markup=admin_root_kb())
+    start = datetime.fromisoformat(start_raw)
+    end = datetime.fromisoformat(end_raw)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT o.id,
+                   o.created_at,
+                   o.amount_total,
+                   o.amount_cash,
+                   o.payment_method,
+                   o.bonus_spent,
+                   o.bonus_earned,
+                   o.client_id,
+                   COALESCE(c.full_name, '') AS client_name,
+                   c.phone AS client_phone,
+                   COALESCE(c.address, '') AS client_address,
+                   COALESCE(s.first_name, '') AS master_fn,
+                   COALESCE(s.last_name, '')  AS master_ln
+            FROM orders o
+            LEFT JOIN clients c ON c.id = o.client_id
+            LEFT JOIN staff s ON s.id = o.master_id
+            WHERE o.id = $1
+              AND o.created_at >= $2
+              AND o.created_at < $3
+            """,
+            target_id,
+            start,
+            end,
+        )
+
+    if not row:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Заказ не найден (возможно, уже удалён).", reply_markup=admin_root_kb())
+
+    created_at = row["created_at"]
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    created_local = created_at.astimezone(MOSCOW_TZ)
+    client_label = (row["client_name"] or "Без имени").strip() or "Без имени"
+    phone_mask = mask_phone_last4(row["client_phone"])
+    address = (row["client_address"] or "").strip()
+    master_name = f"{row['master_fn']} {row['master_ln']}".strip() or "—"
+    payment_method = row["payment_method"] or "—"
+    cash_amount = format_money(Decimal(row["amount_cash"] or 0))
+    total_amount = format_money(Decimal(row["amount_total"] or 0))
+    bonus_spent = int(row["bonus_spent"] or 0)
+    bonus_earned = int(row["bonus_earned"] or 0)
+
+    await state.update_data(order_target_id=target_id)
+    await state.set_state(OrderDeleteFSM.waiting_confirm)
+
+    lines = [
+        "Удалить заказ?",
+        f"ID: {target_id}",
+        f"Дата: {created_local:%d.%m.%Y %H:%M}",
+        f"Клиент: {client_label} {phone_mask}",
+        f"Адрес: {address or '—'}",
+        f"Мастер: {master_name}",
+        f"Оплата: {payment_method}",
+        f"Наличными в кассе: {cash_amount}₽",
+        f"Итого чек: {total_amount}₽",
+        f"Списано бонусов: {bonus_spent}",
+        f"Начислено бонусов: {bonus_earned}",
+        "",
+        "Подтвердите удаление — касса и бонусы будут пересчитаны.",
+    ]
+    await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("order_remove"))
+
+
+@dp.callback_query(OrderDeleteFSM.waiting_confirm)
+async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+    if data not in {"order_remove:yes", "order_remove:cancel"}:
+        await query.answer()
+        return
+
+    await query.answer()
+    await query.message.edit_reply_markup(None)
+
+    if data.endswith("cancel"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Удаление заказа отменено.", reply_markup=admin_root_kb())
+        return
+
+    payload = await state.get_data()
+    target_id = payload.get("order_target_id")
+    if not target_id:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Не удалось получить ID заказа. Попробуйте снова.", reply_markup=admin_root_kb())
+        return
+
+    order_info: dict | None = None
+    status = "ok"
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT o.id,
+                       o.created_at,
+                       o.amount_total,
+                       o.amount_cash,
+                       o.payment_method,
+                       o.bonus_spent,
+                       o.bonus_earned,
+                       o.client_id,
+                       COALESCE(c.full_name, '') AS client_name,
+                       c.phone AS client_phone
+                FROM orders o
+                LEFT JOIN clients c ON c.id = o.client_id
+                WHERE o.id = $1
+                FOR UPDATE
+                """,
+                target_id,
+            )
+
+            if not row:
+                status = "missing"
+            else:
+                client_id = row["client_id"]
+                client_name = (row["client_name"] or "Без имени").strip() or "Без имени"
+                phone_mask = mask_phone_last4(row["client_phone"])
+                payment_method = row["payment_method"] or "—"
+                amount_cash = Decimal(row["amount_cash"] or 0)
+                amount_total = Decimal(row["amount_total"] or 0)
+                bonus_spent = Decimal(row["bonus_spent"] or 0)
+                bonus_earned = Decimal(row["bonus_earned"] or 0)
+                bonus_delta = bonus_earned - bonus_spent
+
+                cash_rows = await conn.fetch(
+                    """
+                    UPDATE cashbook_entries
+                    SET is_deleted = TRUE, deleted_at = NOW()
+                    WHERE order_id = $1 AND COALESCE(is_deleted, FALSE) = FALSE
+                    RETURNING id, amount, method, comment
+                    """,
+                    target_id,
+                )
+                cash_removed = sum(Decimal(r["amount"] or 0) for r in cash_rows) if cash_rows else Decimal(0)
+                cash_methods = sorted({r["method"] for r in cash_rows if r["method"]})
+
+                payroll_delete_res = await conn.execute(
+                    "DELETE FROM payroll_items WHERE order_id = $1",
+                    target_id,
+                )
+                payroll_deleted = int(payroll_delete_res.split()[-1])
+
+                bonus_delete_res = await conn.execute(
+                    "DELETE FROM bonus_transactions WHERE order_id = $1",
+                    target_id,
+                )
+                bonus_deleted = int(bonus_delete_res.split()[-1])
+
+                bonus_adjusted = False
+                if client_id and bonus_delta != 0:
+                    await conn.execute(
+                        """
+                        UPDATE clients
+                        SET bonus_balance = GREATEST(COALESCE(bonus_balance,0) - $1, 0),
+                            last_updated = NOW()
+                        WHERE id = $2
+                        """,
+                        bonus_delta,
+                        client_id,
+                    )
+                    bonus_adjusted = True
+
+                await conn.execute(
+                    "DELETE FROM orders WHERE id = $1",
+                    target_id,
+                )
+
+                balance = await get_cash_balance_excluding_withdrawals(conn)
+
+                order_info = {
+                    "order_id": target_id,
+                    "client_name": client_name,
+                    "phone_mask": phone_mask,
+                    "payment_method": payment_method,
+                    "cash_removed": cash_removed,
+                    "cash_methods": cash_methods,
+                    "amount_total": amount_total,
+                    "bonus_delta": bonus_delta,
+                    "bonus_adjusted": bonus_adjusted,
+                    "bonus_deleted": bonus_deleted,
+                    "payroll_deleted": payroll_deleted,
+                    "cash_entry_ids": [r["id"] for r in cash_rows],
+                    "balance": balance,
+                }
+
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+
+    if status == "missing":
+        await query.message.answer("Заказ уже был удалён ранее.", reply_markup=admin_root_kb())
+        return
+
+    if not order_info:
+        await query.message.answer("Не удалось удалить заказ. Проверьте журналы.", reply_markup=admin_root_kb())
+        return
+
+    cash_methods = order_info["cash_methods"]
+    method_display = ", ".join(cash_methods) if cash_methods else order_info["payment_method"]
+    cash_removed = order_info["cash_removed"]
+    client_label = f"{order_info['client_name']} {order_info['phone_mask']}".strip()
+    bonus_delta = order_info["bonus_delta"]
+    bonus_adjustment = -bonus_delta
+
+    lines = [
+        f"Заказ #{order_info['order_id']} удалён.",
+        f"Клиент: {client_label}",
+        f"Оплата: {order_info['payment_method']} (касса: {method_display})",
+        f"Наличные скорректированы на {format_money(cash_removed)}₽",
+    ]
+
+    if order_info["cash_entry_ids"]:
+        ids_str = ", ".join(f"#{cid}" for cid in order_info["cash_entry_ids"])
+        lines.append(f"Помечены кассовые записи: {ids_str}")
+    else:
+        lines.append("Кассовых записей для заказа не найдено.")
+
+    if order_info["payroll_deleted"]:
+        lines.append(f"Удалено записей payroll: {order_info['payroll_deleted']}")
+    if order_info["bonus_deleted"]:
+        lines.append(f"Удалено бонусных транзакций: {order_info['bonus_deleted']}")
+    if order_info["bonus_adjusted"]:
+        adj_str = f"{int(bonus_adjustment)}"
+        lines.append(f"Бонусы клиента скорректированы на {adj_str}")
+
+    lines.append(f"Остаток кассы: {format_money(order_info['balance'])}₽")
+
+    await query.message.answer("\n".join(lines), reply_markup=admin_root_kb())
+
+    if MONEY_FLOW_CHAT_ID:
+        try:
+            cash_line = format_money(cash_removed)
+            balance_line = format_money(order_info["balance"])
+            msg_lines = [
+                "Транзакция удалена",
+                f"Заказ №{order_info['order_id']} — {method_display} {cash_line}₽",
+                f"Касса - {balance_line}₽",
+            ]
+            await bot.send_message(MONEY_FLOW_CHAT_ID, "\n".join(msg_lines))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("order_remove notify failed for order_id=%s: %s", order_info["order_id"], exc)
 
 
 @dp.message(Command("bonus_backfill"))
