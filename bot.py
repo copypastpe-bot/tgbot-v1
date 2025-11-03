@@ -5331,7 +5331,7 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
                     FROM orders o
                     LEFT JOIN clients c ON c.id = o.client_id
                     WHERE o.id = $1
-                    FOR UPDATE
+                    FOR UPDATE OF o
                     """,
                     target_id,
                 )
