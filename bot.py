@@ -5969,6 +5969,9 @@ async def commit_order(msg: Message, state: FSMContext):
     total_pay = Decimal(str(data["total_pay"]))
     name = data.get("client_name")
     new_bday = data.get("new_birthday")  # date|None
+    client_birthday_val: date | None = data.get("birthday")
+    if isinstance(client_birthday_val, str):
+        client_birthday_val = parse_birthday_str(client_birthday_val)
 
     order_id: int | None = None
     master_display_name: str | None = None
@@ -5989,13 +5992,14 @@ async def commit_order(msg: Message, state: FSMContext):
                 "  full_name = COALESCE(EXCLUDED.full_name, clients.full_name), "
                 "  birthday  = COALESCE(EXCLUDED.birthday, clients.birthday), "
                 "  status='client' "
-                "RETURNING id, bonus_balance, full_name, phone, address",
+                "RETURNING id, bonus_balance, full_name, phone, address, birthday",
                 name, phone_in, new_bday
             )
             client_id = client["id"]
             client_full_name_val = (client["full_name"] or name or "").strip() or None
             client_phone_val = client["phone"] or phone_in
             client_address_val = client.get("address")
+            client_birthday_val = client.get("birthday") or client_birthday_val or new_bday
 
             order = await conn.fetchrow(
                 "INSERT INTO orders (client_id, master_id, phone_digits, amount_total, amount_cash, amount_upsell, "
@@ -6074,6 +6078,9 @@ async def commit_order(msg: Message, state: FSMContext):
 
     master_display_name = master_display_name or (msg.from_user.full_name or msg.from_user.username or f"tg:{msg.from_user.id}")
     client_display_masked = client_display_masked or f"{(name or 'Клиент').strip() or 'Клиент'} {mask_phone_last4(client_phone_val)}".strip()
+    birthday_display = "—"
+    if isinstance(client_birthday_val, date):
+        birthday_display = client_birthday_val.strftime("%d.%m")
 
     if ORDERS_CONFIRM_CHAT_ID:
         try:
@@ -6083,6 +6090,7 @@ async def commit_order(msg: Message, state: FSMContext):
             ]
             if client_address_val:
                 lines.append(f"Адрес: {client_address_val}")
+            lines.append(f"ДР: {birthday_display}")
             pay_line = (
                 f"Оплата: {payment_method} {format_money(cash_payment)}₽ | "
                 f"Бонусами {bonus_spent} | Итого: {format_money(amount_total)}₽"
