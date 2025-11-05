@@ -6577,9 +6577,9 @@ async def show_confirm(msg: Message, state: FSMContext):
     bonus_spent = Decimal(str(data.get("bonus_spent", 0)))
     cash_payment = Decimal(str(data["amount_cash"]))
     payment_method = data.get("payment_method")
-    gross = amount if payment_method == GIFT_CERT_LABEL else cash_payment
+    base_calc_amount = amount
     bonus_earned = qround_ruble(cash_payment * BONUS_RATE)
-    base_pay = qround_ruble(gross * (MASTER_PER_3000 / Decimal(3000)))
+    base_pay = qround_ruble(base_calc_amount * (MASTER_PER_3000 / Decimal(3000)))
     if base_pay < Decimal("1000"):
         base_pay = Decimal("1000")
     upsell_pay = qround_ruble(upsell * (UPSELL_PER_3000 / Decimal(3000)))
@@ -6712,8 +6712,8 @@ async def commit_order(msg: Message, state: FSMContext):
             await conn.execute(
                 "INSERT INTO payroll_items (order_id, master_id, base_pay, fuel_pay, upsell_pay, total_pay, calc_info) "
                 "VALUES ($1, (SELECT id FROM staff WHERE tg_user_id=$2), $3, $4, $5, $6, "
-                "        jsonb_build_object('cash_payment', to_jsonb(($7)::numeric), 'rules', '1000/3000 + 150 + 500/3000'))",
-                order_id, msg.from_user.id, base_pay, fuel_pay, upsell_pay, total_pay, cash_payment
+                "        jsonb_build_object('base_amount', to_jsonb(($7)::numeric), 'cash_payment', to_jsonb(($8)::numeric), 'rules', '1000/3000 + 150 + 500/3000'))",
+                order_id, msg.from_user.id, base_pay, fuel_pay, upsell_pay, total_pay, amount_total, cash_payment
             )
 
             street_label = extract_street(client_address_val)
