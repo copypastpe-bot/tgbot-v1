@@ -738,6 +738,11 @@ def _withdrawal_filter_sql(alias: str = "e") -> str:
     )
 
 
+def _cashbook_active_filter(alias: str = "c") -> str:
+    """Условие для выборок кассовых записей: не удалены и не стартовый остаток."""
+    return f"COALESCE({alias}.is_deleted,false)=FALSE AND {alias}.kind <> 'opening_balance'"
+
+
 def _cashbook_daily_aggregates_sql(start_sql: str, end_sql: str) -> str:
     """Собирает SQL для агрегации кассовых движений по дням в заданном диапазоне."""
     return f"""
@@ -748,7 +753,7 @@ def _cashbook_daily_aggregates_sql(start_sql: str, end_sql: str) -> str:
         FROM cashbook_entries c
         WHERE c.happened_at >= {start_sql}
           AND c.happened_at < {end_sql}
-          AND COALESCE(c.is_deleted,false)=FALSE
+          AND {_cashbook_active_filter("c")}
         GROUP BY 1
     """
 
@@ -3199,13 +3204,13 @@ async def get_payments_by_method_report_text(period: str) -> str:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT COALESCE(method,'прочее') AS method,
+            SELECT COALESCE(c.method,'прочее') AS method,
                    COUNT(*)::int AS cnt,
-                   COALESCE(SUM(amount),0)::numeric(12,2) AS total
-            FROM cashbook_entries
-            WHERE kind='income'
-              AND happened_at >= {start_sql} AND happened_at < {end_sql}
-              AND COALESCE(is_deleted,false)=FALSE
+                   COALESCE(SUM(c.amount),0)::numeric(12,2) AS total
+            FROM cashbook_entries c
+            WHERE c.kind='income'
+              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+              AND {_cashbook_active_filter("c")}
             GROUP BY 1
             ORDER BY total DESC, method
             """
@@ -3213,10 +3218,10 @@ async def get_payments_by_method_report_text(period: str) -> str:
         total_income = await conn.fetchval(
             f"""
             SELECT COALESCE(SUM(amount),0)::numeric(12,2)
-            FROM cashbook_entries
-            WHERE kind='income'
-              AND happened_at >= {start_sql} AND happened_at < {end_sql}
-              AND COALESCE(is_deleted,false)=FALSE
+            FROM cashbook_entries c
+            WHERE c.kind='income'
+              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+              AND {_cashbook_active_filter("c")}
             """
         )
 
@@ -3288,17 +3293,17 @@ async def build_daily_cash_summary_text() -> str:
               COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
             FROM cashbook_entries c
             WHERE c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-              AND COALESCE(c.is_deleted,false)=FALSE
+              AND {_cashbook_active_filter("c")}
             """
         )
         pay_rows = await conn.fetch(
             f"""
-            SELECT COALESCE(method,'прочее') AS method,
-                   COALESCE(SUM(amount),0)::numeric(12,2) AS total
-            FROM cashbook_entries
-            WHERE kind='income'
-              AND happened_at >= {start_sql} AND happened_at < {end_sql}
-              AND COALESCE(is_deleted,false)=FALSE
+            SELECT COALESCE(c.method,'прочее') AS method,
+                   COALESCE(SUM(c.amount),0)::numeric(12,2) AS total
+            FROM cashbook_entries c
+            WHERE c.kind='income'
+              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+              AND {_cashbook_active_filter("c")}
             GROUP BY 1
             """
         )
@@ -3340,7 +3345,7 @@ async def build_profit_summary_text() -> str:
               COALESCE(SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END),0)::numeric(12,2)  AS income,
               COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
             FROM cashbook_entries c
-            WHERE COALESCE(c.is_deleted,false)=FALSE
+            WHERE {_cashbook_active_filter("c")}
             """
         )
 
