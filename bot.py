@@ -740,14 +740,18 @@ def _withdrawal_filter_sql(alias: str = "e") -> str:
 
 def _cashbook_active_filter(alias: str = "c") -> str:
     """Условие для выборок кассовых записей: не удалены и не стартовый остаток."""
-    return f"COALESCE({alias}.is_deleted,false)=FALSE AND {alias}.kind <> 'opening_balance'"
+    return (
+        f"COALESCE({alias}.is_deleted,false)=FALSE "
+        f"AND {alias}.kind <> 'opening_balance' "
+        f"AND NOT ({alias}.kind='income' AND {alias}.comment ILIKE 'Стартовый остаток%')"
+    )
 
 
 def _cashbook_daily_aggregates_sql(start_sql: str, end_sql: str) -> str:
     """Собирает SQL для агрегации кассовых движений по дням в заданном диапазоне."""
     return f"""
         SELECT
-            date_trunc('day', c.happened_at) AS day,
+            (c.happened_at AT TIME ZONE 'Europe/Moscow')::date AS day,
             SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END) AS income,
             SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END) AS expense
         FROM cashbook_entries c
@@ -3004,7 +3008,7 @@ async def get_cash_report_text(period: str) -> str:
             rows = await conn.fetch(
                 f"""
                 WITH daily AS ({daily_sql})
-                SELECT date_trunc('month', day) AS g,
+                SELECT date_trunc('month', day::timestamp) AS g,
                        COALESCE(SUM(income),0)::numeric(12,2)    AS income,
                        COALESCE(SUM(expense),0)::numeric(12,2)   AS expense,
                        COALESCE(SUM(income - expense),0)::numeric(12,2) AS delta
@@ -3122,7 +3126,7 @@ async def get_profit_report_text(period: str) -> str:
             rows = await conn.fetch(
                 f"""
                 WITH daily AS ({daily_sql})
-                SELECT date_trunc('month', day) AS g,
+                SELECT date_trunc('month', day::timestamp) AS g,
                        COALESCE(SUM(income),0)::numeric(12,2)  AS income,
                        COALESCE(SUM(expense),0)::numeric(12,2) AS expense,
                        (COALESCE(SUM(income),0) - COALESCE(SUM(expense),0))::numeric(12,2) AS profit
