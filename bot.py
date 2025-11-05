@@ -4190,7 +4190,7 @@ async def admin_salary_pick_master(msg: Message, state: FSMContext):
         await state.set_state(AdminMenuFSM.root)
         return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
 
-    match = re.search(r"(\\d+)$", text)
+    match = re.search(r"(\d+)$", text)
     if not match:
         prompt, kb = await build_salary_master_kb()
         return await msg.answer("Укажите мастера из списка или нажмите «Отмена».", reply_markup=kb)
