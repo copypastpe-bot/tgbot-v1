@@ -1463,6 +1463,7 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
     processed = 0
     for row in rows:
         client_id = row["id"]
+        current_balance = Decimal(row["bonus_balance"] or 0)
         existing = await conn.fetchval(
             """
             SELECT 1
@@ -1480,6 +1481,29 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
 
         amount = BONUS_BIRTHDAY_VALUE.quantize(Decimal("1"))
         expires_at = (datetime.now(MOSCOW_TZ) + timedelta(days=365)).astimezone(timezone.utc)
+        expire_needed = Decimal("0")
+        if current_balance >= BONUS_BIRTHDAY_VALUE:
+            expire_needed = BONUS_BIRTHDAY_VALUE
+        if expire_needed > 0:
+            expire_int = int(expire_needed)
+            await conn.execute(
+                """
+                INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, meta)
+                VALUES ($1, $2, 'expire', NOW(), NOW(), jsonb_build_object('reason','birthday_refresh'))
+                """,
+                client_id,
+                -expire_int,
+            )
+            await conn.execute(
+                """
+                UPDATE clients
+                SET bonus_balance = GREATEST(COALESCE(bonus_balance,0) - $1, 0),
+                    last_updated = NOW()
+                WHERE id=$2
+                """,
+                expire_int,
+                client_id,
+            )
         try:
             await conn.execute(
                 """
