@@ -39,6 +39,12 @@ class AdminMastersFSM(StatesGroup):
     remove_wait_phone = State()
 
 
+class AdminPayrollFSM(StatesGroup):
+    waiting_master = State()
+    waiting_start = State()
+    waiting_end = State()
+
+
 class IncomeFSM(StatesGroup):
     waiting_method = State()
     waiting_amount = State()
@@ -488,9 +494,98 @@ def admin_root_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Отчёты")],
         [KeyboardButton(text="Приход"), KeyboardButton(text="Расход"), KeyboardButton(text="Изъятие")],
         [KeyboardButton(text="Мастера"), KeyboardButton(text="Клиенты")],
-        [KeyboardButton(text="Кто я")],
+        [KeyboardButton(text="Рассчитать ЗП")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+async def build_salary_master_kb() -> tuple[str, ReplyKeyboardMarkup]:
+    """
+    Возвращает подсказку и клавиатуру с активными мастерами для расчёта ЗП.
+    """
+    async with pool.acquire() as conn:
+        masters = await conn.fetch(
+            """
+            SELECT id,
+                   COALESCE(first_name,'') AS fn,
+                   COALESCE(last_name,'')  AS ln
+            FROM staff
+            WHERE role='master' AND is_active
+            ORDER BY fn, ln, id
+            """
+        )
+    if not masters:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        return "Активных мастеров не найдено.", kb
+
+    rows = [
+        [KeyboardButton(text=f"{(r['fn'] + ' ' + r['ln']).strip() or 'Мастер'} {r['id']}")]
+        for r in masters
+    ]
+    rows.append([KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")])
+    kb = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+    return "Выберите мастера:", kb
+
+
+async def build_salary_summary_text(master_id: int, start_date: date, end_date: date) -> str:
+    start_dt = datetime.combine(start_date, time.min, tzinfo=MOSCOW_TZ)
+    end_dt = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=MOSCOW_TZ)
+    label = f"{start_date:%d.%m.%Y}–{end_date:%d.%m.%Y}"
+    async with pool.acquire() as conn:
+        master = await conn.fetchrow(
+            "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+            "FROM staff WHERE id=$1",
+            master_id,
+        )
+        if not master:
+            return "Мастер не найден."
+
+        rec = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(*)                                   AS orders,
+              COALESCE(SUM(pi.base_pay),   0)::numeric(12,2) AS base_pay,
+              COALESCE(SUM(pi.fuel_pay),   0)::numeric(12,2) AS fuel_pay,
+              COALESCE(SUM(pi.upsell_pay), 0)::numeric(12,2) AS upsell_pay,
+              COALESCE(SUM(pi.total_pay),  0)::numeric(12,2) AS total_pay
+            FROM payroll_items pi
+            JOIN orders o ON o.id = pi.order_id
+            WHERE pi.master_id = $1
+              AND o.created_at >= $2
+              AND o.created_at <  $3
+            """,
+            master_id,
+            start_dt,
+            end_dt,
+        )
+
+        cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
+
+    orders = int(rec["orders"] or 0) if rec else 0
+    base_pay = Decimal(rec["base_pay"] or 0) if rec else Decimal(0)
+    fuel_pay = Decimal(rec["fuel_pay"] or 0) if rec else Decimal(0)
+    upsell_pay = Decimal(rec["upsell_pay"] or 0) if rec else Decimal(0)
+    total_pay = Decimal(rec["total_pay"] or 0) if rec else Decimal(0)
+    on_hand = cash_on_orders - withdrawn_total
+    if on_hand < Decimal(0):
+        on_hand = Decimal(0)
+
+    name = f"{master['fn']} {master['ln']}".strip() or f"Мастер #{master_id}"
+
+    lines = [
+        f"💼 {name} — {label}",
+        f"Заказов выполнено: {orders}",
+        f"Сумма к выплате: {format_money(total_pay)}₽",
+        f"База: {format_money(base_pay)}₽",
+        f"Бенз: {format_money(fuel_pay)}₽",
+        f"Допы: {format_money(upsell_pay)}₽",
+        f"Наличных на руках: {format_money(on_hand)}₽",
+    ]
+    return "\n".join(lines)
 
 
 def admin_masters_kb() -> ReplyKeyboardMarkup:
@@ -4073,6 +4168,117 @@ async def reports_cancel(msg: Message, state: FSMContext):
     await msg.answer("Отменено. Возврат в меню администратора.", reply_markup=admin_root_kb())
 
 
+@dp.message(AdminMenuFSM.root, F.text == "Рассчитать ЗП")
+async def admin_salary_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "view_orders_reports"):
+        return await msg.answer("Только для администраторов.")
+    prompt, kb = await build_salary_master_kb()
+    await state.set_state(AdminPayrollFSM.waiting_master)
+    await msg.answer(prompt, reply_markup=kb)
+
+
+@dp.message(AdminPayrollFSM.waiting_master)
+async def admin_salary_pick_master(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    low = text.lower()
+    if low == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    if low == "назад":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+
+    match = re.search(r"(\\d+)$", text)
+    if not match:
+        prompt, kb = await build_salary_master_kb()
+        return await msg.answer("Укажите мастера из списка или нажмите «Отмена».", reply_markup=kb)
+
+    master_id = int(match.group(1))
+    async with pool.acquire() as conn:
+        master = await conn.fetchrow(
+            "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln "
+            "FROM staff WHERE id=$1 AND role='master' AND is_active",
+            master_id,
+        )
+    if not master:
+        prompt, kb = await build_salary_master_kb()
+        return await msg.answer("Мастер не найден или неактивен. Выберите другого.", reply_markup=kb)
+
+    name = f"{master['fn']} {master['ln']}".strip() or f"Мастер #{master_id}"
+    await state.update_data(salary_master_id=master_id, salary_master_name=name)
+    await state.set_state(AdminPayrollFSM.waiting_start)
+    await msg.answer(
+        f"Мастер: {name}\nВведите дату начала периода (ДД.ММ.ГГГГ):",
+        reply_markup=back_cancel_kb,
+    )
+
+
+@dp.message(AdminPayrollFSM.waiting_start)
+async def admin_salary_pick_start(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    low = text.lower()
+    if low == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    if low == "назад":
+        prompt, kb = await build_salary_master_kb()
+        await state.set_state(AdminPayrollFSM.waiting_master)
+        return await msg.answer(prompt, reply_markup=kb)
+
+    start_date = parse_birthday_str(text)
+    if not start_date:
+        return await msg.answer("Дата должна быть в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД.", reply_markup=back_cancel_kb)
+
+    await state.update_data(salary_start_date=start_date.isoformat())
+    await state.set_state(AdminPayrollFSM.waiting_end)
+    await msg.answer("Введите дату окончания периода (ДД.ММ.ГГГГ, включительно):", reply_markup=back_cancel_kb)
+
+
+@dp.message(AdminPayrollFSM.waiting_end)
+async def admin_salary_pick_end(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    low = text.lower()
+    if low == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Меню администратора:", reply_markup=admin_root_kb())
+    if low == "назад":
+        await state.set_state(AdminPayrollFSM.waiting_start)
+        return await msg.answer("Введите дату начала периода (ДД.ММ.ГГГГ):", reply_markup=back_cancel_kb)
+
+    data = await state.get_data()
+    master_id = data.get("salary_master_id")
+    if not master_id:
+        prompt, kb = await build_salary_master_kb()
+        await state.set_state(AdminPayrollFSM.waiting_master)
+        return await msg.answer("Сначала выберите мастера.", reply_markup=kb)
+
+    start_iso = data.get("salary_start_date")
+    if not start_iso:
+        await state.set_state(AdminPayrollFSM.waiting_start)
+        return await msg.answer("Сначала введите дату начала периода.", reply_markup=back_cancel_kb)
+
+    start_date = date.fromisoformat(start_iso)
+    end_date = parse_birthday_str(text)
+    if not end_date:
+        return await msg.answer("Дата должна быть в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД.", reply_markup=back_cancel_kb)
+    if end_date < start_date:
+        return await msg.answer("Дата окончания не может быть раньше начала. Укажите корректную дату.", reply_markup=back_cancel_kb)
+
+    summary = await build_salary_summary_text(int(master_id), start_date, end_date)
+    await msg.answer(summary)
+
+    await state.update_data(salary_start_date=None)
+    await state.set_state(AdminPayrollFSM.waiting_start)
+    await msg.answer(
+        "Введите дату начала следующего периода или нажмите «Назад», чтобы выбрать другого мастера.",
+        reply_markup=back_cancel_kb,
+    )
+
+
 @dp.message(AdminMenuFSM.root, F.text == "Отчёты")
 async def adm_root_reports(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "view_orders_reports"):
@@ -5963,7 +6169,7 @@ master_kb = ReplyKeyboardMarkup(
 
 def master_main_kb() -> ReplyKeyboardMarkup:
     return master_kb
-salary_period_kb = ReplyKeyboardMarkup(
+master_salary_period_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="День"), KeyboardButton(text="Неделя")],
         [KeyboardButton(text="Месяц"), KeyboardButton(text="Год")],
@@ -5974,6 +6180,12 @@ salary_period_kb = ReplyKeyboardMarkup(
 cancel_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Отмена")]],
     resize_keyboard=True
+)
+
+back_cancel_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
 )
 
 
@@ -6597,7 +6809,7 @@ async def master_salary_prompt(msg: Message, state: FSMContext):
     await state.set_state(MasterFSM.waiting_salary_period)
     await msg.answer(
         "Выберите период:",
-        reply_markup=salary_period_kb
+        reply_markup=master_salary_period_kb
     )
 
 @dp.message(MasterFSM.waiting_salary_period, F.text)
@@ -6613,7 +6825,7 @@ async def master_salary_calc(msg: Message, state: FSMContext):
     if not period:
         return await msg.answer(
             "Период должен быть одним из: День, Неделя, Месяц, Год.",
-            reply_markup=salary_period_kb
+            reply_markup=master_salary_period_kb
         )
     async with pool.acquire() as conn:
         rec = await conn.fetchrow(
