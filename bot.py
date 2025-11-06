@@ -1445,6 +1445,56 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
     today_local = datetime.now(MOSCOW_TZ).date()
     errors: list[str] = []
 
+    async def _consume_expired_portion(client_id: int, amount: Decimal) -> None:
+        remaining = Decimal(amount)
+        while remaining > 0:
+            row = await conn.fetchrow(
+                """
+                WITH available AS (
+                    SELECT
+                        t.id,
+                        (t.delta + COALESCE(SUM(e.delta),0)) AS remaining
+                    FROM bonus_transactions t
+                    LEFT JOIN bonus_transactions e
+                        ON e.meta ->> 'expires_source' = t.id::text
+                    WHERE t.client_id = $1
+                      AND t.delta > 0
+                      AND t.expires_at IS NOT NULL
+                    GROUP BY t.id
+                    HAVING (t.delta + COALESCE(SUM(e.delta),0)) > 0
+                    ORDER BY t.expires_at, t.id
+                    LIMIT 1
+                )
+                SELECT id, remaining FROM available;
+                """,
+                client_id,
+            )
+            if not row:
+                break
+            available = Decimal(row["remaining"])
+            chunk = min(remaining, available)
+            chunk_int = int(chunk)
+            await conn.execute(
+                """
+                INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, meta)
+                VALUES ($1, $2, 'expire', NOW(), NOW(), jsonb_build_object('reason','birthday_refresh','expires_source',$3::text))
+                """,
+                client_id,
+                -chunk_int,
+                row["id"],
+            )
+            await conn.execute(
+                """
+                UPDATE clients
+                SET bonus_balance = GREATEST(COALESCE(bonus_balance,0) - $1, 0),
+                    last_updated = NOW()
+                WHERE id=$2
+                """,
+                chunk_int,
+                client_id,
+            )
+            remaining -= chunk
+
     rows = await conn.fetch(
         """
         SELECT id, full_name, phone, bonus_balance, birthday
@@ -1485,25 +1535,7 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
         if current_balance >= BONUS_BIRTHDAY_VALUE:
             expire_needed = BONUS_BIRTHDAY_VALUE
         if expire_needed > 0:
-            expire_int = int(expire_needed)
-            await conn.execute(
-                """
-                INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, meta)
-                VALUES ($1, $2, 'expire', NOW(), NOW(), jsonb_build_object('reason','birthday_refresh'))
-                """,
-                client_id,
-                -expire_int,
-            )
-            await conn.execute(
-                """
-                UPDATE clients
-                SET bonus_balance = GREATEST(COALESCE(bonus_balance,0) - $1, 0),
-                    last_updated = NOW()
-                WHERE id=$2
-                """,
-                expire_int,
-                client_id,
-            )
+            await _consume_expired_portion(client_id, expire_needed)
         try:
             await conn.execute(
                 """
