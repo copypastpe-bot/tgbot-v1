@@ -1,9 +1,10 @@
-import asyncio, os, re, logging
+import asyncio, os, re, logging, html
 import csv, io
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone, timedelta, time
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -303,6 +304,21 @@ def normalize_phone_for_db(s: str) -> str:
     if digits_all and not s.startswith('+'):
         return '+' + digits_all
     return s
+
+
+def _escape_html(value: object) -> str:
+    return html.escape("" if value is None else str(value))
+
+
+def _bold_html(value: object) -> str:
+    return f"<b>{_escape_html(value)}</b>"
+
+
+def _format_money_signed(amount: Decimal) -> str:
+    signed = format_money(amount)
+    if amount > 0:
+        return f"+{signed}"
+    return signed
 
 def mask_phone_last4(phone: str | None) -> str:
     d = re.sub(r"[^0-9]", "", phone or "")
@@ -3414,27 +3430,50 @@ def _report_period_bounds(period: str) -> tuple[str, str, str] | None:
     return mapping.get(period)
 
 
-def _format_payment_summary(method_totals: dict[str, Decimal]) -> str:
+def _format_payment_summary(
+    method_totals: dict[str, Decimal],
+    *,
+    multiline: bool = False,
+    html_mode: bool = False,
+    bullet: str = "• ",
+    indent: str = "",
+) -> str:
     """
     Собрать строку с разбивкой по типам оплат. Показываем только ненулевые значения.
     """
     if not method_totals:
-        return "нет данных"
+        return _escape_html("нет данных") if html_mode else "нет данных"
     ordered = list(PAYMENT_METHODS) + [GIFT_CERT_LABEL]
     seen = set()
-    parts: list[str] = []
+    parts: list[tuple[str, Decimal]] = []
     for label in ordered:
         value = method_totals.get(label)
         if value and value != Decimal(0):
-            parts.append(f"{label}: {format_money(value)}₽")
+            parts.append((label, Decimal(value)))
             seen.add(label)
     for label in sorted(method_totals.keys()):
         if label in seen:
             continue
         value = method_totals[label]
         if value and value != Decimal(0):
-            parts.append(f"{label}: {format_money(Decimal(value))}₽")
-    return "; ".join(parts) if parts else "нет данных"
+            parts.append((label, Decimal(value)))
+
+    if not parts:
+        return _escape_html("нет данных") if html_mode else "нет данных"
+
+    if not multiline:
+        if html_mode:
+            return "; ".join(f"{_escape_html(label)}: {_escape_html(f'{format_money(value)}₽')}" for label, value in parts)
+        return "; ".join(f"{label}: {format_money(value)}₽" for label, value in parts)
+
+    lines: list[str] = []
+    for label, value in parts:
+        amount_text = f"{format_money(value)}₽"
+        if html_mode:
+            lines.append(f"{indent}{bullet}{_escape_html(label)}: {_bold_html(amount_text)}")
+        else:
+            lines.append(f"{indent}{bullet}{label}: {amount_text}")
+    return "\n".join(lines)
 
 
 async def build_daily_cash_summary_text() -> str:
@@ -3471,12 +3510,20 @@ async def build_daily_cash_summary_text() -> str:
         method = row["method"] or "прочее"
         method_totals[method] = Decimal(row["total"] or 0)
     lines = [
-        "📊 Касса — за сегодня",
-        f"Приход: {format_money(income)}₽",
-        f"Расход: {format_money(expense)}₽",
-        f"Остаток: {format_money(balance)}₽",
+        "📊 <b>Касса — сегодня</b>",
+        "",
+        f"➕ Приход: {_bold_html(f'{format_money(income)}₽')}",
+        f"➖ Расход: {_bold_html(f'{format_money(expense)}₽')}",
+        f"💰 Остаток: {_bold_html(f'{format_money(balance)}₽')}",
     ]
-    lines.append("Типы оплат: " + _format_payment_summary(method_totals))
+    payments_block = _format_payment_summary(
+        method_totals,
+        multiline=True,
+        html_mode=True,
+    )
+    lines.append("")
+    lines.append("💳 Типы оплат:")
+    lines.append(payments_block)
     return "\n".join(lines)
 
 
@@ -3510,11 +3557,18 @@ async def build_profit_summary_text() -> str:
     expense_total = Decimal(total_row["expense"] or 0)
     profit_day = income_day - expense_day
     profit_total = income_total - expense_total
-    return "\n".join([
-        "📈 Прибыль",
-        f"За сегодня: {format_money(profit_day)}₽ (выручка {format_money(income_day)}₽, расходы {format_money(expense_day)}₽)",
-        f"За всё время: {format_money(profit_total)}₽ (выручка {format_money(income_total)}₽, расходы {format_money(expense_total)}₽)",
-    ])
+    lines = [
+        "📈 <b>Прибыль</b>",
+        "",
+        f"Сегодня: {_bold_html(f'{_format_money_signed(profit_day)}₽')}",
+        f"• Выручка: {_bold_html(f'{format_money(income_day)}₽')}",
+        f"• Расходы: {_bold_html(f'{format_money(expense_day)}₽')}",
+        "",
+        f"За всё время: {_bold_html(f'{_format_money_signed(profit_total)}₽')}",
+        f"• Выручка: {_bold_html(f'{format_money(income_total)}₽')}",
+        f"• Расходы: {_bold_html(f'{format_money(expense_total)}₽')}",
+    ]
+    return "\n".join(lines)
 
 
 async def build_daily_orders_admin_summary_text() -> str:
@@ -3531,7 +3585,7 @@ async def build_daily_orders_admin_summary_text() -> str:
         total_orders = 0
         total_method_totals: dict[str, Decimal] = {}
         total_on_hand = Decimal(0)
-        lines = ["📋 Заказы по мастерам — за сегодня"]
+        lines = ["📋 <b>Заказы по мастерам — сегодня</b>"]
 
         for m in masters:
             stats = await conn.fetchrow(
@@ -3569,16 +3623,36 @@ async def build_daily_orders_admin_summary_text() -> str:
             total_on_hand += on_hand
 
             name = f"{m['fn']} {m['ln']}".strip() or f"Мастер #{m['id']}"
+            lines.append("")
+            lines.append(_bold_html(name))
             if master_orders > 0:
-                payments_text = _format_payment_summary(method_totals)
-                lines.append(f"- {name}: {master_orders} заказ(ов); оплаты — {payments_text}; на руках {format_money(on_hand)}₽")
+                lines.append(f"• Заказы: {_bold_html(master_orders)}")
+                payments_text = _format_payment_summary(
+                    method_totals,
+                    multiline=True,
+                    html_mode=True,
+                    bullet="◦ ",
+                    indent="&nbsp;&nbsp;",
+                )
+                lines.append("• Оплаты:")
+                lines.append(payments_text)
             else:
-                lines.append(f"- {name}: на руках {format_money(on_hand)}₽")
+                lines.append("• Заказов нет")
+            lines.append(f"• На руках: {_bold_html(f'{format_money(on_hand)}₽')}")
 
         lines.append("")
-        lines.append(f"Всего заказов за день: {total_orders}")
-        lines.append("Оплаты всего: " + _format_payment_summary(total_method_totals))
-        lines.append(f"Наличными у мастеров: {format_money(total_on_hand)}₽")
+        lines.append(f"Всего заказов за день: {_bold_html(total_orders)}")
+        lines.append("Оплаты всего:")
+        lines.append(
+            _format_payment_summary(
+                total_method_totals,
+                multiline=True,
+                html_mode=True,
+                bullet="◦ ",
+                indent="&nbsp;&nbsp;",
+            )
+        )
+        lines.append(f"Наличными у мастеров: {_bold_html(f'{format_money(total_on_hand)}₽')}")
     return "\n".join(lines)
 
 
@@ -3658,15 +3732,29 @@ async def build_master_daily_summary_text(user_id: int) -> str:
     total_pay_month = Decimal(payroll_month["total_pay"] or 0)
     name = f"{master_row['fn']} {master_row['ln']}".strip() or f"Мастер #{master_id}"
 
+    total_amount = format_money(Decimal(stats["total_amount"] or 0))
     lines = [
-        f"🧾 Сводка за сегодня — {name}",
-        f"Заказов: {int(stats['cnt'] or 0)}",
-        f"Счёт на сумму: {format_money(Decimal(stats['total_amount'] or 0))}₽",
-        "Типы оплат: " + _format_payment_summary(method_totals),
-        f"ЗП за сегодня: база {format_money(base_pay)}₽ + бензин {format_money(fuel_pay)}₽ + доп {format_money(upsell_pay)}₽ = {format_money(total_pay)}₽",
-        f"ЗП за месяц: {format_money(total_pay_month)}₽",
-        f"Наличных на руках: {format_money(on_hand)}₽",
+        f"🧾 <b>Сводка за сегодня — {_escape_html(name)}</b>",
+        "",
+        f"• Заказы: {_bold_html(int(stats['cnt'] or 0))}",
+        f"• Сумма чеков: {_bold_html(f'{total_amount}₽')}",
     ]
+    payments_text = _format_payment_summary(
+        method_totals,
+        multiline=True,
+        html_mode=True,
+        bullet="◦ ",
+        indent="&nbsp;&nbsp;",
+    )
+    lines.append("• Оплаты:")
+    lines.append(payments_text)
+    lines.append(
+        "• ЗП за сегодня: "
+        f"база {format_money(base_pay)}₽ + бензин {format_money(fuel_pay)}₽ + доп {format_money(upsell_pay)}₽ "
+        f"= {_bold_html(f'{format_money(total_pay)}₽')}"
+    )
+    lines.append(f"• ЗП за месяц: {_bold_html(f'{format_money(total_pay_month)}₽')}")
+    lines.append(f"• Наличные на руках: {_bold_html(f'{format_money(on_hand)}₽')}")
     return "\n".join(lines)
 
 
@@ -3690,13 +3778,13 @@ async def send_daily_reports():
     try:
         cash_text = await build_daily_cash_summary_text()
         if MONEY_FLOW_CHAT_ID:
-            await bot.send_message(MONEY_FLOW_CHAT_ID, cash_text)
+            await bot.send_message(MONEY_FLOW_CHAT_ID, cash_text, parse_mode=ParseMode.HTML)
         profit_text = await build_profit_summary_text()
         if MONEY_FLOW_CHAT_ID:
-            await bot.send_message(MONEY_FLOW_CHAT_ID, profit_text)
+            await bot.send_message(MONEY_FLOW_CHAT_ID, profit_text, parse_mode=ParseMode.HTML)
         orders_text = await build_daily_orders_admin_summary_text()
         if ORDERS_CONFIRM_CHAT_ID:
-            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, orders_text)
+            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, orders_text, parse_mode=ParseMode.HTML)
     except Exception as exc:
         logging.exception("Failed to send admin daily reports: %s", exc)
 
@@ -3710,7 +3798,7 @@ async def send_daily_reports():
             continue
         try:
             text = await build_master_daily_summary_text(int(tg_id))
-            await bot.send_message(tg_id, text)
+            await bot.send_message(tg_id, text, parse_mode=ParseMode.HTML)
         except Exception as exc:
             logging.exception("Failed to send master daily report to %s: %s", tg_id, exc)
 
@@ -3948,7 +4036,7 @@ async def daily_cash_report(msg: Message):
     if not await has_permission(msg.from_user.id, "view_cash_reports"):
         return await msg.answer("Только для администраторов.")
     text = await build_daily_cash_summary_text()
-    await msg.answer(text)
+    await msg.answer(text, parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("daily_profit"))
@@ -3956,7 +4044,7 @@ async def daily_profit_report(msg: Message):
     if not await has_permission(msg.from_user.id, "view_profit_reports"):
         return await msg.answer("Только для администраторов.")
     text = await build_profit_summary_text()
-    await msg.answer(text)
+    await msg.answer(text, parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("daily_orders"))
@@ -3964,7 +4052,7 @@ async def daily_orders_report(msg: Message):
     if not await has_permission(msg.from_user.id, "view_orders_reports"):
         return await msg.answer("Только для администраторов.")
     text = await build_daily_orders_admin_summary_text()
-    await msg.answer(text)
+    await msg.answer(text, parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("orders"))
@@ -6208,7 +6296,7 @@ async def my_daily_report(msg: Message):
     if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     text = await build_master_daily_summary_text(msg.from_user.id)
-    await msg.answer(text)
+    await msg.answer(text, parse_mode=ParseMode.HTML)
 
 
 MASTER_SALARY_LABEL = "💼 Зарплата"
@@ -6798,21 +6886,26 @@ async def commit_order(msg: Message, state: FSMContext):
     if ORDERS_CONFIRM_CHAT_ID:
         try:
             lines = [
-                f"🧾 Заказ №{order_id}",
-                f"Клиент: {client_display_masked}",
+                f"🧾 <b>Заказ №{order_id}</b>",
+                f"👤 Клиент: {_bold_html(client_display_masked)}",
             ]
             if client_address_val:
-                lines.append(f"Адрес: {client_address_val}")
-            lines.append(f"ДР: {birthday_display}")
-            pay_line = (
-                f"Оплата: {payment_method} {format_money(cash_payment)}₽ | "
-                f"Бонусами {bonus_spent} | Итого: {format_money(amount_total)}₽"
+                lines.append(f"📍 Адрес: {_escape_html(client_address_val)}")
+            lines.append(f"🎂 ДР: {_escape_html(birthday_display)}")
+            lines.append(
+                f"💳 Оплата: {_bold_html(f'{payment_method} — {format_money(cash_payment)}₽')}"
             )
-            lines.append(pay_line)
-            lines.append(f"Доп. продажа: {format_money(upsell)}₽")
-            lines.append(f"Бонусов начислено {bonus_earned}")
-            lines.append(f"Мастер: {master_display_name}")
-            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, "\n".join(lines))
+            lines.append(f"💰 Итоговый чек: {_bold_html(f'{format_money(amount_total)}₽')}")
+            lines.append(
+                f"🎁 Бонусы: списано {_bold_html(bonus_spent)} / начислено {_bold_html(bonus_earned)}"
+            )
+            lines.append(f"🧺 Доп. продажа: {_bold_html(f'{format_money(upsell)}₽')}")
+            lines.append(f"👨‍🔧 Мастер: {_bold_html(master_display_name)}")
+            await bot.send_message(
+                ORDERS_CONFIRM_CHAT_ID,
+                "\n".join(lines),
+                parse_mode=ParseMode.HTML,
+            )
         except Exception as e:  # noqa: BLE001
             logging.warning("order confirm notify failed for order_id=%s: %s", order_id, e)
 
