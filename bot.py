@@ -3632,7 +3632,7 @@ async def build_daily_orders_admin_summary_text() -> str:
                     multiline=True,
                     html_mode=True,
                     bullet="◦ ",
-                    indent="&nbsp;&nbsp;",
+                    indent="\u00A0\u00A0",
                 )
                 lines.append("• Оплаты:")
                 lines.append(payments_text)
@@ -3649,7 +3649,7 @@ async def build_daily_orders_admin_summary_text() -> str:
                 multiline=True,
                 html_mode=True,
                 bullet="◦ ",
-                indent="&nbsp;&nbsp;",
+                indent="\u00A0\u00A0",
             )
         )
         lines.append(f"Наличными у мастеров: {_bold_html(f'{format_money(total_on_hand)}₽')}")
@@ -3744,7 +3744,7 @@ async def build_master_daily_summary_text(user_id: int) -> str:
         multiline=True,
         html_mode=True,
         bullet="◦ ",
-        indent="&nbsp;&nbsp;",
+        indent="\u00A0\u00A0",
     )
     lines.append("• Оплаты:")
     lines.append(payments_text)
