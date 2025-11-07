@@ -48,18 +48,23 @@ class WahelpCredentials:
 
 
 class WahelpAuthManager:
-    """Handles token issuance/refresh via /api/app/user/login."""
+    """Handles token issuance/refresh via login + refresh-token endpoint."""
 
     def __init__(
         self,
-        credentials: WahelpCredentials,
         *,
+        credentials: WahelpCredentials | None = None,
+        base_url: str | None = None,
         session: aiohttp.ClientSession | None = None,
         timeout: aiohttp.ClientTimeout = DEFAULT_TIMEOUT,
         safety_margin: int = 60,
     ) -> None:
+        if not credentials and not base_url:
+            base = DEFAULT_BASE_URL
+        else:
+            base = base_url or (credentials.base_url if credentials else DEFAULT_BASE_URL)
+        self._base_url = base.rstrip("/")
         self._credentials = credentials
-        self._base_url = credentials.base_url.rstrip("/")
         self._own_session = session is None
         self._session = session or aiohttp.ClientSession(timeout=timeout)
         self._token: str | None = None
@@ -82,6 +87,16 @@ class WahelpAuthManager:
             return await self._refresh()
 
     async def _refresh(self) -> str:
+        if self._token:
+            try:
+                return await self._refresh_via_endpoint()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Wahelp token refresh via endpoint failed: %s", exc)
+        return await self._login_with_credentials()
+
+    async def _login_with_credentials(self) -> str:
+        if not self._credentials:
+            raise RuntimeError("Wahelp credentials not provided for login")
         url = f"{self._base_url}/api/app/user/login"
         payload = {
             "login": self._credentials.login,
@@ -91,23 +106,32 @@ class WahelpAuthManager:
             data = await WahelpClient._parse_response(resp)
             if resp.status >= 400:
                 raise WahelpAPIError(resp.status, "login failed", data)
-            token = (
-                data.get("data", {}).get("access_token")
-                if isinstance(data, Mapping)
-                else None
-            )
-            if not token:
-                raise WahelpAPIError(resp.status, "missing access_token", data)
-            expires_in = (
-                data.get("data", {}).get("expires_in", 3600)
-                if isinstance(data, Mapping)
-                else 3600
-            )
-            now = asyncio.get_running_loop().time()
-            self._token = token
-            self._expires_at = now + max(self._safety_margin, expires_in)
-            logger.info("Wahelp token refreshed (expires in %s s)", expires_in)
+            token = self._extract_token(data, default_expires=3600)
+            logger.info("Wahelp token obtained via login")
             return token
+
+    async def _refresh_via_endpoint(self) -> str:
+        if not self._token:
+            raise RuntimeError("No token available for refresh")
+        url = f"{self._base_url}/api/app/user/refresh-token"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        async with self._session.get(url, headers=headers) as resp:
+            data = await WahelpClient._parse_response(resp)
+            if resp.status >= 400:
+                raise WahelpAPIError(resp.status, "refresh failed", data)
+            token = self._extract_token(data, default_expires=3600)
+            logger.info("Wahelp token refreshed via endpoint")
+            return token
+
+    def _extract_token(self, data: Any, *, default_expires: int) -> str:
+        access = data.get("data", {}).get("access_token") if isinstance(data, Mapping) else None
+        if not access:
+            raise WahelpAPIError(0, "missing access_token", data)
+        expires_in = data.get("data", {}).get("expires_in", default_expires) if isinstance(data, Mapping) else default_expires
+        now = asyncio.get_running_loop().time()
+        self._token = access
+        self._expires_at = now + max(self._safety_margin, expires_in)
+        return access
 
 
 class WahelpClient:
