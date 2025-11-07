@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from .wahelp_client import (
     DEFAULT_BASE_URL,
+    WahelpAPIError,
     WahelpAuthManager,
     WahelpClient,
     WahelpCredentials,
@@ -78,5 +79,61 @@ def _get_channel_config(kind: ChannelKind) -> WahelpChannelConfig:
     if not project_id or not channel_uuid:
         raise RuntimeError(
             f"Environment variables {env_keys[0]} / {env_keys[1]} must be set for channel {kind}."
-        )
+    )
     return WahelpChannelConfig(project_id=project_id, channel_uuid=channel_uuid)
+
+
+async def ensure_user_in_channel(
+    channel_kind: ChannelKind,
+    *,
+    phone: str,
+    name: str | None = None,
+) -> int:
+    client = get_wahelp_client()
+    cfg = get_project_config(channel_kind)
+    channel_uuid = get_channel_uuid(channel_kind)
+    payload: dict[str, str] = {"phone": phone}
+    if name:
+        payload["name"] = name
+    resp = await client.ensure_user(cfg, channel_uuid=channel_uuid, user_payload=payload)
+    user_id = _extract_user_id(resp)
+    logger.debug("Wahelp ensure_user %s -> %s", channel_kind, user_id)
+    return user_id
+
+
+async def send_text_message(
+    channel_kind: ChannelKind,
+    *,
+    user_id: int,
+    text: str,
+) -> dict:
+    client = get_wahelp_client()
+    cfg = get_project_config(channel_kind)
+    channel_uuid = get_channel_uuid(channel_kind)
+    payload = {"text": text}
+    resp = await client.send_message(cfg, channel_uuid=channel_uuid, user_id=user_id, payload=payload)
+    if isinstance(resp, dict) and resp.get("success") is False:
+        raise WahelpAPIError(0, f"Failed to send message via {channel_kind}", resp)
+    logger.info("Wahelp send via %s user=%s text=%s", channel_kind, user_id, text[:40])
+    return resp if isinstance(resp, dict) else {"data": resp}
+
+
+async def send_text_to_phone(
+    channel_kind: ChannelKind,
+    *,
+    phone: str,
+    name: str | None = None,
+    text: str,
+) -> dict:
+    user_id = await ensure_user_in_channel(channel_kind, phone=phone, name=name)
+    return await send_text_message(channel_kind, user_id=user_id, text=text)
+
+
+def _extract_user_id(resp: dict | Any) -> int:
+    if isinstance(resp, dict):
+        if resp.get("success") is False:
+            raise WahelpAPIError(0, "Wahelp ensure_user returned errors", resp)
+        data = resp.get("data")
+        if isinstance(data, dict) and "id" in data:
+            return int(data["id"])
+    raise WahelpAPIError(0, "Unexpected ensure_user response", resp)
