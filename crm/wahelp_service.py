@@ -1,0 +1,82 @@
+"""Helpers to work with Wahelp API inside the bot."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import logging
+import os
+from typing import Literal
+
+import aiohttp
+from dotenv import load_dotenv
+
+from .wahelp_client import (
+    DEFAULT_BASE_URL,
+    WahelpAuthManager,
+    WahelpClient,
+    WahelpCredentials,
+    WahelpProjectConfig,
+)
+
+logger = logging.getLogger(__name__)
+
+ChannelKind = Literal["clients_tg", "clients_wa", "leads"]
+
+
+@dataclass(frozen=True)
+class WahelpChannelConfig:
+    project_id: str
+    channel_uuid: str
+
+
+CHANNEL_ENV_KEYS: dict[ChannelKind, tuple[str, str]] = {
+    "clients_tg": ("WAHELP_CLIENTS_PROJECT_ID", "WAHELP_CLIENTS_CHANNEL_UUID"),
+    "clients_wa": ("WAHELP_CLIENTS_WA_PROJECT_ID", "WAHELP_CLIENTS_WA_CHANNEL_UUID"),
+    "leads": ("WAHELP_LEADS_PROJECT_ID", "WAHELP_LEADS_CHANNEL_UUID"),
+}
+
+load_dotenv()
+
+_base_url = os.getenv("WAHELP_API_BASE", DEFAULT_BASE_URL)
+_login = os.getenv("WAHELP_LOGIN")
+_password = os.getenv("WAHELP_PASSWORD")
+
+_credentials: WahelpCredentials | None = None
+_auth_manager: WahelpAuthManager | None = None
+_client: WahelpClient | None = None
+
+timeout = aiohttp.ClientTimeout(total=20)
+if _login and _password:
+    _credentials = WahelpCredentials(login=_login, password=_password, base_url=_base_url)
+    _auth_manager = WahelpAuthManager(credentials=_credentials, timeout=timeout)
+    _client = WahelpClient(auth_manager=_auth_manager)
+else:
+    logger.warning("Wahelp credentials are not fully configured; integration disabled.")
+
+
+def get_wahelp_client() -> WahelpClient:
+    if _client is None:
+        raise RuntimeError("Wahelp client is not configured. Check WAHELP_LOGIN/WAHELP_PASSWORD in .env")
+    return _client
+
+
+def get_project_config(kind: ChannelKind) -> WahelpProjectConfig:
+    project_id = _get_channel_config(kind).project_id
+    return WahelpProjectConfig(project_id=project_id, base_url=_base_url)
+
+
+def get_channel_uuid(kind: ChannelKind) -> str:
+    return _get_channel_config(kind).channel_uuid
+
+
+def _get_channel_config(kind: ChannelKind) -> WahelpChannelConfig:
+    env_keys = CHANNEL_ENV_KEYS.get(kind)
+    if not env_keys:
+        raise ValueError(f"Unknown Wahelp channel kind: {kind}")
+    project_id = os.getenv(env_keys[0])
+    channel_uuid = os.getenv(env_keys[1])
+    if not project_id or not channel_uuid:
+        raise RuntimeError(
+            f"Environment variables {env_keys[0]} / {env_keys[1]} must be set for channel {kind}."
+        )
+    return WahelpChannelConfig(project_id=project_id, channel_uuid=channel_uuid)
