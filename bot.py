@@ -1096,7 +1096,13 @@ async def process_amocrm_csv(
     dry_run: bool = False,
 ) -> tuple[dict[str, int], list[str]]:
     stream = io.StringIO(csv_text)
-    reader = csv.DictReader(stream, delimiter=";")
+    # detect delimiter between ';' and ',' automatically
+    sample = stream.readline()
+    delimiter = ";"
+    if sample.count(",") > sample.count(";"):
+        delimiter = ","
+    stream.seek(0)
+    reader = csv.DictReader(stream, delimiter=delimiter)
     if reader.fieldnames:
         reader.fieldnames = [fn.strip().lstrip("\ufeff") for fn in reader.fieldnames]
 
@@ -1111,11 +1117,16 @@ async def process_amocrm_csv(
         phone_raw = ""
         for key in [
             "Рабочий телефон (контакт)",
+            "Рабочий телефон",
             "Телефон",
             "Мобильный телефон (контакт)",
+            "Мобильный телефон",
             "Рабочий прямой телефон (контакт)",
+            "Рабочий прямой телефон",
             "Другой телефон (контакт)",
+            "Другой телефон",
             "Домашний телефон (контакт)",
+            "Домашний телефон",
         ]:
             phone_raw = sanitized.get(key, "")
             if phone_raw:
