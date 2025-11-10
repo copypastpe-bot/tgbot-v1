@@ -238,12 +238,12 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
             client_ids,
         )
         for crow in client_rows:
-        client_map[int(crow["id"])] = {
-            "full_name": crow["full_name"],
-            "phone": crow["phone"],
-            "preferred": crow["wahelp_preferred_channel"],
-            "enabled": bool(crow["notifications_enabled"]),
-        }
+            client_map[int(crow["id"])] = {
+                "full_name": crow["full_name"],
+                "phone": crow["phone"],
+                "preferred": crow["wahelp_preferred_channel"],
+                "enabled": bool(crow["notifications_enabled"]),
+            }
     entries: list[NotificationOutboxEntry] = []
     for row in rows:
         client_info = client_map.get(row["client_id"] or -1, {})
