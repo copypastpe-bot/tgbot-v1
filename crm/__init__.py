@@ -19,7 +19,12 @@ from .wahelp_service import (
     send_text_message,
     send_text_to_phone,
 )
-from .wahelp_dispatcher import ClientContact, send_with_rules
+from .wahelp_dispatcher import (
+    ClientContact,
+    SendResult,
+    cancel_followup_for_client,
+    send_with_rules,
+)
 
 __all__ = [
     "WahelpAPIError",
@@ -34,5 +39,7 @@ __all__ = [
     "send_text_message",
     "send_text_to_phone",
     "ClientContact",
+    "SendResult",
     "send_with_rules",
+    "cancel_followup_for_client",
 ]

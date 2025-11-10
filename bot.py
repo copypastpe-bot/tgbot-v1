@@ -2,6 +2,7 @@ import asyncio, os, re, logging, html
 import csv, io
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone, timedelta, time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -20,6 +21,7 @@ from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from typing import Mapping
 
 # ===== FSM State Groups =====
 class AdminMenuFSM(StatesGroup):
@@ -90,6 +92,15 @@ class ReportsFSM(StatesGroup):
 from dotenv import load_dotenv
 
 import asyncpg
+from notifications import (
+    NotificationRules,
+    NotificationWorker,
+    WahelpWebhookServer,
+    ensure_notification_schema,
+    enqueue_notification,
+    load_notification_rules,
+    start_wahelp_webhook,
+)
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
 # Разрешаем пробелы, дефисы и скобки в пользовательском вводе
@@ -113,6 +124,9 @@ for part in re.split(r"[ ,;]+", _admin_ids_env.strip()):
 # chat ids for notifications (2 чата: «Заказы подтверждения» и «Ракета деньги»)
 ORDERS_CONFIRM_CHAT_ID = int(os.getenv("ORDERS_CONFIRM_CHAT_ID", "0") or "0")  # Заказы подтверждения (в т.ч. З/П)
 MONEY_FLOW_CHAT_ID     = int(os.getenv("MONEY_FLOW_CHAT_ID", "0") or "0")      # «Ракета деньги»
+WAHELP_WEBHOOK_HOST = os.getenv("WAHELP_WEBHOOK_HOST", "0.0.0.0")
+WAHELP_WEBHOOK_PORT = int(os.getenv("WAHELP_WEBHOOK_PORT", "0") or "0")
+WAHELP_WEBHOOK_TOKEN = os.getenv("WAHELP_WEBHOOK_TOKEN")
 
 # env rules
 MIN_CASH = Decimal(os.getenv("MIN_CASH", "2500"))
@@ -129,6 +143,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+BASE_DIR = Path(__file__).resolve().parent
+NOTIFICATION_RULES_PATH = BASE_DIR / "docs" / "notification_rules.json"
+
+notification_rules: NotificationRules | None = None
+notification_worker: NotificationWorker | None = None
+wahelp_webhook: WahelpWebhookServer | None = None
 
 # === Ignore group/supergroup/channel updates; work only in private chats ===
 from aiogram import BaseMiddleware
@@ -148,6 +168,125 @@ dp.callback_query.middleware(IgnoreNonPrivateMiddleware())
 pool: asyncpg.Pool | None = None
 daily_reports_task: asyncio.Task | None = None
 birthday_task: asyncio.Task | None = None
+
+
+async def _try_enqueue_notification(
+    conn: asyncpg.Connection,
+    *,
+    event_key: str,
+    client_id: int,
+    payload: Mapping[str, object],
+    scheduled_at: datetime | None = None,
+) -> None:
+    if notification_rules is None:
+        return
+    try:
+        await enqueue_notification(
+            conn,
+            notification_rules,
+            event_key=event_key,
+            client_id=client_id,
+            payload=payload,
+            scheduled_at=scheduled_at,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to enqueue notification %s for client %s: %s",
+            event_key,
+            client_id,
+            exc,
+        )
+
+
+def _format_expire_label(value: datetime | date | None) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        dt_local = value.astimezone(MOSCOW_TZ)
+    else:
+        dt_local = datetime.combine(value, time(), tzinfo=MOSCOW_TZ)
+    return dt_local.strftime("%d.%m.%Y")
+
+
+async def _get_next_bonus_expire_date(conn: asyncpg.Connection, client_id: int) -> datetime | None:
+    return await conn.fetchval(
+        """
+        SELECT expires_at
+        FROM bonus_transactions
+        WHERE client_id = $1
+          AND delta > 0
+          AND expires_at IS NOT NULL
+        ORDER BY expires_at
+        LIMIT 1
+        """,
+        client_id,
+    )
+
+
+async def _enqueue_bonus_change(
+    conn: asyncpg.Connection,
+    *,
+    client_id: int,
+    delta: int,
+    balance_after: int | Decimal | None,
+    expires_at: datetime | date | None = None,
+) -> None:
+    if delta == 0:
+        return
+    total_bonus: int
+    if balance_after is not None:
+        total_bonus = int(balance_after)
+    else:
+        bal = await conn.fetchval(
+            "SELECT COALESCE(bonus_balance,0) FROM clients WHERE id=$1",
+            client_id,
+        )
+        total_bonus = int(bal or 0)
+    expire_target = expires_at
+    if expire_target is None and delta < 0:
+        expire_target = await _get_next_bonus_expire_date(conn, client_id)
+    payload = {
+        "bonus": abs(int(delta)),
+        "total_bonus": total_bonus,
+        "expire_date": _format_expire_label(expire_target),
+    }
+    event_key = "bonus_credit" if delta > 0 else "bonus_debit"
+    await _try_enqueue_notification(conn, event_key=event_key, client_id=client_id, payload=payload)
+
+
+async def _enqueue_order_completed_notification(
+    conn: asyncpg.Connection,
+    *,
+    client_id: int,
+    total_sum: Decimal,
+    used_bonus: int,
+    earned_bonus: int,
+    bonus_balance: int,
+) -> None:
+    payload = {
+        "total_sum": format_money(total_sum),
+        "used_bonus": used_bonus,
+        "earned_bonus": earned_bonus,
+        "bonus_balance": bonus_balance,
+    }
+    await _try_enqueue_notification(
+        conn,
+        event_key="order_completed_summary_and_rating",
+        client_id=client_id,
+        payload=payload,
+    )
+
+
+def _load_notification_rules() -> NotificationRules | None:
+    try:
+        return load_notification_rules(NOTIFICATION_RULES_PATH)
+    except FileNotFoundError:
+        logger.warning("Notification rules file not found: %s", NOTIFICATION_RULES_PATH)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to load notification rules: %s", exc)
+    return None
 
 # ===== RBAC helpers (DB-driven) =====
 async def get_user_role(conn: asyncpg.Connection, user_id: int) -> str | None:
@@ -1578,6 +1717,13 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
                 int(amount),
                 client_id,
             )
+            await _enqueue_bonus_change(
+                conn,
+                client_id=client_id,
+                delta=int(amount),
+                balance_after=int((current_balance or Decimal(0)) + amount),
+                expires_at=expires_at,
+            )
             processed += 1
         except Exception as exc:  # noqa: BLE001
             logging.exception("Birthday accrual failed for client %s: %s", client_id, exc)
@@ -1633,6 +1779,12 @@ async def _expire_old_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str]]
                 "UPDATE clients SET bonus_balance = bonus_balance - $1, last_updated = NOW() WHERE id=$2",
                 expire_amount,
                 client_id,
+            )
+            await _enqueue_bonus_change(
+                conn,
+                client_id=client_id,
+                delta=-int(expire_amount),
+                balance_after=int(max(0, balance - expire_amount)),
             )
             expired += 1
         except Exception as exc:  # noqa: BLE001
@@ -6812,6 +6964,7 @@ async def commit_order(msg: Message, state: FSMContext):
             client_phone_val = client["phone"] or phone_in
             client_address_val = client.get("address")
             client_birthday_val = client.get("birthday") or client_birthday_val or new_bday
+            current_bonus_balance = int(client.get("bonus_balance") or 0)
 
             order = await conn.fetchrow(
                 "INSERT INTO orders (client_id, master_id, phone_digits, amount_total, amount_cash, amount_upsell, "
@@ -6858,10 +7011,24 @@ async def commit_order(msg: Message, state: FSMContext):
                     "INSERT INTO bonus_transactions (client_id, delta, reason, order_id) VALUES ($1, $2, 'spend', $3)",
                     client_id, -bonus_spent, order_id
                 )
+                current_bonus_balance -= bonus_spent
+                await _enqueue_bonus_change(
+                    conn,
+                    client_id=client_id,
+                    delta=-bonus_spent,
+                    balance_after=current_bonus_balance,
+                )
             if bonus_earned > 0:
                 await conn.execute(
                     "INSERT INTO bonus_transactions (client_id, delta, reason, order_id) VALUES ($1, $2, 'accrual', $3)",
                     client_id, bonus_earned, order_id
+                )
+                current_bonus_balance += bonus_earned
+                await _enqueue_bonus_change(
+                    conn,
+                    client_id=client_id,
+                    delta=bonus_earned,
+                    balance_after=current_bonus_balance,
                 )
 
             await conn.execute(
@@ -6883,6 +7050,14 @@ async def commit_order(msg: Message, state: FSMContext):
             if master_db_id is None:
                 raise RuntimeError("Не удалось определить master_id для записи кассы.")
             await _record_order_income(conn, payment_method, cash_payment, order_id, int(master_db_id), notify_label)
+            await _enqueue_order_completed_notification(
+                conn,
+                client_id=client_id,
+                total_sum=amount_total,
+                used_bonus=bonus_spent,
+                earned_bonus=bonus_earned,
+                bonus_balance=current_bonus_balance,
+            )
         try:
             await post_order_bonus_delta(conn, order_id)
         except Exception as e:  # noqa: BLE001
@@ -7058,11 +7233,13 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task
+    global pool, daily_reports_task, birthday_task, notification_rules, notification_worker
+    notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
         await init_permissions(_conn)
         await _ensure_bonus_posted_column(_conn)
+        await ensure_notification_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(
@@ -7072,7 +7249,28 @@ async def main():
         birthday_task = asyncio.create_task(
             schedule_daily_job(12, 0, run_birthday_jobs, "birthday_bonuses")
         )
-    await dp.start_polling(bot)
+    if notification_rules is not None:
+        notification_worker = NotificationWorker(pool, notification_rules)
+        notification_worker.start()
+    if WAHELP_WEBHOOK_PORT > 0:
+        try:
+            wahelp_webhook = await start_wahelp_webhook(
+                pool,
+                host=WAHELP_WEBHOOK_HOST,
+                port=WAHELP_WEBHOOK_PORT,
+                token=WAHELP_WEBHOOK_TOKEN,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to start Wahelp webhook server: %s", exc)
+    else:
+        logger.info("Wahelp webhook server disabled (WAHELP_WEBHOOK_PORT not set)")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if notification_worker is not None:
+            await notification_worker.stop()
+        if wahelp_webhook is not None:
+            await wahelp_webhook.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())

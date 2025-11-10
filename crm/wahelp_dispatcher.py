@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import asyncpg
 
@@ -37,24 +37,35 @@ class ClientContact:
     preferred_channel: ChannelKind | None = None
 
 
+@dataclass(slots=True)
+class SendResult:
+    channel: ChannelKind
+    response: Mapping[str, object] | None = None
+
+
 async def send_with_rules(
     conn: asyncpg.Connection,
     contact: ClientContact,
     *,
     text: str,
-) -> ChannelKind:
+) -> SendResult:
     channels = _build_channel_sequence(contact.preferred_channel)
     last_error: Exception | None = None
     for channel in channels:
         try:
-            await send_text_to_phone(channel, phone=contact.phone, name=contact.name, text=text)
+            response = await send_text_to_phone(
+                channel,
+                phone=contact.phone,
+                name=contact.name,
+                text=text,
+            )
             await _set_preferred_channel(conn, contact.client_id, channel)
             if channel == TELEGRAM_CHANNEL:
                 _schedule_followup(contact, text)
             else:
                 _cancel_followup(contact.client_id)
             logger.info("Message sent via %s to client %s", channel, contact.client_id)
-            return channel
+            return SendResult(channel=channel, response=response if isinstance(response, Mapping) else None)
         except WahelpAPIError as exc:
             logger.warning("Send via %s failed for client %s: %s", channel, contact.client_id, exc)
             last_error = exc
@@ -115,3 +126,8 @@ def _cancel_followup(client_id: int) -> None:
     task = _followup_tasks.pop(client_id, None)
     if task:
         task.cancel()
+
+
+def cancel_followup_for_client(client_id: int) -> None:
+    """Expose follow-up cancellation for external consumers (e.g. webhook)."""
+    _cancel_followup(client_id)
