@@ -200,13 +200,8 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 o.payload,
                 o.locale,
                 o.scheduled_at,
-                o.attempts,
-                c.full_name AS client_full_name,
-                c.phone AS client_phone,
-                c.wahelp_preferred_channel,
-                COALESCE(c.notifications_enabled, true) AS notifications_enabled
+                o.attempts
             FROM notification_outbox o
-            LEFT JOIN clients c ON c.id = o.client_id
             WHERE o.status = 'pending'
               AND o.scheduled_at <= NOW()
             ORDER BY o.scheduled_at, o.id
@@ -231,8 +226,27 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
             ids,
         )
     attempts_map = {row["id"]: row["attempts"] for row in updated}
+    client_ids = [row["client_id"] for row in rows if row["client_id"] is not None]
+    client_map: dict[int, dict[str, Any]] = {}
+    if client_ids:
+        client_rows = await conn.fetch(
+            """
+            SELECT id, full_name, phone, wahelp_preferred_channel, COALESCE(notifications_enabled, true) AS notifications_enabled
+            FROM clients
+            WHERE id = ANY($1::int[])
+            """,
+            client_ids,
+        )
+        for crow in client_rows:
+        client_map[int(crow["id"])] = {
+            "full_name": crow["full_name"],
+            "phone": crow["phone"],
+            "preferred": crow["wahelp_preferred_channel"],
+            "enabled": bool(crow["notifications_enabled"]),
+        }
     entries: list[NotificationOutboxEntry] = []
     for row in rows:
+        client_info = client_map.get(row["client_id"] or -1, {})
         payload = row["payload"] or {}
         entries.append(
             NotificationOutboxEntry(
@@ -245,10 +259,10 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 locale=row["locale"],
                 scheduled_at=row["scheduled_at"],
                 attempts=attempts_map.get(row["id"], row["attempts"]),
-                client_phone=row["client_phone"],
-                client_name=row["client_full_name"],
-                client_preferred_channel=row["wahelp_preferred_channel"],
-                notifications_enabled=bool(row["notifications_enabled"]) if row["notifications_enabled"] is not None else False,
+                client_phone=client_info.get("phone"),
+                client_name=client_info.get("full_name"),
+                client_preferred_channel=client_info.get("preferred"),
+                notifications_enabled=client_info.get("enabled", True),
             )
         )
     return entries
