@@ -49,15 +49,17 @@ _client: WahelpClient | None = None
 timeout = aiohttp.ClientTimeout(total=20)
 if _login and _password:
     _credentials = WahelpCredentials(login=_login, password=_password, base_url=_base_url)
-    _auth_manager = WahelpAuthManager(credentials=_credentials, timeout=timeout)
-    _client = WahelpClient(auth_manager=_auth_manager)
 else:
     logger.warning("Wahelp credentials are not fully configured; integration disabled.")
 
 
 def get_wahelp_client() -> WahelpClient:
+    global _client, _auth_manager
     if _client is None:
-        raise RuntimeError("Wahelp client is not configured. Check WAHELP_LOGIN/WAHELP_PASSWORD in .env")
+        if _credentials is None:
+            raise RuntimeError("Wahelp client is not configured. Check WAHELP_LOGIN/WAHELP_PASSWORD in .env")
+        _auth_manager = WahelpAuthManager(credentials=_credentials, timeout=timeout)
+        _client = WahelpClient(auth_manager=_auth_manager)
     return _client
 
 
