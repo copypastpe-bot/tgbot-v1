@@ -170,7 +170,6 @@ async def enqueue_notification(
     schedule_time = scheduled_at
     if schedule_time is None:
         schedule_time = _now_utc() + timedelta(minutes=event.delay_minutes)
-    data = serialize_payload(payload)
     row_id = await conn.fetchval(
         """
         INSERT INTO notification_outbox (event_key, recipient_kind, client_id, template, payload, locale, scheduled_at)
@@ -181,7 +180,7 @@ async def enqueue_notification(
         event.recipient,
         client_id,
         event.template,
-        data,
+        json.dumps(serialize_payload(payload), ensure_ascii=False),
         rules.locale,
         schedule_time,
     )
@@ -311,7 +310,7 @@ async def mark_outbox_sent(
         channel,
         message_text,
         provider_message_id,
-        provider_payload,
+        json.dumps(provider_payload, ensure_ascii=False) if provider_payload is not None else None,
     )
 
 
@@ -510,7 +509,7 @@ async def apply_provider_status_update(
             return False
 
         updates: list[str] = ["last_status_payload = $1::jsonb", "updated_at = NOW()"]
-        params: list[Any] = [payload]
+        params: list[Any] = [json.dumps(payload, ensure_ascii=False)]
         param_idx = 2
 
         if normalized_status:
