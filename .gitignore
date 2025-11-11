@@ -18,3 +18,7 @@ logs/
 .vscode/
 .idea/
 Сохраняем файл на всякий/
+.env
+.venv-wahelp/
+test.db
+trace.txt
