@@ -149,6 +149,7 @@ NOTIFICATION_RULES_PATH = BASE_DIR / "docs" / "notification_rules.json"
 notification_rules: NotificationRules | None = None
 notification_worker: NotificationWorker | None = None
 wahelp_webhook: WahelpWebhookServer | None = None
+BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
 
 # === Ignore group/supergroup/channel updates; work only in private chats ===
 from aiogram import BaseMiddleware
@@ -233,7 +234,7 @@ async def _enqueue_bonus_change(
     balance_after: int | Decimal | None,
     expires_at: datetime | date | None = None,
 ) -> None:
-    if delta == 0:
+    if delta == 0 or not BONUS_CHANGE_NOTIFICATIONS_ENABLED:
         return
     total_bonus: int
     if balance_after is not None:
@@ -267,18 +268,29 @@ async def _enqueue_order_completed_notification(
     used_bonus: int,
     earned_bonus: int,
     bonus_balance: int,
+    cash_payment: Decimal,
+    bonus_expires_at: datetime | date | None,
 ) -> None:
+    cash_amount = cash_payment if isinstance(cash_payment, Decimal) else Decimal(cash_payment)
     payload = {
         "total_sum": format_money(total_sum),
         "used_bonus": used_bonus,
         "earned_bonus": earned_bonus,
         "bonus_balance": bonus_balance,
+        "amount_due": format_money(cash_amount),
+        "bonus_expire_date": _format_expire_label(bonus_expires_at),
     }
     await _try_enqueue_notification(
         conn,
-        event_key="order_completed_summary_and_rating",
+        event_key="order_completed_summary",
         client_id=client_id,
         payload=payload,
+    )
+    await _try_enqueue_notification(
+        conn,
+        event_key="order_rating_reminder",
+        client_id=client_id,
+        payload={},
     )
 
 
@@ -7077,6 +7089,8 @@ async def commit_order(msg: Message, state: FSMContext):
                 used_bonus=bonus_spent,
                 earned_bonus=bonus_earned,
                 bonus_balance=current_bonus_balance,
+                cash_payment=cash_payment,
+                bonus_expires_at=order_bonus_expires_utc,
             )
         try:
             await post_order_bonus_delta(conn, order_id)
