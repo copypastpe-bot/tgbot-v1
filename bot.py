@@ -245,8 +245,11 @@ async def _enqueue_bonus_change(
         )
         total_bonus = int(bal or 0)
     expire_target = expires_at
-    if expire_target is None and delta < 0:
-        expire_target = await _get_next_bonus_expire_date(conn, client_id)
+    if expire_target is None:
+        if delta > 0:
+            expire_target = (datetime.now(MOSCOW_TZ) + timedelta(days=365)).date()
+        elif delta < 0:
+            expire_target = await _get_next_bonus_expire_date(conn, client_id)
     payload = {
         "bonus": abs(int(delta)),
         "total_bonus": total_bonus,
