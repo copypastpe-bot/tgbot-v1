@@ -6950,6 +6950,9 @@ async def commit_order(msg: Message, state: FSMContext):
     upsell_pay = Decimal(str(data["upsell_pay"]))
     fuel_pay = Decimal(str(data["fuel_pay"]))
     total_pay = Decimal(str(data["total_pay"]))
+    order_created_local = datetime.now(MOSCOW_TZ)
+    order_created_utc = order_created_local.astimezone(timezone.utc)
+    order_bonus_expires_utc = (order_created_local + timedelta(days=365)).astimezone(timezone.utc)
     name = data.get("client_name")
     new_bday = data.get("new_birthday")  # date|None
     client_birthday_val: date | None = data.get("birthday")
