@@ -22,3 +22,5 @@ logs/
 .venv-wahelp/
 test.db
 trace.txt
+.env.local
+.venv
