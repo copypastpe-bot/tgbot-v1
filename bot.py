@@ -4987,6 +4987,10 @@ async def import_leads(msg: Message):
     if not await has_permission(msg.from_user.id, "import_leads"):
         return await msg.answer("Только для администраторов.")
 
+    order_created_local = datetime.now(MOSCOW_TZ)
+    order_created_utc = order_created_local.astimezone(timezone.utc)
+    order_bonus_expires_utc = (order_created_local + timedelta(days=365)).astimezone(timezone.utc)
+
     async with pool.acquire() as conn:
         async with conn.transaction():
             # ensure helpers exist (same as in dryrun)
@@ -7011,8 +7015,14 @@ async def commit_order(msg: Message, state: FSMContext):
 
             if bonus_spent > 0:
                 await conn.execute(
-                    "INSERT INTO bonus_transactions (client_id, delta, reason, order_id) VALUES ($1, $2, 'spend', $3)",
-                    client_id, -bonus_spent, order_id
+                    """
+                    INSERT INTO bonus_transactions (client_id, delta, reason, order_id, created_at, happened_at)
+                    VALUES ($1, $2, 'spend', $3, $4, $4)
+                    """,
+                    client_id,
+                    -bonus_spent,
+                    order_id,
+                    order_created_utc,
                 )
                 current_bonus_balance -= bonus_spent
                 await _enqueue_bonus_change(
@@ -7023,8 +7033,15 @@ async def commit_order(msg: Message, state: FSMContext):
                 )
             if bonus_earned > 0:
                 await conn.execute(
-                    "INSERT INTO bonus_transactions (client_id, delta, reason, order_id) VALUES ($1, $2, 'accrual', $3)",
-                    client_id, bonus_earned, order_id
+                    """
+                    INSERT INTO bonus_transactions (client_id, delta, reason, order_id, created_at, happened_at, expires_at)
+                    VALUES ($1, $2, 'accrual', $3, $4, $4, $5)
+                    """,
+                    client_id,
+                    bonus_earned,
+                    order_id,
+                    order_created_utc,
+                    order_bonus_expires_utc,
                 )
                 current_bonus_balance += bonus_earned
                 await _enqueue_bonus_change(
