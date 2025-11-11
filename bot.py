@@ -1646,9 +1646,9 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
                 VALUES ($1, $2, 'expire', NOW(), NOW(), jsonb_build_object('reason','birthday_refresh','expires_source',$3::text))
                 """,
                 client_id,
-                -chunk_int,
-                row["id"],
-            )
+                    -chunk_int,
+                    str(row["id"]),
+                )
             await conn.execute(
                 """
                 UPDATE clients
