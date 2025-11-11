@@ -1,0 +1,3 @@
+ssh admin@91.200.150.68 <<'EOF'
+cd /opt/telegram-bot
+rm -rf docs import backups

@@ -1,0 +1,250 @@
+{
+  "version": "1.0",
+  "updated_at": "2025-11-07T16:33:03.342271",
+  "defaults": {
+    "locale": "ru-RU",
+    "channel_priority": [
+      "tg",
+      "wa"
+    ],
+    "check_flags": [
+      "notifications_enabled == true"
+    ]
+  },
+  "events": [
+    {
+      "key": "order_created",
+      "name": "Внесение заказа в календарь",
+      "recipient": "client",
+      "condition": "calendar.status == 'confirmed'",
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Здравствуйте!\nВаш заказ принят ✅\n\n📅 Дата: {{date}}\n🕒 Время: {{time}}\n📍 Адрес: {{address}}\n\nМастер: {{master_name}} ({{master_phone}}). Мастер свяжется перед приездом.",
+      "variables": [
+        "date",
+        "time",
+        "address",
+        "master_name",
+        "master_phone"
+      ]
+    },
+    {
+      "key": "order_changed_notify_master",
+      "name": "Изменение заказа (уведомление мастеру)",
+      "recipient": "master",
+      "condition": "calendar.fields_changed in ['date','time','address','services','executor']",
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Изменение заказа #{{order_id}}\n📅 {{date}}\n🕒 {{time}}\n📍 {{address}}\nРаботы: {{services}}",
+      "variables": [
+        "order_id",
+        "date",
+        "time",
+        "address",
+        "services"
+      ]
+    },
+    {
+      "key": "order_deleted_notify_master",
+      "name": "Удаление заказа (инициатива клиента, уведомить мастера)",
+      "recipient": "master",
+      "condition": "calendar.status == 'deleted' or order.status == 'cancelled_by_client'",
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Отмена заказа #{{order_id}}. Не выезжайте.",
+      "variables": [
+        "order_id"
+      ]
+    },
+    {
+      "key": "order_deleted_notify_client",
+      "name": "Удаление заказа (инициатива клиента, уведомить клиента)",
+      "recipient": "client",
+      "condition": "order.status == 'cancelled_by_client'",
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Заказ отменён по вашему запросу.\nЕсли захотите выбрать новую дату, просто напишите здесь — подберём удобное время.",
+      "variables": []
+    },
+    {
+      "key": "order_completed_summary_and_rating",
+      "name": "Выполнение заказа (сводка + запрос оценки)",
+      "recipient": "client",
+      "condition": "order.status == 'completed'",
+      "timing": {
+        "delay_minutes": 120
+      },
+      "template": "Работа завершена 🎉\n\n💰 Сумма чека: {{total_sum}}₽\n🎁 Оплачено бонусами: {{used_bonus}}\n✨ Начислено бонусов: {{earned_bonus}}\n💳 Баланс бонусов: {{bonus_balance}}\n\nПожалуйста, оцените работу от 1 до 5 — просто напишите цифру.",
+      "variables": [
+        "total_sum",
+        "used_bonus",
+        "earned_bonus",
+        "bonus_balance"
+      ],
+      "note": "Отдельные сообщения о начислении/списании бонусов после выполнения НЕ слать."
+    },
+    {
+      "key": "bonus_credit",
+      "name": "Начисление бонусов",
+      "recipient": "client",
+      "condition": "bonus.type == 'credit'",
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Вам начислены {{bonus}} баллов 🎁\nТеперь на счёте: {{total_bonus}}\nСрок действия бонусов — до {{expire_date}}.",
+      "variables": [
+        "bonus",
+        "total_bonus",
+        "expire_date"
+      ]
+    },
+    {
+      "key": "bonus_debit",
+      "name": "Списание бонусов",
+      "recipient": "client",
+      "condition": "bonus.type == 'debit'",
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "С вашего бонусного счёта списано {{bonus}} баллов.\nОстаток: {{total_bonus}}\nСрок действия оставшихся бонусов — до {{expire_date}}.",
+      "variables": [
+        "bonus",
+        "total_bonus",
+        "expire_date"
+      ]
+    },
+    {
+      "key": "client_inbound_message",
+      "name": "Клиент написал в TG/WA (уведомить админа)",
+      "recipient": "admin",
+      "condition": "inbound.message == true",
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Клиент {{name}} написал: “{{snippet}}”. Нужен ответ.",
+      "variables": [
+        "name",
+        "snippet"
+      ]
+    }
+  ],
+  "chains": [
+    {
+      "key": "post_completion_rating_flow",
+      "name": "Цепочка оценки после выполнения",
+      "start_on": "order_completed_summary_and_rating",
+      "branches": [
+        {
+          "when": "rating == 5",
+          "actions": [
+            {
+              "recipient": "client",
+              "delay_minutes": 0,
+              "template": "Спасибо за высокую оценку! Если удобно, оставьте короткий отзыв: {{review_links}}."
+            }
+          ]
+        },
+        {
+          "when": "rating == 4",
+          "actions": [
+            {
+              "recipient": "client",
+              "delay_minutes": 0,
+              "template": "Спасибо! Подскажите, что можно улучшить? Ваши идеи помогут нам стать лучше."
+            },
+            {
+              "recipient": "admin",
+              "delay_minutes": 0,
+              "template": "Оценка 4 по заказу #{{order_id}}. Нужен разбор комментариев клиента."
+            }
+          ]
+        },
+        {
+          "when": "rating <= 3",
+          "actions": [
+            {
+              "recipient": "client",
+              "delay_minutes": 0,
+              "template": "Извините, что результат не оправдал ожиданий. У нас действует гарантия 30 дней — мы свяжемся и решим вопрос."
+            },
+            {
+              "recipient": "admin",
+              "delay_minutes": 0,
+              "template": "Низкая оценка ({{score}}) по #{{order_id}}. Срочно связаться с клиентом (гарантийный сценарий)."
+            }
+          ]
+        },
+        {
+          "when": "no_response_24h",
+          "actions": [
+            {
+              "recipient": "client",
+              "delay_minutes": 1440,
+              "template": "Напомню про оценку от 1 до 5. Пара секунд, а нам очень важно."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "bonus_expiration_flow",
+      "name": "Цепочка сгорания бонусов",
+      "schedule": "relative_to(bonus.expire_date)",
+      "steps": [
+        {
+          "at": "-14d",
+          "recipient": "client",
+          "template": "На вашем счёте {{total}} баллов, они действуют до {{expires_at}}. Можно использовать при следующем заказе."
+        },
+        {
+          "at": "-3d",
+          "recipient": "client",
+          "template": "Напоминание: {{total}} баллов сгорят {{expires_at}}. Хотите записаться? Подберём удобное время."
+        },
+        {
+          "at": "0d",
+          "recipient": "client",
+          "template": "Срок действия бонусов истёк. Баланс: {{total_after}}. При следующем заказе часть бонусов восстановим."
+        }
+      ]
+    },
+    {
+      "key": "order_cancelled_client_winback",
+      "name": "Цепочка после отмены клиентом",
+      "start_on": "order_deleted_notify_client",
+      "steps": [
+        {
+          "delay_minutes": 2880,
+          "recipient": "client",
+          "template": "Можем забронировать удобное время на этой неделе. Напишите, какой день подходит?"
+        },
+        {
+          "delay_minutes": 43200,
+          "recipient": "client",
+          "template": "Давно не виделись! Хотите освежить диван или ковер? Есть бонус на повторный заказ."
+        }
+      ]
+    },
+    {
+      "key": "visit_reminders",
+      "name": "Цепочка напоминаний о визите",
+      "anchor": "order.datetime",
+      "steps": [
+        {
+          "at": "-24h",
+          "recipient": "client",
+          "template": "Напоминание о визите завтра:\n📅 {{date}} в {{time}}\n📍 {{address}}\n\nМастер: {{master_name}} ({{master_phone}})\nПодтвердите, пожалуйста, что будете на месте."
+        },
+        {
+          "at": "-2h",
+          "recipient": "client",
+          "template": "Сегодня в {{time}} будет {{master_name}} ({{master_phone}}). Проверьте, пожалуйста, доступ к розетке и воде."
+        }
+      ]
+    }
+  ]
+}
