@@ -171,7 +171,6 @@ async def enqueue_notification(
     if schedule_time is None:
         schedule_time = _now_utc() + timedelta(minutes=event.delay_minutes)
     data = serialize_payload(payload)
-    payload_json = json.dumps(data, ensure_ascii=False)
     row_id = await conn.fetchval(
         """
         INSERT INTO notification_outbox (event_key, recipient_kind, client_id, template, payload, locale, scheduled_at)
@@ -182,7 +181,7 @@ async def enqueue_notification(
         event.recipient,
         client_id,
         event.template,
-        payload_json,
+        data,
         rules.locale,
         schedule_time,
     )
@@ -248,8 +247,10 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
             }
     entries: list[NotificationOutboxEntry] = []
     for row in rows:
-        client_info = client_map.get(row["client_id"] or -1, {})
         payload = row["payload"] or {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        client_info = client_map.get(row["client_id"] or -1, {})
         entries.append(
             NotificationOutboxEntry(
                 id=row["id"],
@@ -279,9 +280,6 @@ async def mark_outbox_sent(
     provider_payload: Mapping[str, Any] | None,
     provider_message_id: str | None,
 ) -> None:
-    provider_payload_json = None
-    if provider_payload is not None:
-        provider_payload_json = json.dumps(provider_payload, ensure_ascii=False)
     await conn.execute(
         """
         UPDATE notification_outbox
@@ -313,7 +311,7 @@ async def mark_outbox_sent(
         channel,
         message_text,
         provider_message_id,
-        provider_payload_json,
+        provider_payload,
     )
 
 
@@ -497,7 +495,6 @@ async def apply_provider_status_update(
     normalized_status = _normalize_status(status_value if isinstance(status_value, str) else None, event_name)
     event_time = _parse_timestamp(status_time) or _now_utc()
 
-    payload_json = json.dumps(payload, ensure_ascii=False)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -513,7 +510,7 @@ async def apply_provider_status_update(
             return False
 
         updates: list[str] = ["last_status_payload = $1::jsonb", "updated_at = NOW()"]
-        params: list[Any] = [payload_json]
+        params: list[Any] = [payload]
         param_idx = 2
 
         if normalized_status:
