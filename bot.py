@@ -1622,12 +1622,14 @@ async def process_amocrm_csv(
     return counters, errors
 
 
-async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str]]:
+async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str], int]:
     today_local = datetime.now(MOSCOW_TZ).date()
     errors: list[str] = []
+    refresh_expired_total = 0
 
-    async def _consume_expired_portion(client_id: int, amount: Decimal) -> None:
+    async def _consume_expired_portion(client_id: int, amount: Decimal) -> int:
         remaining = Decimal(amount)
+        expired_rows = 0
         while remaining > 0:
             row = await conn.fetchrow(
                 """
@@ -1661,9 +1663,9 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
                 VALUES ($1, $2, 'expire', NOW(), NOW(), jsonb_build_object('reason','birthday_refresh','expires_source',$3::text))
                 """,
                 client_id,
-                    -chunk_int,
-                    str(row["id"]),
-                )
+                -chunk_int,
+                str(row["id"]),
+            )
             await conn.execute(
                 """
                 UPDATE clients
@@ -1675,6 +1677,8 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
                 client_id,
             )
             remaining -= chunk
+            expired_rows += 1
+        return expired_rows
 
     rows = await conn.fetch(
         """
@@ -1689,7 +1693,7 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
     )
 
     if not rows:
-        return 0, errors
+        return 0, errors, 0
 
     processed = 0
     for row in rows:
@@ -1716,7 +1720,7 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
         if current_balance >= BONUS_BIRTHDAY_VALUE:
             expire_needed = BONUS_BIRTHDAY_VALUE
         if expire_needed > 0:
-            await _consume_expired_portion(client_id, expire_needed)
+            refresh_expired_total += await _consume_expired_portion(client_id, expire_needed)
         try:
             await conn.execute(
                 """
@@ -1744,7 +1748,7 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
             logging.exception("Birthday accrual failed for client %s: %s", client_id, exc)
             errors.append(f"client {client_id}: {exc}")
 
-    return processed, errors
+    return processed, errors, refresh_expired_total
 
 
 async def _expire_old_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str]]:
@@ -1811,13 +1815,14 @@ async def _expire_old_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str]]
 
 async def run_birthday_jobs() -> None:
     async with pool.acquire() as conn:
-        accrued, accrual_errors = await _accrue_birthday_bonuses(conn)
+        accrued, accrual_errors, refresh_expired = await _accrue_birthday_bonuses(conn)
         expired, expire_errors = await _expire_old_bonuses(conn)
+    total_expired = expired + refresh_expired
 
     lines = [
         "🎉 Итоги по бонусам:",
         f"Начислено именинникам: {accrued}",
-        f"Списано по сроку: {expired}",
+        f"Списано по сроку: {total_expired}",
     ]
     errors = (accrual_errors + expire_errors)
     if errors:
