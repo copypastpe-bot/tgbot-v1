@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable, Mapping
 
 import asyncpg
 from aiohttp import web
@@ -15,9 +15,16 @@ logger = logging.getLogger(__name__)
 
 
 class WahelpWebhookServer:
-    def __init__(self, pool: asyncpg.Pool, *, token: str | None = None) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        token: str | None = None,
+        inbound_handler: Callable[[Mapping[str, Any]], Awaitable[bool]] | None = None,
+    ) -> None:
         self.pool = pool
         self.token = token
+        self.inbound_handler = inbound_handler
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
 
@@ -57,14 +64,21 @@ class WahelpWebhookServer:
         except Exception:
             return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
 
+        custom_handled = False
+        if self.inbound_handler is not None:
+            try:
+                custom_handled = await self.inbound_handler(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Inbound handler failed: %s", exc)
+
         handled = await apply_provider_status_update(
             self.pool,
             payload,
             cancel_followup=cancel_followup_for_client,
         )
-        if not handled:
+        if not handled and not custom_handled:
             logger.debug("Webhook payload ignored: %s", payload)
-        return web.json_response({"ok": True, "handled": handled})
+        return web.json_response({"ok": True, "handled": handled or custom_handled})
 
 
 async def start_wahelp_webhook(
@@ -73,8 +87,9 @@ async def start_wahelp_webhook(
     host: str,
     port: int,
     token: str | None = None,
+    inbound_handler: Callable[[Mapping[str, Any]], Awaitable[bool]] | None = None,
 ) -> WahelpWebhookServer:
-    server = WahelpWebhookServer(pool, token=token)
+    server = WahelpWebhookServer(pool, token=token, inbound_handler=inbound_handler)
     await server.start(host, port)
     return server
 

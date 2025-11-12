@@ -1,5 +1,5 @@
-import asyncio, os, re, logging, html
-import csv, io
+import asyncio, os, re, logging, html, random
+import csv, io, calendar
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone, timedelta, time
 from pathlib import Path
@@ -138,6 +138,11 @@ UPSELL_PER_3000 = Decimal(os.getenv("UPSELL_RATE_PER_3000", "500"))
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 BONUS_BIRTHDAY_VALUE = Decimal("300")
+PROMO_BONUS_VALUE = 200
+PROMO_REMINDER_FIRST_GAP_MONTHS = 8
+PROMO_REMINDER_SECOND_GAP_MONTHS = 2
+PROMO_RANDOM_DELAY_RANGE = (1, 10)
+PROMO_BONUS_TTL_DAYS = 365
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -169,6 +174,7 @@ dp.callback_query.middleware(IgnoreNonPrivateMiddleware())
 pool: asyncpg.Pool | None = None
 daily_reports_task: asyncio.Task | None = None
 birthday_task: asyncio.Task | None = None
+promo_task: asyncio.Task | None = None
 
 
 async def _try_enqueue_notification(
@@ -224,6 +230,300 @@ async def _get_next_bonus_expire_date(conn: asyncpg.Connection, client_id: int) 
         """,
         client_id,
     )
+
+
+async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        ALTER TABLE clients
+        ADD COLUMN IF NOT EXISTS promo_opt_out boolean NOT NULL DEFAULT false;
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE clients
+        ADD COLUMN IF NOT EXISTS promo_opt_out_at timestamptz;
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_reengagements (
+            client_id integer PRIMARY KEY REFERENCES clients(id) ON DELETE CASCADE,
+            last_variant_sent smallint NOT NULL DEFAULT 0,
+            last_sent_at timestamptz,
+            next_send_at timestamptz,
+            responded_at timestamptz
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_promo_reeng_next
+        ON promo_reengagements(next_send_at)
+        """
+    )
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    if months == 0:
+        return dt
+    month = dt.month - 1 + months
+    year = dt.year + month // 12
+    month = month % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _format_bonus_amount(amount: int | Decimal) -> str:
+    try:
+        value = int(Decimal(amount))
+    except Exception:  # pragma: no cover - fallback
+        value = int(amount)
+    return f"{value:,}".replace(",", " ")
+
+
+async def _ensure_min_bonus_for_promo(conn: asyncpg.Connection, client_id: int) -> tuple[int, datetime | None]:
+    current_balance = await conn.fetchval(
+        "SELECT COALESCE(bonus_balance, 0) FROM clients WHERE id=$1",
+        client_id,
+    )
+    expire_at = await _get_next_bonus_expire_date(conn, client_id)
+    if (current_balance or 0) > 0:
+        return int(current_balance or 0), expire_at
+
+    amount = PROMO_BONUS_VALUE
+    expires_at = (datetime.now(MOSCOW_TZ) + timedelta(days=PROMO_BONUS_TTL_DAYS)).astimezone(timezone.utc)
+    await conn.execute(
+        """
+        INSERT INTO bonus_transactions (client_id, delta, reason, created_at, happened_at, expires_at, meta)
+        VALUES ($1, $2, 'promo', NOW(), NOW(), $3, jsonb_build_object('bonus_type','promo_reengage'))
+        """,
+        client_id,
+        amount,
+        expires_at,
+    )
+    await conn.execute(
+        """
+        UPDATE clients
+        SET bonus_balance = COALESCE(bonus_balance,0) + $1,
+            last_updated = NOW()
+        WHERE id=$2
+        """,
+        amount,
+        client_id,
+    )
+    return amount, expires_at
+
+
+async def _schedule_promo_notification(
+    conn: asyncpg.Connection,
+    *,
+    client_id: int,
+    event_key: str,
+) -> bool:
+    bonus_amount, expire_at = await _ensure_min_bonus_for_promo(conn, client_id)
+    delay_minutes = random.randint(*PROMO_RANDOM_DELAY_RANGE)
+    scheduled_at = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+    payload = {
+        "bonus": _format_bonus_amount(bonus_amount),
+        "expire_date": _format_expire_label(expire_at),
+    }
+    await _try_enqueue_notification(
+        conn,
+        event_key=event_key,
+        client_id=client_id,
+        payload=payload,
+        scheduled_at=scheduled_at,
+    )
+    return True
+
+
+async def _process_promo_stage(conn: asyncpg.Connection, stage: int) -> int:
+    if stage == 1:
+        rows = await conn.fetch(
+            """
+            SELECT c.id AS client_id
+            FROM clients c
+            LEFT JOIN promo_reengagements pr ON pr.client_id = c.id
+            WHERE c.phone IS NOT NULL
+              AND c.phone <> ''
+              AND c.phone_digits IS NOT NULL
+              AND c.last_order_at IS NOT NULL
+              AND c.last_order_at <= (NOW() - INTERVAL '8 months')
+              AND COALESCE(c.notifications_enabled, true)
+              AND NOT COALESCE(c.promo_opt_out, false)
+              AND COALESCE(pr.last_variant_sent, 0) = 0
+            """,
+        )
+        if not rows:
+            return 0
+        count = 0
+        next_due = _add_months(datetime.now(timezone.utc), PROMO_REMINDER_SECOND_GAP_MONTHS)
+        for row in rows:
+            if await _schedule_promo_notification(conn, client_id=row["client_id"], event_key="promo_reengage_first"):
+                await conn.execute(
+                    """
+                    INSERT INTO promo_reengagements (client_id, last_variant_sent, last_sent_at, next_send_at, responded_at)
+                    VALUES ($1, 1, NOW(), $2, NULL)
+                    ON CONFLICT (client_id) DO UPDATE
+                    SET last_variant_sent = 1,
+                        last_sent_at = NOW(),
+                        next_send_at = $2,
+                        responded_at = NULL
+                    """,
+                    row["client_id"],
+                    next_due,
+                )
+                count += 1
+        return count
+
+    if stage == 2:
+        rows = await conn.fetch(
+            """
+            SELECT c.id AS client_id
+            FROM promo_reengagements pr
+            JOIN clients c ON c.id = pr.client_id
+            WHERE pr.last_variant_sent = 1
+              AND pr.next_send_at IS NOT NULL
+              AND pr.next_send_at <= NOW()
+              AND pr.responded_at IS NULL
+              AND NOT COALESCE(c.promo_opt_out, false)
+              AND COALESCE(c.notifications_enabled, true)
+              AND c.phone IS NOT NULL
+              AND c.phone <> ''
+              AND c.phone_digits IS NOT NULL
+              AND (c.last_order_at IS NULL OR c.last_order_at <= pr.last_sent_at)
+            """,
+        )
+        if not rows:
+            return 0
+        count = 0
+        for row in rows:
+            if await _schedule_promo_notification(conn, client_id=row["client_id"], event_key="promo_reengage_second"):
+                await conn.execute(
+                    """
+                    UPDATE promo_reengagements
+                    SET last_variant_sent = 2,
+                        last_sent_at = NOW(),
+                        next_send_at = NULL
+                    WHERE client_id = $1
+                    """,
+                    row["client_id"],
+                )
+                count += 1
+        return count
+
+    return 0
+
+
+async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
+    if pool is None:
+        return False
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return False
+    destination = str(data.get("destination") or data.get("direction") or "").lower()
+    if destination in {"", "from_operator", "operator"}:
+        return False
+    text = data.get("message")
+    if isinstance(text, Mapping):
+        text = text.get("text") or text.get("message")
+    if not isinstance(text, str):
+        return False
+    normalized_text = text.strip()
+    if not normalized_text:
+        return False
+    normalized_lower = normalized_text.lower()
+    is_stop = normalized_lower in {"stop", "стоп"}
+    is_interest = normalized_lower.startswith("1")
+    if not (is_stop or is_interest):
+        return False
+
+    phone_value = None
+    user_info = data.get("user")
+    if isinstance(user_info, Mapping):
+        for candidate in (user_info.get("phone"), user_info.get("uid2"), user_info.get("uid")):
+            if candidate:
+                phone_value = candidate
+                break
+    if not phone_value:
+        contact_info = data.get("contact")
+        if isinstance(contact_info, Mapping):
+            phone_value = contact_info.get("phone")
+    if not phone_value:
+        return False
+    digits = re.sub(r"[^0-9]", "", phone_value)
+    if not digits:
+        return False
+
+    async with pool.acquire() as conn:
+        client = await conn.fetchrow(
+            "SELECT id, full_name, phone FROM clients WHERE phone_digits=$1 LIMIT 1",
+            digits,
+        )
+        if not client:
+            return False
+        promo_row = await conn.fetchrow(
+            "SELECT last_variant_sent, responded_at FROM promo_reengagements WHERE client_id=$1",
+            client["id"],
+        )
+        if not promo_row or promo_row["last_variant_sent"] == 0 or promo_row["responded_at"] is not None:
+            return False
+
+        if is_stop:
+            await conn.execute(
+                """
+                UPDATE clients
+                SET promo_opt_out = TRUE,
+                    promo_opt_out_at = NOW(),
+                    last_updated = NOW()
+                WHERE id=$1
+                """,
+                client["id"],
+            )
+            await conn.execute(
+                """
+                UPDATE promo_reengagements
+                SET responded_at = NOW(),
+                    next_send_at = NULL
+                WHERE client_id=$1
+                """,
+                client["id"],
+            )
+            return True
+
+        if is_interest:
+            await conn.execute(
+                """
+                UPDATE promo_reengagements
+                SET responded_at = NOW(),
+                    next_send_at = NULL
+                WHERE client_id=$1
+                """,
+                client["id"],
+            )
+            await _notify_admins_about_promo_interest(client, normalized_text)
+            return True
+
+    return False
+
+
+async def _notify_admins_about_promo_interest(client_row: Mapping[str, Any], message_text: str) -> None:
+    if not ADMIN_TG_IDS:
+        return
+    name = client_row.get("full_name") or "Клиент"
+    phone = client_row.get("phone") or "неизвестно"
+    text = (
+        "📞 Клиент откликнулся на промо-напоминание\n"
+        f"Имя: {name}\n"
+        f"Телефон: {phone}\n"
+        f"Ответ: {message_text.strip()}"
+    )
+    for admin_id in ADMIN_TG_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to notify admin %s about промо интерес: %s", admin_id, exc)
 
 
 async def _enqueue_bonus_change(
@@ -1837,6 +2137,15 @@ async def run_birthday_jobs() -> None:
             await bot.send_message(MONEY_FLOW_CHAT_ID, "\n".join(lines))
         except Exception as exc:  # noqa: BLE001
             logging.exception("Failed to send birthday bonus summary: %s", exc)
+
+
+async def run_promo_reminders() -> None:
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        stage_one = await _process_promo_stage(conn, 1)
+        stage_two = await _process_promo_stage(conn, 2)
+    logger.info("Promo reminders queued: first=%s second=%s", stage_one, stage_two)
 
 
 async def schedule_daily_job(hour_msk: int, minute_msk: int, job_coro, job_name: str) -> None:
@@ -7275,13 +7584,14 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, notification_rules, notification_worker
+    global pool, daily_reports_task, birthday_task, promo_task, notification_rules, notification_worker, wahelp_webhook
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
         await init_permissions(_conn)
         await _ensure_bonus_posted_column(_conn)
         await ensure_notification_schema(_conn)
+        await ensure_promo_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(
@@ -7290,6 +7600,10 @@ async def main():
     if birthday_task is None:
         birthday_task = asyncio.create_task(
             schedule_daily_job(12, 0, run_birthday_jobs, "birthday_bonuses")
+        )
+    if promo_task is None:
+        promo_task = asyncio.create_task(
+            schedule_daily_job(11, 0, run_promo_reminders, "promo_reminders")
         )
     if notification_rules is not None:
         notification_worker = NotificationWorker(pool, notification_rules)
@@ -7301,6 +7615,7 @@ async def main():
                 host=WAHELP_WEBHOOK_HOST,
                 port=WAHELP_WEBHOOK_PORT,
                 token=WAHELP_WEBHOOK_TOKEN,
+                inbound_handler=handle_wahelp_inbound,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to start Wahelp webhook server: %s", exc)
