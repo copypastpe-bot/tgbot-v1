@@ -143,6 +143,11 @@ PROMO_REMINDER_FIRST_GAP_MONTHS = 8
 PROMO_REMINDER_SECOND_GAP_MONTHS = 2
 PROMO_RANDOM_DELAY_RANGE = (1, 10)
 PROMO_BONUS_TTL_DAYS = 365
+BDAY_TEMPLATE_KEYS = (
+    "birthday_congrats_variant_1",
+    "birthday_congrats_variant_2",
+    "birthday_congrats_variant_3",
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -247,6 +252,12 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
     )
     await conn.execute(
         """
+        ALTER TABLE clients
+        ADD COLUMN IF NOT EXISTS last_bday_template smallint NOT NULL DEFAULT 0;
+        """
+    )
+    await conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS promo_reengagements (
             client_id integer PRIMARY KEY REFERENCES clients(id) ON DELETE CASCADE,
             last_variant_sent smallint NOT NULL DEFAULT 0,
@@ -343,6 +354,42 @@ async def _schedule_promo_notification(
         scheduled_at=scheduled_at,
     )
     return True
+
+
+async def _schedule_birthday_congrats(
+    conn: asyncpg.Connection,
+    *,
+    client_id: int,
+    bonus_balance: int,
+) -> None:
+    current_variant = await conn.fetchval(
+        "SELECT COALESCE(last_bday_template, 0) FROM clients WHERE id=$1",
+        client_id,
+    ) or 0
+    next_variant = (int(current_variant) % len(BDAY_TEMPLATE_KEYS)) + 1
+    await conn.execute(
+        """
+        UPDATE clients
+        SET last_bday_template=$1,
+            last_updated = NOW()
+        WHERE id=$2
+        """,
+        next_variant,
+        client_id,
+    )
+    event_key = BDAY_TEMPLATE_KEYS[next_variant - 1]
+    delay_seconds = random.randint(1, 10)
+    scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+    payload = {
+        "bonus_balance": _format_bonus_amount(bonus_balance),
+    }
+    await _try_enqueue_notification(
+        conn,
+        event_key=event_key,
+        client_id=client_id,
+        payload=payload,
+        scheduled_at=scheduled_at,
+    )
 
 
 async def _process_promo_stage(conn: asyncpg.Connection, stage: int) -> int:
@@ -2031,6 +2078,10 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
             expire_needed = BONUS_BIRTHDAY_VALUE
         if expire_needed > 0:
             refresh_expired_total += await _consume_expired_portion(client_id, expire_needed)
+            current_balance = Decimal(
+                await conn.fetchval("SELECT COALESCE(bonus_balance,0) FROM clients WHERE id=$1", client_id)
+                or 0
+            )
         try:
             await conn.execute(
                 """
@@ -2052,6 +2103,15 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
                 delta=int(amount),
                 balance_after=int((current_balance or Decimal(0)) + amount),
                 expires_at=expires_at,
+            )
+            new_balance = await conn.fetchval(
+                "SELECT COALESCE(bonus_balance,0) FROM clients WHERE id=$1",
+                client_id,
+            ) or 0
+            await _schedule_birthday_congrats(
+                conn,
+                client_id=client_id,
+                bonus_balance=int(new_balance),
             )
             processed += 1
         except Exception as exc:  # noqa: BLE001
