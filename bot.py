@@ -356,7 +356,8 @@ async def _process_promo_stage(conn: asyncpg.Connection, stage: int) -> int:
               AND c.phone <> ''
               AND c.phone_digits IS NOT NULL
               AND c.last_order_at IS NOT NULL
-              AND c.last_order_at <= (NOW() - INTERVAL '8 months')
+              AND c.last_order_at >= (NOW() - INTERVAL '8 months') - INTERVAL '1 day'
+              AND c.last_order_at < (NOW() - INTERVAL '8 months')
               AND COALESCE(c.notifications_enabled, true)
               AND NOT COALESCE(c.promo_opt_out, false)
               AND COALESCE(pr.last_variant_sent, 0) = 0
