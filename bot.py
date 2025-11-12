@@ -252,8 +252,15 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
             last_variant_sent smallint NOT NULL DEFAULT 0,
             last_sent_at timestamptz,
             next_send_at timestamptz,
-            responded_at timestamptz
+            responded_at timestamptz,
+            response_kind text
         );
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE promo_reengagements
+        ADD COLUMN IF NOT EXISTS response_kind text;
         """
     )
     await conn.execute(
@@ -485,6 +492,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                 """
                 UPDATE promo_reengagements
                 SET responded_at = NOW(),
+                    response_kind = 'stop',
                     next_send_at = NULL
                 WHERE client_id=$1
                 """,
@@ -497,6 +505,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                 """
                 UPDATE promo_reengagements
                 SET responded_at = NOW(),
+                    response_kind = 'interest',
                     next_send_at = NULL
                 WHERE client_id=$1
                 """,
@@ -2117,6 +2126,45 @@ async def run_birthday_jobs() -> None:
     async with pool.acquire() as conn:
         accrued, accrual_errors, refresh_expired = await _accrue_birthday_bonuses(conn)
         expired, expire_errors = await _expire_old_bonuses(conn)
+        yesterday = datetime.now(MOSCOW_TZ).date() - timedelta(days=1)
+        start_local = datetime.combine(yesterday, time.min, tzinfo=MOSCOW_TZ)
+        end_local = start_local + timedelta(days=1)
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = end_local.astimezone(timezone.utc)
+        promo_sent = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM notification_messages
+            WHERE event_key = ANY($1::text[])
+              AND sent_at >= $2
+              AND sent_at < $3
+            """,
+            ["promo_reengage_first", "promo_reengage_second"],
+            start_utc,
+            end_utc,
+        ) or 0
+        promo_stops = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM promo_reengagements
+            WHERE response_kind = 'stop'
+              AND responded_at >= $1
+              AND responded_at < $2
+            """,
+            start_utc,
+            end_utc,
+        ) or 0
+        promo_interests = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM promo_reengagements
+            WHERE response_kind = 'interest'
+              AND responded_at >= $1
+              AND responded_at < $2
+            """,
+            start_utc,
+            end_utc,
+        ) or 0
     total_expired = expired + refresh_expired
 
     lines = [
@@ -2124,6 +2172,15 @@ async def run_birthday_jobs() -> None:
         f"Начислено именинникам: {accrued}",
         f"Списано по сроку: {total_expired}",
     ]
+    lines.extend(
+        [
+            "",
+            "📨 Промо-рассылки за вчера:",
+            f"Отправлено: {promo_sent}",
+            f"STOP: {promo_stops}",
+            f"Ответ 1: {promo_interests}",
+        ]
+    )
     errors = (accrual_errors + expire_errors)
     if errors:
         lines.append("\nОшибки:")
