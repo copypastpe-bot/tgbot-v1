@@ -21,7 +21,7 @@ from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from typing import Mapping
+from typing import Mapping, Any, Sequence, Callable
 
 # ===== FSM State Groups =====
 class AdminMenuFSM(StatesGroup):
