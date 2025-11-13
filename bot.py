@@ -4803,73 +4803,57 @@ async def get_master_orders_payments_report_text(master_id: int, period: str) ->
         if not master_row:
             return "Мастер не найден."
 
-        rec = await conn.fetchrow(
+        stats = await conn.fetchrow(
             f"""
-            WITH scope AS (
-              SELECT o.*
-              FROM orders o
-              WHERE o.master_id = $1
-                AND o.created_at >= {start_sql}
-                AND o.created_at <  {end_sql}
-            ),
-            w AS (
-              SELECT COALESCE(SUM(c.amount),0)::numeric(12,2) AS withdrawn
-              FROM cashbook_entries c
-              WHERE c.kind='withdrawal' AND c.method='cash' AND c.master_id=$1
-                AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-            )
             SELECT
               COUNT(*) AS cnt,
-              COALESCE(SUM(CASE WHEN payment_method='Наличные'              THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
-              COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
-              COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
-              COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
-              COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total,
-              (SELECT withdrawn FROM w) AS withdrawn
-            FROM scope;
+              COALESCE(SUM(o.amount_total),0)::numeric(12,2) AS total_amount
+            FROM orders o
+            WHERE o.master_id = $1
+              AND o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
             """,
             master_id,
         )
+        pay_rows = await conn.fetch(
+            f"""
+            SELECT op.method,
+                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS total
+            FROM order_payments op
+            JOIN orders o ON o.id = op.order_id
+            WHERE o.master_id = $1
+              AND o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+            GROUP BY op.method
+            """,
+            master_id,
+        )
+        payment_totals = {row["method"]: Decimal(row["total"] or 0) for row in pay_rows}
+        withdrawn_period = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(amount),0)::numeric(12,2)
+            FROM cashbook_entries c
+            WHERE {_withdrawal_filter_sql("c")}
+              AND c.master_id=$1
+              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
+            """,
+            master_id,
+        ) or Decimal(0)
 
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
         on_hand_now = cash_on_orders - withdrawn_total
         if on_hand_now < Decimal(0):
             on_hand_now = Decimal(0)
 
-        withdrawn_period = await conn.fetchval(
-            f"""
-            SELECT COALESCE(SUM(amount),0)::numeric(12,2)
-            FROM cashbook_entries
-            WHERE kind='expense' AND method='Наличные'
-              AND master_id=$1 AND order_id IS NULL
-              AND (comment ILIKE '[WDR]%' OR comment ILIKE 'изъят%')
-              AND happened_at >= {start_sql} AND happened_at < {end_sql}
-            """,
-            master_id,
-        )
-
     fio = f"{master_row['fn']} {master_row['ln']}".strip()
     tg_id = master_row["tg_user_id"]
 
     lines = [
         f"Мастер: {fio or '—'} (tg:{tg_id}) — {label}",
-        f"Заказов выполнено: {rec['cnt'] if rec else 0}",
+        f"Заказов выполнено: {stats['cnt'] if stats else 0}",
     ]
-    if rec:
-        if rec["s_cash"] > 0:
-            lines.append(f"Оплачено наличными: {rec['s_cash']}₽")
-        if rec["s_card_jenya"] > 0:
-            lines.append(f"Оплачено Карта Женя: {rec['s_card_jenya']}₽")
-        if rec["s_card_dima"] > 0:
-            lines.append(f"Оплачено Карта Дима: {rec['s_card_dima']}₽")
-        if rec["s_rs"] > 0:
-            lines.append(f"Оплачено р/с: {rec['s_rs']}₽")
-        if rec["s_gift_total"] > 0:
-            lines.append(f"Оплачено сертификатом: {rec['s_gift_total']}₽")
-        withdrawn_value = rec["withdrawn"] or Decimal(0)
-        if withdrawn_value > 0:
-            lines.append(f"Изъято у мастера: {withdrawn_value}₽")
-
+    lines.append("Оплаты:")
+    lines.append(_format_payment_summary(payment_totals, multiline=True))
     lines.append(f"Изъято у мастера за период: {format_money(Decimal(withdrawn_period or 0))}₽")
     lines.append(f"Итого на руках наличных: {format_money(on_hand_now)}₽")
     return "\n".join(lines)
