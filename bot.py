@@ -8931,20 +8931,24 @@ async def master_income(msg: Message):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT o.payment_method AS method,
-                   SUM(o.amount_cash) AS total
+            SELECT op.method,
+                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS total
             FROM orders o
+            JOIN order_payments op ON op.order_id = o.id
             WHERE o.master_id = (
                 SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1
             )
               AND date_trunc('day', o.created_at) = date_trunc('day', NOW())
-            GROUP BY o.payment_method
+            GROUP BY op.method
             """,
             msg.from_user.id,
         )
     if not rows:
         return await msg.answer("Нет данных за сегодня.", reply_markup=master_kb)
-    lines = [f"{row['method']}: {row['total']}₽" for row in rows]
+    lines = [
+        f"{_format_payment_label(row['method'])}: {format_money(Decimal(row['total'] or 0))}₽"
+        for row in rows
+    ]
     await msg.answer("Сегодняшний приход по типам оплаты:\n" + "\n".join(lines), reply_markup=master_kb)
 
 # fallback
