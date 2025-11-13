@@ -3977,21 +3977,9 @@ async def get_cash_report_text(period: str) -> str:
                 LIMIT 31
                 """
             )
-        pending_wire = await conn.fetchval(
-            """
-            SELECT COALESCE(SUM(amount),0)
-            FROM cashbook_entries
-            WHERE kind='income'
-              AND method='р/с'
-              AND order_id IS NULL
-              AND NOT COALESCE(is_deleted, false)
-            """
-        ) or Decimal(0)
-
     income  = Decimal(rec["income"] or 0) if rec else Decimal(0)
     expense = Decimal(rec["expense"] or 0) if rec else Decimal(0)
     delta   = Decimal(rec["delta"] or 0) if rec else Decimal(0)
-    pending_wire = Decimal(pending_wire)
 
     lines = [
         f"Касса за {period_label}:",
@@ -3999,8 +3987,6 @@ async def get_cash_report_text(period: str) -> str:
         f"➖ Расход: {format_money(expense)}₽",
         f"= Дельта: {format_money(delta)}₽",
     ]
-    if pending_wire > 0:
-        lines.insert(1, f"💤 Не привязано к заказам: {format_money(pending_wire)}₽")
     if rows:
         lines.append(f"\n{detail_label}")
         for r in rows:
@@ -4293,10 +4279,21 @@ async def build_daily_cash_summary_text() -> str:
             GROUP BY op.method
             """
         )
+        pending_wire = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(amount),0)
+            FROM cashbook_entries
+            WHERE kind='income'
+              AND awaiting_order
+              AND order_id IS NULL
+              AND NOT COALESCE(is_deleted,false)
+            """
+        ) or Decimal(0)
         balance = await get_cash_balance_excluding_withdrawals(conn)
 
     income = Decimal(totals["income"] or 0)
     expense = Decimal(totals["expense"] or 0)
+    pending_wire = Decimal(pending_wire)
     method_totals: dict[str, Decimal] = {}
     for row in pay_rows:
         method = row["method"] or "прочее"
@@ -4308,6 +4305,8 @@ async def build_daily_cash_summary_text() -> str:
         f"➖ Расход: {_bold_html(f'{format_money(expense)}₽')}",
         f"💰 Остаток: {_bold_html(f'{format_money(balance)}₽')}",
     ]
+    if pending_wire > 0:
+        lines.insert(1, f"💤 Не привязано к заказам: {_bold_html(f'{format_money(pending_wire)}₽')}")
     payments_block = _format_payment_summary(
         method_totals,
         multiline=True,
