@@ -367,6 +367,18 @@ async def ensure_order_payments_schema(conn: asyncpg.Connection) -> None:
     )
 
 
+async def ensure_orders_rating_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        ALTER TABLE orders
+        ADD COLUMN IF NOT EXISTS rating_score smallint,
+        ADD COLUMN IF NOT EXISTS rating_comment text,
+        ADD COLUMN IF NOT EXISTS rating_requested_at timestamptz,
+        ADD COLUMN IF NOT EXISTS rating_replied_at timestamptz;
+        """
+    )
+
+
 def _add_months(dt: datetime, months: int) -> datetime:
     if months == 0:
         return dt
@@ -614,10 +626,18 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
     if not normalized_text:
         return False
     normalized_lower = normalized_text.lower()
+    rating_score: int | None = None
+    rating_match = re.match(r"^([1-5])(?:\D.*)?$", normalized_lower)
+    if rating_match:
+        try:
+            rating_score = int(rating_match.group(1))
+        except ValueError:
+            rating_score = None
     is_stop = normalized_lower in {"stop", "стоп"}
     is_interest = normalized_lower.startswith("1")
     if not (is_stop or is_interest):
-        return False
+        if rating_score is None:
+            return False
 
     phone_value = None
     user_info = data.get("user")
@@ -643,6 +663,20 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
         )
         if not client:
             return False
+        rating_order = None
+        if rating_score is not None:
+            rating_order = await _select_pending_rating_order(conn, client["id"])
+
+        if rating_score is not None and rating_order:
+            await _process_rating_response(
+                conn,
+                client_row=client,
+                order_id=rating_order["id"],
+                rating_score=rating_score,
+                raw_text=normalized_text,
+            )
+            return True
+
         promo_row = await conn.fetchrow(
             "SELECT last_variant_sent, responded_at FROM promo_reengagements WHERE client_id=$1",
             client["id"],
@@ -708,6 +742,101 @@ async def _notify_admins_about_promo_interest(client_row: Mapping[str, Any], mes
             logger.warning("Failed to notify admin %s about промо интерес: %s", admin_id, exc)
 
 
+RATING_LOOKBACK_DAYS = 30
+
+
+async def _select_pending_rating_order(conn: asyncpg.Connection, client_id: int) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        SELECT id
+        FROM orders
+        WHERE client_id = $1
+          AND rating_score IS NULL
+          AND created_at >= NOW() - INTERVAL '30 days'
+        ORDER BY COALESCE(rating_requested_at, created_at) DESC
+        LIMIT 1
+        """,
+        client_id,
+    )
+
+
+async def _process_rating_response(
+    conn: asyncpg.Connection,
+    *,
+    client_row: Mapping[str, Any],
+    order_id: int,
+    rating_score: int,
+    raw_text: str,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE orders
+        SET rating_score = $1,
+            rating_comment = $2,
+            rating_replied_at = NOW()
+        WHERE id = $3
+        """,
+        rating_score,
+        raw_text.strip(),
+        order_id,
+    )
+    payload = {"order_id": order_id, "score": rating_score}
+    client_id = int(client_row["id"])
+    if rating_score >= 5:
+        await _try_enqueue_notification(
+            conn,
+            event_key="order_rating_response_high_client",
+            client_id=client_id,
+            payload=payload,
+        )
+        await _notify_rating_admins(client_row, order_id, rating_score, raw_text, notify=False)
+    elif rating_score == 4:
+        await _try_enqueue_notification(
+            conn,
+            event_key="order_rating_response_mid_client",
+            client_id=client_id,
+            payload=payload,
+        )
+        await _notify_rating_admins(client_row, order_id, rating_score, raw_text, notify=True)
+    else:
+        await _try_enqueue_notification(
+            conn,
+            event_key="order_rating_response_low_client",
+            client_id=client_id,
+            payload=payload,
+        )
+        await _notify_rating_admins(client_row, order_id, rating_score, raw_text, notify=True, urgent=True)
+
+
+async def _notify_rating_admins(
+    client_row: Mapping[str, Any],
+    order_id: int,
+    rating_score: int,
+    message_text: str,
+    notify: bool = True,
+    urgent: bool = False,
+) -> None:
+    if not notify or not ADMIN_TG_IDS:
+        return
+    prefix = "⚠️" if urgent else ("ℹ️" if rating_score == 4 else "✅")
+    name = (client_row.get("full_name") or "Клиент").strip() or "Клиент"
+    phone = client_row.get("phone") or "неизвестно"
+    lines = [
+        f"{prefix} Оценка {rating_score} по заказу #{order_id}",
+        f"Клиент: {name}",
+        f"Телефон: {phone}",
+    ]
+    comment = message_text.strip()
+    if comment:
+        lines.append(f"Сообщение: {comment}")
+    text = "\n".join(lines)
+    for admin_id in ADMIN_TG_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to notify admin %s about rating: %s", admin_id, exc)
+
+
 async def _enqueue_bonus_change(
     conn: asyncpg.Connection,
     *,
@@ -745,6 +874,7 @@ async def _enqueue_bonus_change(
 async def _enqueue_order_completed_notification(
     conn: asyncpg.Connection,
     *,
+    order_id: int,
     client_id: int,
     total_sum: Decimal,
     used_bonus: int,
@@ -781,7 +911,18 @@ async def _enqueue_order_completed_notification(
         conn,
         event_key="order_rating_reminder",
         client_id=client_id,
-        payload={},
+        payload={"order_id": order_id},
+    )
+    await conn.execute(
+        """
+        UPDATE orders
+        SET rating_requested_at = NOW(),
+            rating_replied_at = NULL,
+            rating_score = NULL,
+            rating_comment = NULL
+        WHERE id = $1
+        """,
+        order_id,
     )
 
 
@@ -8769,6 +8910,7 @@ async def commit_order(msg: Message, state: FSMContext):
                 await _record_order_income(conn, payment_method, cash_payment, order_id, int(effective_master_id), notify_label)
             await _enqueue_order_completed_notification(
                 conn,
+                order_id=order_id,
                 client_id=client_id,
                 total_sum=amount_total,
                 used_bonus=bonus_spent,
@@ -8981,6 +9123,7 @@ async def main():
         await ensure_order_masters_schema(_conn)
         await ensure_orders_wire_schema(_conn)
         await ensure_cashbook_wire_schema(_conn)
+        await ensure_orders_rating_schema(_conn)
         await ensure_order_payments_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
