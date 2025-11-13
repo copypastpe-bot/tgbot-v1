@@ -21,7 +21,7 @@ from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from typing import Mapping, Any, Sequence, Callable
+from typing import Mapping, Any, Sequence, Callable, List, Dict
 
 # ===== FSM State Groups =====
 class AdminMenuFSM(StatesGroup):
@@ -143,6 +143,7 @@ PROMO_REMINDER_FIRST_GAP_MONTHS = 8
 PROMO_REMINDER_SECOND_GAP_MONTHS = 2
 PROMO_RANDOM_DELAY_RANGE = (1, 10)
 PROMO_BONUS_TTL_DAYS = 365
+MAX_ORDER_MASTERS = 5
 BDAY_TEMPLATE_KEYS = (
     "birthday_congrats_variant_1",
     "birthday_congrats_variant_2",
@@ -274,6 +275,27 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
         ADD COLUMN IF NOT EXISTS response_kind text;
         """
     )
+
+
+async def ensure_order_masters_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_masters (
+            order_id    integer REFERENCES orders(id) ON DELETE CASCADE,
+            master_id   integer REFERENCES staff(id) ON DELETE CASCADE,
+            share_fraction numeric(10,4) NOT NULL DEFAULT 1.0,
+            fuel_pay    numeric(12,2) NOT NULL DEFAULT 0,
+            created_at  timestamptz NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (order_id, master_id)
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_masters_master
+        ON order_masters(master_id);
+        """
+    )
     await conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_promo_reeng_next
@@ -354,6 +376,32 @@ async def _schedule_promo_notification(
         scheduled_at=scheduled_at,
     )
     return True
+
+
+def _split_amount(amount: Decimal, parts: int) -> list[Decimal]:
+    if parts <= 0:
+        return []
+    if parts == 1:
+        return [amount]
+    per_part = (amount / parts)
+    result: list[Decimal] = []
+    remaining = amount
+    for idx in range(parts):
+        if idx == parts - 1:
+            portion = remaining
+        else:
+            portion = qround_ruble(per_part)
+            remaining -= portion
+        result.append(portion)
+    return result
+
+
+def _format_staff_name(record: Mapping[str, Any]) -> str:
+    first = (record.get("first_name") or "").strip()
+    last = (record.get("last_name") or "").strip()
+    if first or last:
+        return f"{first} {last}".strip()
+    return record.get("nickname") or record.get("display") or f"ID {record.get('id')}"
 
 
 async def _schedule_birthday_congrats(
@@ -7039,6 +7087,8 @@ class OrderFSM(StatesGroup):
     bonus_spend = State()
     bonus_custom = State()
     waiting_payment_method = State()
+    add_more_masters = State()
+    pick_extra_master = State()
     maybe_bday = State()
     name_fix = State()
     confirm = State()
@@ -7287,7 +7337,7 @@ async def order_pick_method(msg: Message, state: FSMContext):
             "Выбран Подарочный сертификат. Сумма чека будет использована как номинал, в кассу поступит 0₽.",
             reply_markup=ReplyKeyboardRemove()
         )
-        return await proceed_order_finalize(msg, state)
+        return await ask_extra_master(msg, state)
 
     data = await state.get_data()
     amount_cash = Decimal(str(data.get("amount_cash", 0)))
@@ -7298,7 +7348,131 @@ async def order_pick_method(msg: Message, state: FSMContext):
 
     await msg.answer("Метод оплаты сохранён.", reply_markup=ReplyKeyboardRemove())
 
-    return await proceed_order_finalize(msg, state)
+    return await ask_extra_master(msg, state)
+
+
+async def ensure_primary_master_info(state: FSMContext, tg_user_id: int) -> tuple[int, str]:
+    data = await state.get_data()
+    master_id = data.get("primary_master_id")
+    master_name = data.get("primary_master_name")
+    if master_id and master_name:
+        return master_id, master_name
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, COALESCE(first_name,'') AS first_name, COALESCE(last_name,'') AS last_name "
+            "FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
+            tg_user_id,
+        )
+    if not row:
+        raise RuntimeError("Не удалось определить мастера в таблице staff.")
+    name = _format_staff_name(row)
+    await state.update_data(primary_master_id=row["id"], primary_master_name=name)
+    return int(row["id"]), name
+
+
+async def ask_extra_master(msg: Message, state: FSMContext):
+    primary_id, primary_name = await ensure_primary_master_info(state, msg.from_user.id)
+    data = await state.get_data()
+    extras = data.get("extra_masters") or []
+    await state.update_data(extra_masters=extras)
+    current_total = 1 + len(extras)
+    if current_total >= MAX_ORDER_MASTERS:
+        await msg.answer("Достигнуто максимальное число мастеров для заказа.", reply_markup=ReplyKeyboardRemove())
+        return await proceed_order_finalize(msg, state)
+    selected_names = ", ".join([primary_name] + [m["name"] for m in extras])
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Добавить мастера")],
+            [KeyboardButton(text="Нет, еду один")],
+            [KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+    )
+    await state.set_state(OrderFSM.add_more_masters)
+    return await msg.answer(
+        "Добавить ещё мастера? (максимум 5 на заказ)\n"
+        f"Текущие: {selected_names}",
+        reply_markup=kb,
+    )
+
+
+async def _prompt_pick_extra_master(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    extras = data.get("extra_masters") or []
+    primary_id, _ = await ensure_primary_master_info(state, msg.from_user.id)
+    exclude_ids = [primary_id] + [m["id"] for m in extras]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, COALESCE(first_name,'') AS first_name, COALESCE(last_name,'') AS last_name
+            FROM staff
+            WHERE role='master' AND is_active
+              AND NOT (id = ANY($1::int[]))
+            ORDER BY first_name, last_name, id
+            """,
+            exclude_ids if exclude_ids else [0],
+        )
+    if not rows:
+        await msg.answer("Нет доступных мастеров для добавления.", reply_markup=ReplyKeyboardRemove())
+        return await ask_extra_master(msg, state)
+    lines = ["Доступные мастера (введите ID из списка):"]
+    for row in rows[:40]:
+        lines.append(f"{row['id']}: {_format_staff_name(row)}")
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="-")], [KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+    )
+    await state.set_state(OrderFSM.pick_extra_master)
+    return await msg.answer("\n".join(lines), reply_markup=kb)
+
+
+@dp.message(OrderFSM.add_more_masters, F.text)
+async def handle_add_more_masters(msg: Message, state: FSMContext):
+    choice = (msg.text or "").strip().lower()
+    if choice in {"нет", "нет, еду один", "дальше", "далее", "продолжить"}:
+        await msg.answer("Ок, оставляем текущий состав мастеров.", reply_markup=ReplyKeyboardRemove())
+        return await proceed_order_finalize(msg, state)
+    if "добав" in choice:
+        return await _prompt_pick_extra_master(msg, state)
+    if choice == "отмена":
+        return await cancel_order(msg, state)
+    return await msg.answer("Ответьте «Добавить мастера» или «Нет, еду один».")
+
+
+@dp.message(OrderFSM.pick_extra_master, F.text)
+async def pick_extra_master(msg: Message, state: FSMContext):
+    raw = (msg.text or "").strip()
+    if raw.lower() == "отмена":
+        return await cancel_order(msg, state)
+    if raw in {"-", "нет"}:
+        return await ask_extra_master(msg, state)
+    try:
+        master_id = int(raw)
+    except ValueError:
+        return await msg.answer("Введите ID мастера числом или '-' чтобы пропустить.")
+
+    data = await state.get_data()
+    extras = data.get("extra_masters") or []
+    existing_ids = {m["id"] for m in extras}
+    primary_id, _ = await ensure_primary_master_info(state, msg.from_user.id)
+    if master_id == primary_id or master_id in existing_ids:
+        return await msg.answer("Этот мастер уже добавлен. Введите другой ID.")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, COALESCE(first_name,'') AS first_name, COALESCE(last_name,'') AS last_name
+            FROM staff
+            WHERE id=$1 AND role='master' AND is_active
+            """,
+            master_id,
+        )
+    if not row:
+        return await msg.answer("Мастер с таким ID не найден или не активен.")
+    extras.append({"id": row["id"], "name": _format_staff_name(row)})
+    await state.update_data(extra_masters=extras)
+    await msg.answer(f"Добавлен мастер: {_format_staff_name(row)}", reply_markup=ReplyKeyboardRemove())
+    return await ask_extra_master(msg, state)
 
 
 async def proceed_order_finalize(msg: Message, state: FSMContext):
@@ -7343,8 +7517,29 @@ async def show_confirm(msg: Message, state: FSMContext):
     upsell_pay = qround_ruble(upsell * (UPSELL_PER_3000 / Decimal(3000)))
     total_pay = base_pay + FUEL_PAY + upsell_pay
     await state.update_data(bonus_earned=int(bonus_earned), base_pay=base_pay, upsell_pay=upsell_pay, fuel_pay=FUEL_PAY, total_pay=total_pay)
+    primary_master_id, primary_master_name = await ensure_primary_master_info(state, msg.from_user.id)
+    master_entries: list[dict[str, Any]] = [{"id": primary_master_id, "name": primary_master_name}]
+    for extra in data.get("extra_masters") or []:
+        master_entries.append({"id": extra["id"], "name": extra["name"]})
+    share_count = len(master_entries)
+    if share_count <= 0:
+        share_count = 1
+    base_shares = _split_amount(base_pay, share_count)
+    upsell_shares = _split_amount(upsell_pay, share_count)
+    share_fraction = Decimal("1") / share_count
+    for idx, entry in enumerate(master_entries):
+        entry["base_pay"] = base_shares[idx]
+        entry["upsell_pay"] = upsell_shares[idx]
+        entry["fuel_pay"] = FUEL_PAY
+        entry["total_pay"] = base_shares[idx] + upsell_shares[idx] + FUEL_PAY
+        entry["share_fraction"] = share_fraction
+    await state.update_data(master_shares=master_entries)
     name = data.get("client_name") or "Без имени"
     bday_text = data.get("birthday") or data.get("new_birthday") or "—"
+    masters_summary = "\n".join(
+        f"👷 {entry['name']}: {entry['total_pay']} (база {entry['base_pay']} + бензин {entry['fuel_pay']} + доп {entry['upsell_pay']})"
+        for entry in master_entries
+    )
     text = (
         f"Проверьте:\n"
         f"👤 {name}\n"
@@ -7354,7 +7549,7 @@ async def show_confirm(msg: Message, state: FSMContext):
         f"🎁 Списано бонусов: {bonus_spent}\n"
         f"➕ Начислить бонусов: {int(bonus_earned)}\n"
         f"🎂 ДР: {bday_text}\n"
-        f"👷 ЗП мастера: {total_pay} (база {base_pay} + бензин {FUEL_PAY} + доп {upsell_pay})\n\n"
+        f"{masters_summary}\n\n"
         f"Отправьте 'подтвердить' или 'отмена'"
     )
     await msg.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="подтвердить")],[KeyboardButton(text="отмена")]], resize_keyboard=True))
@@ -7498,12 +7693,47 @@ async def commit_order(msg: Message, state: FSMContext):
                     balance_after=current_bonus_balance,
                 )
 
-            await conn.execute(
-                "INSERT INTO payroll_items (order_id, master_id, base_pay, fuel_pay, upsell_pay, total_pay, calc_info) "
-                "VALUES ($1, (SELECT id FROM staff WHERE tg_user_id=$2), $3, $4, $5, $6, "
-                "        jsonb_build_object('base_amount', to_jsonb(($7)::numeric), 'cash_payment', to_jsonb(($8)::numeric), 'rules', '1000/3000 + 150 + 500/3000'))",
-                order_id, msg.from_user.id, base_pay, fuel_pay, upsell_pay, total_pay, amount_total, cash_payment
-            )
+            master_shares = data.get("master_shares")
+            if not master_shares:
+                master_shares = [{
+                    "id": int(master_db_id),
+                    "name": master_display_name or "Мастер",
+                    "base_pay": base_pay,
+                    "upsell_pay": upsell_pay,
+                    "fuel_pay": fuel_pay,
+                    "total_pay": total_pay,
+                    "share_fraction": Decimal("1"),
+                }]
+            for entry in master_shares:
+                share_fraction = Decimal(str(entry.get("share_fraction", Decimal("1"))))
+                entry_base = Decimal(str(entry.get("base_pay", 0)))
+                entry_upsell = Decimal(str(entry.get("upsell_pay", 0)))
+                entry_fuel = Decimal(str(entry.get("fuel_pay", FUEL_PAY)))
+                entry_total = Decimal(str(entry.get("total_pay", entry_base + entry_fuel + entry_upsell)))
+                await conn.execute(
+                    """
+                    INSERT INTO order_masters (order_id, master_id, share_fraction, fuel_pay)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    order_id,
+                    int(entry["id"]),
+                    share_fraction,
+                    entry_fuel,
+                )
+                await conn.execute(
+                    "INSERT INTO payroll_items (order_id, master_id, base_pay, fuel_pay, upsell_pay, total_pay, calc_info) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, "
+                    "        jsonb_build_object('base_amount', to_jsonb(($7)::numeric), 'cash_payment', to_jsonb(($8)::numeric), 'share', to_jsonb(($9)::numeric), 'rules', '1000/3000 + 150 + 500/3000'))",
+                    order_id,
+                    int(entry["id"]),
+                    entry_base,
+                    entry_fuel,
+                    entry_upsell,
+                    entry_total,
+                    amount_total,
+                    cash_payment,
+                    share_fraction,
+                )
 
             street_label = extract_street(client_address_val)
             base_name_for_label = (client_full_name_val or name or "Клиент").strip() or "Клиент"
@@ -7710,6 +7940,7 @@ async def main():
         await _ensure_bonus_posted_column(_conn)
         await ensure_notification_schema(_conn)
         await ensure_promo_schema(_conn)
+        await ensure_order_masters_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(
