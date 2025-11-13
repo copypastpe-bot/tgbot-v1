@@ -53,6 +53,14 @@ class IncomeFSM(StatesGroup):
     waiting_amount = State()
     waiting_comment = State()
     waiting_confirm = State()
+    waiting_wire_choice = State()
+
+
+class WireLinkFSM(StatesGroup):
+    waiting_entry = State()
+    waiting_order_date = State()
+    waiting_order_pick = State()
+    waiting_master_amount = State()
 
 
 class ExpenseFSM(StatesGroup):
@@ -296,6 +304,15 @@ async def ensure_order_masters_schema(conn: asyncpg.Connection) -> None:
         ON order_masters(master_id);
         """
     )
+
+
+async def ensure_orders_wire_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        ALTER TABLE orders
+        ADD COLUMN IF NOT EXISTS awaiting_wire_payment boolean NOT NULL DEFAULT false;
+        """
+    )
     await conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_promo_reeng_next
@@ -437,6 +454,20 @@ async def _schedule_birthday_congrats(
         client_id=client_id,
         payload=payload,
         scheduled_at=scheduled_at,
+    )
+
+
+async def _enqueue_wire_payment_received(
+    conn: asyncpg.Connection,
+    *,
+    client_id: int,
+    amount: Decimal,
+) -> None:
+    await _try_enqueue_notification(
+        conn,
+        event_key="order_wire_payment_received",
+        client_id=client_id,
+        payload={"amount_paid": format_money(amount)},
     )
 
 
@@ -675,22 +706,31 @@ async def _enqueue_order_completed_notification(
     bonus_balance: int,
     cash_payment: Decimal,
     bonus_expires_at: datetime | date | None,
+    wire_pending: bool = False,
 ) -> None:
     cash_amount = cash_payment if isinstance(cash_payment, Decimal) else Decimal(cash_payment)
-    payload = {
-        "total_sum": format_money(total_sum),
-        "used_bonus": used_bonus,
-        "earned_bonus": earned_bonus,
-        "bonus_balance": bonus_balance,
-        "amount_due": format_money(cash_amount),
-        "bonus_expire_date": _format_expire_label(bonus_expires_at),
-    }
-    await _try_enqueue_notification(
-        conn,
-        event_key="order_completed_summary",
-        client_id=client_id,
-        payload=payload,
-    )
+    if wire_pending:
+        await _try_enqueue_notification(
+            conn,
+            event_key="order_completed_wire_pending",
+            client_id=client_id,
+            payload={},
+        )
+    else:
+        payload = {
+            "total_sum": format_money(total_sum),
+            "used_bonus": used_bonus,
+            "earned_bonus": earned_bonus,
+            "bonus_balance": bonus_balance,
+            "amount_due": format_money(cash_amount),
+            "bonus_expire_date": _format_expire_label(bonus_expires_at),
+        }
+        await _try_enqueue_notification(
+            conn,
+            event_key="order_completed_summary",
+            client_id=client_id,
+            payload=payload,
+        )
     await _try_enqueue_notification(
         conn,
         event_key="order_rating_reminder",
@@ -3860,6 +3900,17 @@ async def get_cash_report_text(period: str) -> str:
     income  = Decimal(rec["income"] or 0) if rec else Decimal(0)
     expense = Decimal(rec["expense"] or 0) if rec else Decimal(0)
     delta   = Decimal(rec["delta"] or 0) if rec else Decimal(0)
+    pending_wire = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount),0)
+        FROM cashbook_entries
+        WHERE kind='income'
+          AND method='р/с'
+          AND order_id IS NULL
+          AND NOT COALESCE(is_deleted, false)
+        """
+    ) or Decimal(0)
+    pending_wire = Decimal(pending_wire)
 
     lines = [
         f"Касса за {period_label}:",
@@ -3867,6 +3918,8 @@ async def get_cash_report_text(period: str) -> str:
         f"➖ Расход: {format_money(expense)}₽",
         f"= Дельта: {format_money(delta)}₽",
     ]
+    if pending_wire > 0:
+        lines.insert(1, f"💤 Не привязано к заказам: {format_money(pending_wire)}₽")
     if rows:
         lines.append(f"\n{detail_label}")
         for r in rows:
@@ -5203,6 +5256,40 @@ async def income_wizard_amount(msg: Message, state: FSMContext):
     await msg.answer("Комментарий? (введите текст или нажмите «Без комментария»)", reply_markup=kb)
 
 
+@dp.message(Command("link_payment"))
+async def link_payment_cmd(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "manage_income"):
+        return await msg.answer("Только для администраторов.")
+    await state.clear()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, amount, happened_at, comment
+            FROM cashbook_entries
+            WHERE kind='income'
+              AND method='р/с'
+              AND order_id IS NULL
+              AND NOT COALESCE(is_deleted, false)
+            ORDER BY happened_at
+            LIMIT 30
+            """
+        )
+    if not rows:
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Непривязанных оплат нет.", reply_markup=admin_root_kb())
+    lines = ["Непривязанные оплаты:"]
+    for row in rows:
+        when = row["happened_at"].strftime("%d.%m %H:%M")
+        lines.append(f"#{row['id']}: {format_money(Decimal(row['amount']))}₽ — {when} ({row['comment'] or ''})")
+    await msg.answer("\n".join(lines))
+    await state.set_state(WireLinkFSM.waiting_entry)
+    await msg.answer("Введите ID оплаты для привязки или «Отмена»:", reply_markup=ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    ))
+
+
 @dp.message(IncomeFSM.waiting_comment)
 async def income_wizard_comment(msg: Message, state: FSMContext):
     txt = (msg.text or "").strip()
@@ -5220,6 +5307,40 @@ async def income_wizard_comment(msg: Message, state: FSMContext):
         f"Комментарий: {txt}",
     ]
     await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("income_confirm"))
+
+
+@dp.message(WireLinkFSM.waiting_entry, F.text)
+async def wire_link_pick_entry(msg: Message, state: FSMContext):
+    raw = (msg.text or "").strip()
+    if raw.lower() == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Ок, привязку можно выполнить позже.", reply_markup=admin_root_kb())
+    try:
+        entry_id = int(raw)
+    except ValueError:
+        return await msg.answer("Введите числовой ID оплаты или «Отмена».")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, amount, comment
+            FROM cashbook_entries
+            WHERE id=$1
+              AND kind='income'
+              AND method='р/с'
+              AND order_id IS NULL
+              AND NOT COALESCE(is_deleted, false)
+            """,
+            entry_id,
+        )
+    if not row:
+        return await msg.answer("Оплата с таким ID не найдена или уже привязана. Введите другой ID.")
+    context = {
+        "entry_id": row["id"],
+        "amount": str(row["amount"]),
+        "comment": row["comment"] or "",
+    }
+    await _start_wire_link_flow(msg, state, context)
 
 
 @dp.message(AdminMenuFSM.root, F.text.casefold() == "расход")
@@ -6693,6 +6814,26 @@ async def income_confirm_handler(query: CallbackQuery, state: FSMContext):
         f"Приход №{tx['id']}: {format_money(amount)}₽ | {method} — {when}\nКомментарий: {comment}",
         reply_markup=admin_root_kb(),
     )
+    if method == "р/с":
+        await state.update_data(
+            wire_link_context={
+                "entry_id": tx["id"],
+                "amount": str(amount),
+                "comment": comment,
+            }
+        )
+        await state.set_state(IncomeFSM.waiting_wire_choice)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Привязать сейчас")],
+                [KeyboardButton(text="Нет")],
+                [KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await query.message.answer("Привязать оплату к заказу сейчас?", reply_markup=kb)
+        return
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
 
@@ -6741,6 +6882,36 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
     )
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
+
+
+@dp.message(IncomeFSM.waiting_wire_choice, F.text)
+async def income_wire_choice(msg: Message, state: FSMContext):
+    choice = (msg.text or "").strip().lower()
+    if choice == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Готово. Привязать оплату можно позже командой /link_payment.", reply_markup=admin_root_kb())
+    if choice in {"нет", "не", "потом"}:
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Ок, оплату можно привязать позже командой /link_payment.", reply_markup=admin_root_kb())
+    if "прив" in choice:
+        ctx = (await state.get_data()).get("wire_link_context")
+        if not ctx:
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            return await msg.answer("Нет данных по оплате. Попробуйте ещё раз командой /link_payment.", reply_markup=admin_root_kb())
+        await _start_wire_link_flow(msg, state, ctx)
+        return
+    return await msg.answer("Ответьте «Привязать сейчас» или «Нет».", reply_markup=ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Привязать сейчас")],
+            [KeyboardButton(text="Нет")],
+            [KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    ))
 
 # ===== /income admin command =====
 @dp.message(Command("income"))
@@ -7475,6 +7646,176 @@ async def pick_extra_master(msg: Message, state: FSMContext):
     return await ask_extra_master(msg, state)
 
 
+def _wire_date_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Сегодня"), KeyboardButton(text="Вчера")],
+            [KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+async def _start_wire_link_flow(msg: Message, state: FSMContext, context: dict):
+    await state.update_data(wire_link_context=context or {})
+    await state.set_state(WireLinkFSM.waiting_order_date)
+    await msg.answer(
+        "Введите дату заказа (например 12.11 или «Сегодня»):",
+        reply_markup=_wire_date_keyboard(),
+    )
+
+
+def _parse_wire_date(text: str) -> date | None:
+    value = (text or "").strip().lower()
+    today = datetime.now(MOSCOW_TZ).date()
+    if value in {"сегодня", "today"}:
+        return today
+    if value in {"вчера", "yesterday"}:
+        return today - timedelta(days=1)
+    try:
+        if len(value) == 5:
+            dt = datetime.strptime(value, "%d.%m")
+            return date(today.year, dt.month, dt.day)
+        return datetime.strptime(value, "%d.%m.%Y").date()
+    except Exception:
+        return None
+
+
+async def _load_orders_for_date(conn: asyncpg.Connection, dt: date) -> list[asyncpg.Record]:
+    return await conn.fetch(
+        """
+        SELECT o.id,
+               o.amount_total,
+               o.payment_method,
+               o.awaiting_wire_payment,
+               COALESCE(c.full_name, '') AS client_name,
+               COALESCE(c.phone, '') AS phone,
+               o.created_at
+        FROM orders o
+        LEFT JOIN clients c ON c.id = o.client_id
+        WHERE DATE(o.created_at AT TIME ZONE 'Europe/Moscow') = $1
+          AND o.payment_method = 'р/с'
+        ORDER BY o.created_at
+        """,
+        dt,
+    )
+
+
+async def _load_order_masters(conn: asyncpg.Connection, order_id: int) -> list[dict]:
+    rows = await conn.fetch(
+        """
+        SELECT om.master_id,
+               COALESCE(s.first_name,'') AS first_name,
+               COALESCE(s.last_name,'') AS last_name
+        FROM order_masters om
+        JOIN staff s ON s.id = om.master_id
+        WHERE om.order_id = $1
+        ORDER BY om.master_id
+        """,
+        order_id,
+    )
+    if not rows:
+        row = await conn.fetchrow("SELECT master_id FROM orders WHERE id=$1", order_id)
+        if not row or row["master_id"] is None:
+            return []
+        staff = await conn.fetchrow(
+            "SELECT id, COALESCE(first_name,'') AS first_name, COALESCE(last_name,'') AS last_name "
+            "FROM staff WHERE id=$1",
+            row["master_id"],
+        )
+        if not staff:
+            return []
+        return [{"id": staff["id"], "name": _format_staff_name(staff)}]
+    return [{"id": r["master_id"], "name": _format_staff_name(r)} for r in rows]
+
+
+async def _prompt_next_wire_master(msg: Message, state: FSMContext):
+    ctx = (await state.get_data()).get("wire_link_context") or {}
+    masters = ctx.get("masters") or []
+    idx = ctx.get("master_index", 0)
+    if idx >= len(masters):
+        return await _finalize_wire_link_flow(msg, state)
+    master = masters[idx]
+    await msg.answer(
+        f"Введите оплату (база) для {master['name']} (руб):",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+
+
+async def _finalize_wire_link_flow(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    ctx = data.get("wire_link_context") or {}
+    entry_id = ctx.get("entry_id")
+    order_id = ctx.get("order_id")
+    masters = ctx.get("masters") or []
+    payments = ctx.get("master_payments") or []
+    amount = ctx.get("amount")
+    comment = ctx.get("comment") or ""
+    if not entry_id or not order_id or not masters or len(masters) != len(payments):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Не удалось привязать оплату: неполные данные.", reply_markup=admin_root_kb())
+    try:
+        amount_dec = Decimal(str(amount))
+    except Exception:
+        amount_dec = Decimal("0")
+    async with pool.acquire() as conn:
+        order_row = await conn.fetchrow(
+            "SELECT client_id FROM orders WHERE id=$1",
+            order_id,
+        )
+        await conn.execute(
+            """
+            UPDATE cashbook_entries
+            SET order_id = $1,
+                comment = $2
+            WHERE id = $3
+            """,
+            order_id,
+            f"Поступление по заказу #{order_id}",
+            entry_id,
+        )
+        await conn.execute(
+            """
+            UPDATE orders
+            SET amount_total=$1,
+                amount_cash=0,
+                awaiting_wire_payment = FALSE
+            WHERE id=$2
+            """,
+            amount_dec,
+            order_id,
+        )
+        for master, base_amount in zip(masters, payments):
+            base_dec = Decimal(str(base_amount))
+            await conn.execute(
+                """
+                UPDATE payroll_items
+                SET base_pay = $1,
+                    upsell_pay = 0,
+                    total_pay = $1 + fuel_pay,
+                    calc_info = COALESCE(calc_info, '{}'::jsonb) || jsonb_build_object('wire_manual', true)
+                WHERE order_id = $2 AND master_id = $3
+                """,
+                base_dec,
+                order_id,
+                master["id"],
+            )
+        if order_row and order_row["client_id"]:
+            await _enqueue_wire_payment_received(conn, client_id=int(order_row["client_id"]), amount=amount_dec)
+    await msg.answer(
+        f"Оплата по заказу #{order_id} на сумму {format_money(amount_dec)}₽ привязана. Зарплата мастерам обновлена.",
+        reply_markup=admin_root_kb(),
+    )
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+
+
 async def proceed_order_finalize(msg: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("birthday"):
@@ -7510,12 +7851,19 @@ async def show_confirm(msg: Message, state: FSMContext):
     cash_payment = Decimal(str(data["amount_cash"]))
     payment_method = data.get("payment_method")
     base_calc_amount = amount
-    bonus_earned = qround_ruble(cash_payment * BONUS_RATE)
-    base_pay = qround_ruble(base_calc_amount * (MASTER_PER_3000 / Decimal(3000)))
-    if base_pay < Decimal("1000"):
-        base_pay = Decimal("1000")
-    upsell_pay = qround_ruble(upsell * (UPSELL_PER_3000 / Decimal(3000)))
-    total_pay = base_pay + FUEL_PAY + upsell_pay
+    payment_method = data.get("payment_method")
+    bonus_earned = Decimal("0")
+    if payment_method != "р/с":
+        bonus_earned = qround_ruble(cash_payment * BONUS_RATE)
+    base_pay = Decimal("0")
+    upsell_pay = Decimal("0")
+    total_pay = FUEL_PAY
+    if payment_method != "р/с":
+        base_pay = qround_ruble(base_calc_amount * (MASTER_PER_3000 / Decimal(3000)))
+        if base_pay < Decimal("1000"):
+            base_pay = Decimal("1000")
+        upsell_pay = qround_ruble(upsell * (UPSELL_PER_3000 / Decimal(3000)))
+        total_pay = base_pay + FUEL_PAY + upsell_pay
     await state.update_data(bonus_earned=int(bonus_earned), base_pay=base_pay, upsell_pay=upsell_pay, fuel_pay=FUEL_PAY, total_pay=total_pay)
     primary_master_id, primary_master_name = await ensure_primary_master_info(state, msg.from_user.id)
     master_entries: list[dict[str, Any]] = [{"id": primary_master_id, "name": primary_master_name}]
@@ -7552,7 +7900,10 @@ async def show_confirm(msg: Message, state: FSMContext):
         f"➕ Начислить бонусов: {int(bonus_earned)}\n"
         f"🎂 ДР: {bday_text}\n"
         f"{masters_summary}\n\n"
-        f"Отправьте 'подтвердить' или 'отмена'"
+    )
+    if payment_method == "р/с":
+        text += "💼 Оплата по р/с — зарплата будет начислена после поступления средств.\n\n"
+    text += "Отправьте 'подтвердить' или 'отмена'"
     )
     await msg.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="подтвердить")],[KeyboardButton(text="отмена")]], resize_keyboard=True))
 
@@ -7571,6 +7922,7 @@ async def commit_order(msg: Message, state: FSMContext):
         raw_total = amount_cash
     amount_total = Decimal(str(raw_total))
     payment_method = data.get("payment_method")
+    is_wire_payment = payment_method == "р/с"
     upsell = Decimal(str(data.get("upsell_amount", 0)))
     bonus_spent = int(Decimal(str(data.get("bonus_spent", 0))))
     cash_payment = amount_cash
@@ -7629,6 +7981,11 @@ async def commit_order(msg: Message, state: FSMContext):
             )
             order_id = order["id"]
             master_db_id = order["master_id"]
+            if is_wire_payment:
+                await conn.execute(
+                    "UPDATE orders SET awaiting_wire_payment = TRUE WHERE id=$1",
+                    order_id,
+                )
 
             await conn.execute(
                 "INSERT INTO staff(tg_user_id, role, is_active) "
@@ -7675,7 +8032,7 @@ async def commit_order(msg: Message, state: FSMContext):
                     delta=-bonus_spent,
                     balance_after=current_bonus_balance,
                 )
-            if bonus_earned > 0:
+            if bonus_earned > 0 and not is_wire_payment:
                 await conn.execute(
                     """
                     INSERT INTO bonus_transactions (client_id, delta, reason, order_id, created_at, happened_at, expires_at)
@@ -7751,7 +8108,8 @@ async def commit_order(msg: Message, state: FSMContext):
                 effective_master_id = int(master_shares[0]["id"])
             if effective_master_id is None:
                 raise RuntimeError("Не удалось определить master_id для записи кассы.")
-            await _record_order_income(conn, payment_method, cash_payment, order_id, int(effective_master_id), notify_label)
+            if not is_wire_payment:
+                await _record_order_income(conn, payment_method, cash_payment, order_id, int(effective_master_id), notify_label)
             await _enqueue_order_completed_notification(
                 conn,
                 client_id=client_id,
@@ -7761,11 +8119,13 @@ async def commit_order(msg: Message, state: FSMContext):
                 bonus_balance=current_bonus_balance,
                 cash_payment=cash_payment,
                 bonus_expires_at=order_bonus_expires_utc,
+                wire_pending=is_wire_payment,
             )
-        try:
-            await post_order_bonus_delta(conn, order_id)
-        except Exception as e:  # noqa: BLE001
-            logging.warning("post_order_bonus_delta failed for order_id=%s: %s", order_id, e)
+        if not is_wire_payment:
+            try:
+                await post_order_bonus_delta(conn, order_id)
+            except Exception as e:  # noqa: BLE001
+                logging.warning("post_order_bonus_delta failed for order_id=%s: %s", order_id, e)
 
     master_display_name = master_display_name or (msg.from_user.full_name or msg.from_user.username or f"tg:{msg.from_user.id}")
     client_display_masked = client_display_masked or f"{(name or 'Клиент').strip() or 'Клиент'} {mask_phone_last4(client_phone_val)}".strip()
@@ -7792,6 +8152,8 @@ async def commit_order(msg: Message, state: FSMContext):
             lines.append(f"🧺 Доп. продажа: {_bold_html(f'{format_money(upsell)}₽')}")
             master_names = ", ".join(entry["name"] for entry in master_shares) if master_shares else master_display_name
             lines.append(f"👨‍🔧 Мастер: {_bold_html(master_names)}")
+            if payment_method == "р/с":
+                lines.append("💼 Оплата по р/с (ожидаем поступление)")
             await bot.send_message(
                 ORDERS_CONFIRM_CHAT_ID,
                 "\n".join(lines),
@@ -7947,6 +8309,7 @@ async def main():
         await ensure_notification_schema(_conn)
         await ensure_promo_schema(_conn)
         await ensure_order_masters_schema(_conn)
+        await ensure_orders_wire_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(
