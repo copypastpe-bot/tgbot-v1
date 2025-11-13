@@ -337,6 +337,36 @@ async def ensure_cashbook_wire_schema(conn: asyncpg.Connection) -> None:
     )
 
 
+async def ensure_order_payments_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_payments (
+            id serial PRIMARY KEY,
+            order_id integer REFERENCES orders(id) ON DELETE CASCADE,
+            method text NOT NULL,
+            amount numeric(12,2) NOT NULL DEFAULT 0,
+            created_at timestamptz NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_payments_order
+        ON order_payments(order_id);
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO order_payments (order_id, method, amount, created_at)
+        SELECT o.id, o.payment_method, COALESCE(o.amount_cash, 0), COALESCE(o.created_at, NOW())
+        FROM orders o
+        WHERE NOT EXISTS (
+            SELECT 1 FROM order_payments op WHERE op.order_id = o.id
+        );
+        """
+    )
+
+
 def _add_months(dt: datetime, months: int) -> datetime:
     if months == 0:
         return dt
@@ -1335,15 +1365,15 @@ async def _send_tx_last(msg: Message, limit: int) -> None:
 async def get_master_cash_on_orders(conn, master_id: int) -> Decimal:
     """
     Возвращает сумму наличных, полученных мастером от заказов (все время).
-    Считается по таблице cashbook_entries, kind='income', method='Наличные'.
+    Считается по таблице order_payments (метод 'Наличные').
     """
     cash_sum = await conn.fetchval(
         """
-        SELECT COALESCE(SUM(amount),0)
-        FROM cashbook_entries
-        WHERE kind='income' AND method='Наличные'
-          AND master_id=$1 AND order_id IS NOT NULL
-          AND COALESCE(is_deleted,false)=FALSE
+        SELECT COALESCE(SUM(op.amount),0)
+        FROM order_payments op
+        JOIN orders o ON o.id = op.order_id
+        WHERE op.method='Наличные'
+          AND o.master_id=$1
         """,
         master_id,
     )
@@ -1454,6 +1484,40 @@ def format_money(amount: Decimal) -> str:
     int_part, frac_part = f"{q:.1f}".split('.')
     int_formatted = f"{int(int_part):,}".replace(',', ' ')
     return f"{int_formatted},{frac_part}"
+
+
+PAYMENT_LABELS: dict[str, str] = {
+    "Наличные": "наличными",
+    "Карта Дима": "карта Дима",
+    "Карта Женя": "карта Жени",
+    "р/с": "р/с",
+    GIFT_CERT_LABEL: "сертификатом",
+}
+
+
+def _format_payment_label(method: str | None) -> str:
+    if not method:
+        return "—"
+    return PAYMENT_LABELS.get(method, method.lower())
+
+
+def _format_payment_parts(parts: Sequence[Mapping[str, Any]] | None, *, with_currency: bool = True) -> str:
+    if not parts:
+        return ""
+    chunks: list[str] = []
+    for entry in parts:
+        try:
+            amount = Decimal(str(entry.get("amount", "0")))
+        except Exception:
+            continue
+        if amount <= 0:
+            continue
+        label = _format_payment_label(entry.get("method"))
+        amt_text = format_money(amount)
+        if with_currency:
+            amt_text += "₽"
+        chunks.append(f"{label} — {amt_text}")
+    return ", ".join(chunks)
 
 
 def _withdrawal_filter_sql(alias: str = "e") -> str:
@@ -4309,6 +4373,44 @@ async def build_daily_orders_admin_summary_text() -> str:
         )
         if not masters:
             return "Мастеров в активном статусе нет."
+        payment_rows = await conn.fetch(
+            f"""
+            SELECT o.master_id,
+                   op.method,
+                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS total
+            FROM order_payments op
+            JOIN orders o ON o.id = op.order_id
+            WHERE o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+            GROUP BY o.master_id, op.method
+            """
+        )
+        count_rows = await conn.fetch(
+            f"""
+            SELECT master_id, COUNT(*) AS cnt
+            FROM orders
+            WHERE created_at >= {start_sql}
+              AND created_at <  {end_sql}
+            GROUP BY master_id
+            """
+        )
+        gift_rows = await conn.fetch(
+            f"""
+            SELECT master_id,
+                   COALESCE(SUM(amount_total),0)::numeric(12,2) AS total
+            FROM orders
+            WHERE payment_method = $1
+              AND created_at >= {start_sql}
+              AND created_at <  {end_sql}
+            GROUP BY master_id
+            """,
+            GIFT_CERT_LABEL,
+        )
+        payment_map: dict[tuple[int, str], Decimal] = {}
+        for row in payment_rows:
+            payment_map[(row["master_id"], row["method"])] = Decimal(row["total"] or 0)
+        counts_map = {row["master_id"]: int(row["cnt"] or 0) for row in count_rows}
+        gift_map = {row["master_id"]: Decimal(row["total"] or 0) for row in gift_rows}
 
         total_orders = 0
         total_method_totals: dict[str, Decimal] = {}
@@ -4316,30 +4418,15 @@ async def build_daily_orders_admin_summary_text() -> str:
         lines = ["📋 <b>Заказы по мастерам — сегодня</b>"]
 
         for m in masters:
-            stats = await conn.fetchrow(
-                f"""
-                SELECT
-                  COUNT(*) AS cnt,
-                  COALESCE(SUM(CASE WHEN payment_method='Наличные'              THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
-                  COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
-                  COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
-                  COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
-                  COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total
-                FROM orders o
-                WHERE o.master_id = $1
-                  AND o.created_at >= {start_sql}
-                  AND o.created_at <  {end_sql}
-                """,
-                m["id"],
-            )
+            master_id = m["id"]
             method_totals = {
-                "Наличные": Decimal(stats["s_cash"] or 0),
-                "Карта Женя": Decimal(stats["s_card_jenya"] or 0),
-                "Карта Дима": Decimal(stats["s_card_dima"] or 0),
-                "р/с": Decimal(stats["s_rs"] or 0),
-                GIFT_CERT_LABEL: Decimal(stats["s_gift_total"] or 0),
+                "Наличные": payment_map.get((master_id, "Наличные"), Decimal(0)),
+                "Карта Женя": payment_map.get((master_id, "Карта Женя"), Decimal(0)),
+                "Карта Дима": payment_map.get((master_id, "Карта Дима"), Decimal(0)),
+                "р/с": payment_map.get((master_id, "р/с"), Decimal(0)),
+                GIFT_CERT_LABEL: gift_map.get(master_id, Decimal(0)),
             }
-            master_orders = int(stats["cnt"] or 0)
+            master_orders = counts_map.get(master_id, 0)
             total_orders += master_orders
             for key, value in method_totals.items():
                 total_method_totals[key] = total_method_totals.get(key, Decimal(0)) + value
@@ -4401,11 +4488,6 @@ async def build_master_daily_summary_text(user_id: int) -> str:
             f"""
             SELECT
               COUNT(*) AS cnt,
-              COALESCE(SUM(CASE WHEN payment_method='Наличные'              THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_cash,
-              COALESCE(SUM(CASE WHEN payment_method='Карта Женя'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_jenya,
-              COALESCE(SUM(CASE WHEN payment_method='Карта Дима'            THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_card_dima,
-              COALESCE(SUM(CASE WHEN payment_method='р/с'                   THEN amount_cash  ELSE 0 END),0)::numeric(12,2) AS s_rs,
-              COALESCE(SUM(CASE WHEN payment_method='Подарочный сертификат' THEN amount_total ELSE 0 END),0)::numeric(12,2) AS s_gift_total,
               COALESCE(SUM(o.amount_total),0)::numeric(12,2) AS total_amount
             FROM orders o
             WHERE o.master_id = $1
@@ -4413,6 +4495,32 @@ async def build_master_daily_summary_text(user_id: int) -> str:
               AND o.created_at <  {end_sql}
             """,
             master_id,
+        )
+        pay_rows = await conn.fetch(
+            f"""
+            SELECT op.method,
+                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS total
+            FROM order_payments op
+            JOIN orders o ON o.id = op.order_id
+            WHERE o.master_id = $1
+              AND o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+            GROUP BY op.method
+            """,
+            master_id,
+        )
+        payment_map = {row["method"]: Decimal(row["total"] or 0) for row in pay_rows}
+        gift_total = await conn.fetchval(
+            f"""
+            SELECT COALESCE(SUM(amount_total),0)::numeric(12,2)
+            FROM orders
+            WHERE master_id = $1
+              AND payment_method = $2
+              AND created_at >= {start_sql}
+              AND created_at <  {end_sql}
+            """,
+            master_id,
+            GIFT_CERT_LABEL,
         )
         payroll = await conn.fetchrow(
             f"""
@@ -4446,13 +4554,13 @@ async def build_master_daily_summary_text(user_id: int) -> str:
         if on_hand < Decimal(0):
             on_hand = Decimal(0)
 
-    method_totals = {
-        "Наличные": Decimal(stats["s_cash"] or 0),
-        "Карта Женя": Decimal(stats["s_card_jenya"] or 0),
-        "Карта Дима": Decimal(stats["s_card_dima"] or 0),
-        "р/с": Decimal(stats["s_rs"] or 0),
-        GIFT_CERT_LABEL: Decimal(stats["s_gift_total"] or 0),
-    }
+        method_totals = {
+            "Наличные": payment_map.get("Наличные", Decimal(0)),
+            "Карта Женя": payment_map.get("Карта Женя", Decimal(0)),
+            "Карта Дима": payment_map.get("Карта Дима", Decimal(0)),
+            "р/с": payment_map.get("р/с", Decimal(0)),
+            GIFT_CERT_LABEL: Decimal(gift_total or 0),
+        }
     total_pay = Decimal(payroll["total_pay"] or 0)
     base_pay = Decimal(payroll["base_pay"] or 0)
     fuel_pay = Decimal(payroll["fuel_pay"] or 0)
@@ -4976,6 +5084,7 @@ async def orders_report(msg: Message):
             """,
             *params
         )
+        parts_map = await _fetch_order_payment_parts(conn, [row["id"] for row in rows])
 
     cnt   = totals["orders_cnt"] or 0
     money = totals["money_cash"] or 0
@@ -4995,8 +5104,13 @@ async def orders_report(msg: Message):
         lines.append("\nПоследние заказы:")
         for r in rows:
             dt = r["created_utc"].strftime("%Y-%m-%d %H:%M")
+            breakdown = _format_payment_parts(parts_map.get(r["id"]), with_currency=True)
+            if breakdown:
+                payment_display = breakdown
+            else:
+                payment_display = f"{r['payment_method']} — {format_money(Decimal(r['cash']))}₽"
             lines.append(
-                f"#{r['id']} | {dt} | {r['client_name']} | m:{r['master_tg']} | {r['payment_method']} | {r['cash']}₽/{r['total']}₽"
+                f"#{r['id']} | {dt} | {r['client_name']} | m:{r['master_tg']} | {payment_display} | {format_money(Decimal(r['total']))}₽"
             )
     else:
         lines.append("Данных нет.")
@@ -7436,6 +7550,9 @@ class OrderFSM(StatesGroup):
     bonus_spend = State()
     bonus_custom = State()
     waiting_payment_method = State()
+    payment_split_prompt = State()
+    payment_split_amount = State()
+    payment_split_method = State()
     add_more_masters = State()
     pick_extra_master = State()
     maybe_bday = State()
@@ -7681,7 +7798,7 @@ async def order_pick_method(msg: Message, state: FSMContext):
         data["amount_total"] = amt_cash
         data["amount_cash"] = Decimal(0)
         data["payment_method"] = GIFT_CERT_LABEL
-        await state.update_data(**data)
+        await state.update_data(**data, payment_parts=[{"method": GIFT_CERT_LABEL, "amount": str(amt_cash or Decimal(0))}])
         await msg.answer(
             "Выбран Подарочный сертификат. Сумма чека будет использована как номинал, в кассу поступит 0₽.",
             reply_markup=ReplyKeyboardRemove()
@@ -7693,11 +7810,189 @@ async def order_pick_method(msg: Message, state: FSMContext):
     if data.get("amount_total") is None and data.get("amount_cash") is not None:
         data["amount_total"] = data["amount_cash"]
     data["payment_method"] = method
-    await state.update_data(payment_method=method, amount_total=data.get("amount_total"))
+    payment_parts = [{"method": method, "amount": str(amount_cash)}]
+    await state.update_data(payment_method=method, amount_total=data.get("amount_total"), payment_parts=payment_parts)
 
     await msg.answer("Метод оплаты сохранён.", reply_markup=ReplyKeyboardRemove())
 
-    return await ask_extra_master(msg, state)
+    if method == "р/с":
+        return await ask_extra_master(msg, state)
+    return await _prompt_payment_split(msg, state)
+
+
+async def _prompt_payment_split(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    parts = data.get("payment_parts") or []
+    if not parts:
+        return await ask_extra_master(msg, state)
+    try:
+        primary_amount = Decimal(str(parts[0].get("amount", "0")))
+    except Exception:
+        primary_amount = Decimal(0)
+    if primary_amount <= 0:
+        return await ask_extra_master(msg, state)
+    await state.set_state(OrderFSM.payment_split_prompt)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Да"), KeyboardButton(text="Нет")],
+            [KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer(
+        f"Добавить способ оплаты?\nОстаток по первому способу: {format_money(primary_amount)}₽",
+        reply_markup=kb,
+    )
+
+
+def _payment_parts_from_state(data: Mapping[str, Any]) -> list[dict[str, str]]:
+    parts = data.get("payment_parts") or []
+    if not isinstance(parts, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for entry in parts:
+        if not isinstance(entry, Mapping):
+            continue
+        method = entry.get("method")
+        amount = str(entry.get("amount", "0"))
+        normalized.append({"method": method, "amount": amount})
+    return normalized
+
+
+async def _fetch_order_payment_parts(conn: asyncpg.Connection, order_ids: Sequence[int]) -> dict[int, list[dict[str, str]]]:
+    if not order_ids:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT order_id, method, amount
+        FROM order_payments
+        WHERE order_id = ANY($1::int[])
+        ORDER BY order_id, id
+        """,
+        order_ids,
+    )
+    result: dict[int, list[dict[str, str]]] = {}
+    for row in rows:
+        result.setdefault(row["order_id"], []).append(
+            {"method": row["method"], "amount": str(row["amount"] or "0")}
+        )
+    return result
+
+
+@dp.message(OrderFSM.payment_split_prompt, F.text)
+async def order_payment_split_prompt(msg: Message, state: FSMContext):
+    choice = (msg.text or "").strip().lower()
+    if choice == "отмена":
+        return await cancel_order(msg, state)
+    if choice in {"нет", "не"}:
+        return await ask_extra_master(msg, state)
+    if choice in {"да", "добавить", "ага", "+"}:
+        data = await state.get_data()
+        parts = _payment_parts_from_state(data)
+        if not parts:
+            return await ask_extra_master(msg, state)
+        available = Decimal(str(parts[0].get("amount", "0")))
+        if available <= 0:
+            return await ask_extra_master(msg, state)
+        await state.set_state(OrderFSM.payment_split_amount)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        return await msg.answer(
+            f"Введите сумму второго способа (не более {format_money(available)}₽):",
+            reply_markup=kb,
+        )
+    return await msg.answer("Ответьте «Да» или «Нет».", reply_markup=ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Да"), KeyboardButton(text="Нет")],
+            [KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    ))
+
+
+@dp.message(OrderFSM.payment_split_amount, F.text)
+async def order_payment_split_amount(msg: Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+    lower = txt.lower()
+    if lower == "отмена":
+        return await cancel_order(msg, state)
+    if lower == "назад":
+        return await _prompt_payment_split(msg, state)
+    amount = parse_money(txt)
+    if amount is None or amount <= 0:
+        return await msg.answer("Введите положительную сумму (например 1500).")
+    data = await state.get_data()
+    parts = _payment_parts_from_state(data)
+    if not parts:
+        return await ask_extra_master(msg, state)
+    available = Decimal(str(parts[0].get("amount", "0")))
+    if amount > available:
+        return await msg.answer(f"Нельзя указать больше {format_money(available)}₽.")
+    await state.update_data(pending_payment_amount=str(amount))
+    await state.set_state(OrderFSM.payment_split_method)
+    method_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=label)] for label in PAYMENT_METHODS if label != "р/с"
+        ] + [[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Выберите способ оплаты для указанной суммы:", reply_markup=method_kb)
+
+
+@dp.message(OrderFSM.payment_split_method, F.text)
+async def order_payment_split_method(msg: Message, state: FSMContext):
+    choice = (msg.text or "").strip()
+    lower = choice.lower()
+    if lower == "отмена":
+        return await cancel_order(msg, state)
+    if lower == "назад":
+        await state.set_state(OrderFSM.payment_split_amount)
+        return await msg.answer("Введите сумму второго способа:", reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ))
+    method = norm_pay_method_py(choice)
+    if method not in PAYMENT_METHODS or method == "р/с":
+        return await msg.answer("Можно выбрать только наличные или карту.", reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=m)] for m in PAYMENT_METHODS if m != "р/с"
+            ] + [[KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ))
+    data = await state.get_data()
+    pending_amount = Decimal(str(data.get("pending_payment_amount") or "0"))
+    if pending_amount <= 0:
+        return await _prompt_payment_split(msg, state)
+    parts = _payment_parts_from_state(data)
+    if not parts:
+        parts = [{"method": method, "amount": str(pending_amount)}]
+    else:
+        base_amount = Decimal(str(parts[0].get("amount", "0")))
+        new_base = base_amount - pending_amount
+        if new_base < Decimal("0"):
+            return await msg.answer("Сумма превышает доступный остаток. Введите значение заново.")
+        parts[0]["amount"] = str(new_base)
+        parts.append({"method": method, "amount": str(pending_amount)})
+    await state.update_data(payment_parts=parts, pending_payment_amount=None)
+    try:
+        remainder = Decimal(str(parts[0].get("amount", "0")))
+    except Exception:
+        remainder = Decimal(0)
+    if remainder <= 0:
+        return await ask_extra_master(msg, state)
+    return await _prompt_payment_split(msg, state)
 
 
 async def ensure_primary_master_info(state: FSMContext, tg_user_id: int) -> tuple[int, str]:
@@ -8213,12 +8508,17 @@ async def show_confirm(msg: Message, state: FSMContext):
             for entry in master_entries
         ]
     )
+    payment_parts = _payment_parts_from_state(data)
+    payment_breakdown = _format_payment_parts(payment_parts)
+    payment_line = f"💳 Оплата деньгами: {format_money(cash_payment)}₽"
+    if payment_breakdown:
+        payment_line += f" ({payment_breakdown})"
     text = (
         f"Проверьте:\n"
         f"👤 {name}\n"
         f"📞 {data['phone_in']}\n"
         f"💈 Чек: {amount} (доп: {upsell})\n"
-        f"💳 Оплата деньгами: {cash_payment}\n"
+        f"{payment_line}\n"
         f"🎁 Списано бонусов: {bonus_spent}\n"
         f"➕ Начислить бонусов: {int(bonus_earned)}\n"
         f"🎂 ДР: {bday_text}\n"
@@ -8270,6 +8570,9 @@ async def commit_order(msg: Message, state: FSMContext):
     client_birthday_val: date | None = data.get("birthday")
     if isinstance(client_birthday_val, str):
         client_birthday_val = parse_birthday_str(client_birthday_val)
+    payment_parts_data = _payment_parts_from_state(data)
+    if not payment_parts_data:
+        payment_parts_data = [{"method": payment_method, "amount": str(cash_payment)}]
 
     order_id: int | None = None
     master_display_name: str | None = None
@@ -8424,6 +8727,35 @@ async def commit_order(msg: Message, state: FSMContext):
                     cash_payment,
                     share_fraction,
                 )
+            payment_rows: list[tuple[str, Decimal]] = []
+            total_parts_amount = Decimal("0")
+            for entry in payment_parts_data:
+                method_label = entry.get("method") or payment_method
+                try:
+                    amount_value = Decimal(str(entry.get("amount", "0")))
+                except Exception:
+                    amount_value = Decimal(0)
+                if amount_value <= 0:
+                    continue
+                payment_rows.append((method_label, amount_value))
+                total_parts_amount += amount_value
+            if not payment_rows:
+                payment_rows.append((payment_method, cash_payment))
+                total_parts_amount = cash_payment
+            if total_parts_amount != cash_payment:
+                diff = (cash_payment - total_parts_amount).quantize(Decimal("0.01"))
+                method_label, amount_value = payment_rows[0]
+                payment_rows[0] = (method_label, amount_value + diff)
+            for method_label, amount_value in payment_rows:
+                await conn.execute(
+                    """
+                    INSERT INTO order_payments (order_id, method, amount, created_at)
+                    VALUES ($1, $2, $3, NOW())
+                    """,
+                    order_id,
+                    method_label,
+                    amount_value,
+                )
 
             street_label = extract_street(client_address_val)
             base_name_for_label = (client_full_name_val or name or "Клиент").strip() or "Клиент"
@@ -8473,9 +8805,16 @@ async def commit_order(msg: Message, state: FSMContext):
             if client_address_val:
                 lines.append(f"📍 Адрес: {_escape_html(client_address_val)}")
             lines.append(f"🎂 ДР: {_escape_html(birthday_display)}")
-            lines.append(
-                f"💳 Оплата: {_bold_html(f'{payment_method} — {format_money(cash_payment)}₽')}"
-            )
+            payment_parts_text = _format_payment_parts(payment_parts)
+            payment_summary = f"{format_money(cash_payment)}₽"
+            if payment_parts_text:
+                lines.append(
+                    f"💳 Оплата: {_bold_html(payment_summary)} ({_escape_html(payment_parts_text)})"
+                )
+            else:
+                lines.append(
+                    f"💳 Оплата: {_bold_html(f'{payment_method} — {payment_summary}')}"
+                )
             lines.append(f"💰 Итоговый чек: {_bold_html(f'{format_money(amount_total)}₽')}")
             lines.append(
                 f"🎁 Бонусы: списано {_bold_html(bonus_spent)} / начислено {_bold_html(bonus_earned)}"
@@ -8642,6 +8981,7 @@ async def main():
         await ensure_order_masters_schema(_conn)
         await ensure_orders_wire_schema(_conn)
         await ensure_cashbook_wire_schema(_conn)
+        await ensure_order_payments_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(
