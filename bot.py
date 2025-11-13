@@ -378,7 +378,7 @@ async def _schedule_birthday_congrats(
         client_id,
     )
     event_key = BDAY_TEMPLATE_KEYS[next_variant - 1]
-    delay_seconds = random.randint(1, 10)
+    delay_seconds = random.randint(60, 600)
     scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
     payload = {
         "bonus_balance": _format_bonus_amount(bonus_balance),
