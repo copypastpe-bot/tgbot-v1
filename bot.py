@@ -7383,7 +7383,7 @@ async def ask_extra_master(msg: Message, state: FSMContext):
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Добавить мастера")],
-            [KeyboardButton(text="Нет, еду один")],
+            [KeyboardButton(text="Нет")],
             [KeyboardButton(text="Отмена")],
         ],
         resize_keyboard=True,
@@ -7429,14 +7429,14 @@ async def _prompt_pick_extra_master(msg: Message, state: FSMContext):
 @dp.message(OrderFSM.add_more_masters, F.text)
 async def handle_add_more_masters(msg: Message, state: FSMContext):
     choice = (msg.text or "").strip().lower()
-    if choice in {"нет", "нет, еду один", "дальше", "далее", "продолжить"}:
+    if choice in {"нет", "дальше", "далее", "продолжить"}:
         await msg.answer("Ок, оставляем текущий состав мастеров.", reply_markup=ReplyKeyboardRemove())
         return await proceed_order_finalize(msg, state)
     if "добав" in choice:
         return await _prompt_pick_extra_master(msg, state)
     if choice == "отмена":
         return await cancel_order(msg, state)
-    return await msg.answer("Ответьте «Добавить мастера» или «Нет, еду один».")
+    return await msg.answer("Ответьте «Добавить мастера» или «Нет».")
 
 
 @dp.message(OrderFSM.pick_extra_master, F.text)
@@ -7537,8 +7537,10 @@ async def show_confirm(msg: Message, state: FSMContext):
     name = data.get("client_name") or "Без имени"
     bday_text = data.get("birthday") or data.get("new_birthday") or "—"
     masters_summary = "\n".join(
-        f"👷 {entry['name']}: {entry['total_pay']} (база {entry['base_pay']} + бензин {entry['fuel_pay']} + доп {entry['upsell_pay']})"
-        for entry in master_entries
+        [
+            f"👷 {entry['name']}: {entry['total_pay']} (база {entry['base_pay']} + бензин {entry['fuel_pay']} + доп {entry['upsell_pay']})"
+            for entry in master_entries
+        ]
     )
     text = (
         f"Проверьте:\n"
@@ -7744,9 +7746,12 @@ async def commit_order(msg: Message, state: FSMContext):
             else:
                 notify_label = client_display_masked
 
-            if master_db_id is None:
+            effective_master_id = master_db_id
+            if master_shares and master_shares[0].get("id"):
+                effective_master_id = int(master_shares[0]["id"])
+            if effective_master_id is None:
                 raise RuntimeError("Не удалось определить master_id для записи кассы.")
-            await _record_order_income(conn, payment_method, cash_payment, order_id, int(master_db_id), notify_label)
+            await _record_order_income(conn, payment_method, cash_payment, order_id, int(effective_master_id), notify_label)
             await _enqueue_order_completed_notification(
                 conn,
                 client_id=client_id,
@@ -7785,7 +7790,8 @@ async def commit_order(msg: Message, state: FSMContext):
                 f"🎁 Бонусы: списано {_bold_html(bonus_spent)} / начислено {_bold_html(bonus_earned)}"
             )
             lines.append(f"🧺 Доп. продажа: {_bold_html(f'{format_money(upsell)}₽')}")
-            lines.append(f"👨‍🔧 Мастер: {_bold_html(master_display_name)}")
+            master_names = ", ".join(entry["name"] for entry in master_shares) if master_shares else master_display_name
+            lines.append(f"👨‍🔧 Мастер: {_bold_html(master_names)}")
             await bot.send_message(
                 ORDERS_CONFIRM_CHAT_ID,
                 "\n".join(lines),
