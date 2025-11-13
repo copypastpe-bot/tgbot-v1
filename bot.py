@@ -3977,20 +3977,20 @@ async def get_cash_report_text(period: str) -> str:
                 LIMIT 31
                 """
             )
+        pending_wire = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(amount),0)
+            FROM cashbook_entries
+            WHERE kind='income'
+              AND method='р/с'
+              AND order_id IS NULL
+              AND NOT COALESCE(is_deleted, false)
+            """
+        ) or Decimal(0)
 
     income  = Decimal(rec["income"] or 0) if rec else Decimal(0)
     expense = Decimal(rec["expense"] or 0) if rec else Decimal(0)
     delta   = Decimal(rec["delta"] or 0) if rec else Decimal(0)
-    pending_wire = await conn.fetchval(
-        """
-        SELECT COALESCE(SUM(amount),0)
-        FROM cashbook_entries
-        WHERE kind='income'
-          AND method='р/с'
-          AND order_id IS NULL
-          AND NOT COALESCE(is_deleted, false)
-        """
-    ) or Decimal(0)
     pending_wire = Decimal(pending_wire)
 
     lines = [
