@@ -8792,6 +8792,8 @@ async def commit_order(msg: Message, state: FSMContext):
 
     if ORDERS_CONFIRM_CHAT_ID:
         try:
+            payment_parts = payment_parts_data
+            payment_parts_text = _format_payment_parts(payment_parts)
             lines = [
                 f"🧾 <b>Заказ №{order_id}</b>",
                 f"👤 Клиент: {_bold_html(client_display_masked)}",
@@ -8799,7 +8801,6 @@ async def commit_order(msg: Message, state: FSMContext):
             if client_address_val:
                 lines.append(f"📍 Адрес: {_escape_html(client_address_val)}")
             lines.append(f"🎂 ДР: {_escape_html(birthday_display)}")
-            payment_parts_text = _format_payment_parts(payment_parts)
             payment_summary = f"{format_money(cash_payment)}₽"
             if payment_parts_text:
                 lines.append(
