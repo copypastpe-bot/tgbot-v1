@@ -8822,6 +8822,7 @@ async def commit_order(msg: Message, state: FSMContext):
                 ORDERS_CONFIRM_CHAT_ID,
                 "\n".join(lines),
                 parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
         except Exception as e:  # noqa: BLE001
             logging.warning("order confirm notify failed for order_id=%s: %s", order_id, e)
