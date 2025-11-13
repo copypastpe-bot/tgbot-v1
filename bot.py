@@ -7904,8 +7904,16 @@ async def show_confirm(msg: Message, state: FSMContext):
     if payment_method == "р/с":
         text += "💼 Оплата по р/с — зарплата будет начислена после поступления средств.\n\n"
     text += "Отправьте 'подтвердить' или 'отмена'"
+    await msg.answer(
+        text,
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="подтвердить")],
+                [KeyboardButton(text="отмена")],
+            ],
+            resize_keyboard=True,
+        ),
     )
-    await msg.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="подтвердить")],[KeyboardButton(text="отмена")]], resize_keyboard=True))
 
 @dp.message(OrderFSM.confirm, F.text.lower() == "отмена")
 async def cancel_order(msg: Message, state: FSMContext):
