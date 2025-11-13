@@ -4167,24 +4167,24 @@ async def get_payments_by_method_report_text(period: str) -> str:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT COALESCE(c.method,'прочее') AS method,
+            SELECT op.method,
                    COUNT(*)::int AS cnt,
-                   COALESCE(SUM(c.amount),0)::numeric(12,2) AS total
-            FROM cashbook_entries c
-            WHERE c.kind='income'
-              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-              AND {_cashbook_active_filter("c")}
-            GROUP BY 1
-            ORDER BY total DESC, method
+                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS total
+            FROM order_payments op
+            JOIN orders o ON o.id = op.order_id
+            WHERE o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+            GROUP BY op.method
+            ORDER BY total DESC, op.method
             """
         )
         total_income = await conn.fetchval(
             f"""
-            SELECT COALESCE(SUM(amount),0)::numeric(12,2)
-            FROM cashbook_entries c
-            WHERE c.kind='income'
-              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-              AND {_cashbook_active_filter("c")}
+            SELECT COALESCE(SUM(op.amount),0)::numeric(12,2)
+            FROM order_payments op
+            JOIN orders o ON o.id = op.order_id
+            WHERE o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
             """
         )
 
@@ -4194,7 +4194,7 @@ async def get_payments_by_method_report_text(period: str) -> str:
     total_income_dec = Decimal(total_income or 0)
     lines = [f"Типы оплат за {period_label}: (итого {format_money(total_income_dec)}₽)"]
     for r in rows:
-        method = r["method"]
+        method = r["method"] or "прочее"
         amount = format_money(Decimal(r["total"] or 0))
         lines.append(f"- {method}: {amount}₽ ({r['cnt']} шт.)")
     return "\n".join(lines)
@@ -4284,13 +4284,13 @@ async def build_daily_cash_summary_text() -> str:
         )
         pay_rows = await conn.fetch(
             f"""
-            SELECT COALESCE(c.method,'прочее') AS method,
-                   COALESCE(SUM(c.amount),0)::numeric(12,2) AS total
-            FROM cashbook_entries c
-            WHERE c.kind='income'
-              AND c.happened_at >= {start_sql} AND c.happened_at < {end_sql}
-              AND {_cashbook_active_filter("c")}
-            GROUP BY 1
+            SELECT op.method,
+                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS total
+            FROM order_payments op
+            JOIN orders o ON o.id = op.order_id
+            WHERE o.created_at >= {start_sql}
+              AND o.created_at <  {end_sql}
+            GROUP BY op.method
             """
         )
         balance = await get_cash_balance_excluding_withdrawals(conn)
@@ -5050,11 +5050,22 @@ async def orders_report(msg: Message):
         # итоги по периоду
         totals = await conn.fetchrow(
             f"""
+            WITH pay AS (
+                SELECT o.master_id,
+                       COALESCE(SUM(op.amount),0)::numeric(12,2) AS money_cash
+                FROM order_payments op
+                JOIN orders o ON o.id = op.order_id
+                WHERE o.created_at >= {start_sql}
+                  AND o.created_at <  {end_sql}
+                  AND {where_master}
+                GROUP BY o.master_id
+            )
             SELECT
-              COUNT(*)                               AS orders_cnt,
-              COALESCE(SUM(o.amount_cash),  0)::numeric(12,2) AS money_cash,
+              COUNT(*) AS orders_cnt,
+              COALESCE(SUM(pay.money_cash),0)::numeric(12,2) AS money_cash,
               COALESCE(SUM(CASE WHEN o.payment_method='Подарочный сертификат' THEN o.amount_total ELSE 0 END), 0)::numeric(12,2) AS gift_total
             FROM orders o
+            LEFT JOIN pay ON pay.master_id = o.master_id
             WHERE o.created_at >= {start_sql}
               AND o.created_at <  {end_sql}
               AND {where_master};
