@@ -4555,6 +4555,7 @@ async def wire_pending_reminder_job():
             WHERE kind='income'
               AND method='р/с'
               AND order_id IS NULL
+              AND awaiting_order
               AND NOT COALESCE(is_deleted, false)
             ORDER BY happened_at
             """
@@ -5356,6 +5357,7 @@ async def _begin_wire_entry_selection(target_msg: Message, state: FSMContext) ->
             WHERE kind='income'
               AND method='р/с'
               AND order_id IS NULL
+              AND awaiting_order
               AND NOT COALESCE(is_deleted, false)
             ORDER BY happened_at
             LIMIT 30
@@ -5369,12 +5371,8 @@ async def _begin_wire_entry_selection(target_msg: Message, state: FSMContext) ->
     for row in rows:
         when = row["happened_at"].astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
         amount = format_money(Decimal(row["amount"]))
-        note = row["comment"] or ""
         flag = " (ожидаем заказ)" if row["awaiting_order"] else ""
-        if note:
-            lines.append(f"#{row['id']}: {amount}₽ — {when}{flag} | {note}")
-        else:
-            lines.append(f"#{row['id']}: {amount}₽ — {when}{flag}")
+        lines.append(f"#{row['id']}: {amount}₽ — {when}{flag}")
     await target_msg.answer("\n".join(lines))
     await state.set_state(WireLinkFSM.waiting_entry)
     await target_msg.answer(
@@ -5413,12 +5411,33 @@ async def income_wizard_comment(msg: Message, state: FSMContext):
     method = data.get("method")
     amount = Decimal(data.get("amount"))
     await state.update_data(comment=txt)
+    if method == "р/с":
+        await state.set_state(IncomeFSM.waiting_wire_choice)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Привязать сейчас")],
+                [KeyboardButton(text="Нет")],
+                [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await msg.answer("Привязать оплату к заказу сейчас?", reply_markup=kb)
+        return
+    await _send_income_confirm(msg, state, amount, method, txt)
+
+
+async def _send_income_confirm(msg: Message, state: FSMContext, amount: Decimal | None = None, method: str | None = None, comment: str | None = None):
+    data = await state.get_data()
+    amount = amount if amount is not None else Decimal(data.get("amount"))
+    method = method or data.get("method")
+    comment = comment or data.get("comment") or "поступление денег в кассу"
     await state.set_state(IncomeFSM.waiting_confirm)
     lines = [
         "Подтвердите приход:",
         f"Сумма: {format_money(amount)}₽",
         f"Метод: {method}",
-        f"Комментарий: {txt}",
+        f"Комментарий: {comment}",
     ]
     await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("income_confirm"))
 
@@ -5445,6 +5464,7 @@ async def wire_link_pick_entry(msg: Message, state: FSMContext):
               AND kind='income'
               AND method='р/с'
               AND order_id IS NULL
+              AND awaiting_order
               AND NOT COALESCE(is_deleted, false)
             """,
             entry_id,
@@ -5461,7 +5481,7 @@ async def wire_link_pick_entry(msg: Message, state: FSMContext):
         await _exit_wire_link_pending(
             msg,
             state,
-            custom_text="Заказы, ожидающие оплату, не найдены. Оплата помечена как ожидающая заказа.",
+            custom_text="Нет заказов, ожидающих оплату по р/с. Оплата помечена как ожидающая заказа.",
         )
 
 
@@ -6757,10 +6777,10 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
         f"Заказ #{order_info['order_id']} удалён.",
         f"Клиент: {client_label}",
         f"Оплата: {order_info['payment_method']} (касса: {method_display})",
-        f"Наличные скорректированы на {format_money(cash_adjustment)}₽",
     ]
 
     if order_info["cash_entry_ids"]:
+        lines.append(f"Касса скорректирована на {format_money(cash_adjustment)}₽")
         ids_str = ", ".join(f"#{cid}" for cid in order_info["cash_entry_ids"])
         lines.append(f"Помечены кассовые записи: {ids_str}")
     else:
@@ -6937,24 +6957,25 @@ async def income_confirm_handler(query: CallbackQuery, state: FSMContext):
         reply_markup=admin_root_kb(),
     )
     if method == "р/с":
-        await state.update_data(
-            wire_link_context={
-                "entry_id": tx["id"],
-                "amount": str(amount),
-                "comment": comment,
-            }
-        )
-        await state.set_state(IncomeFSM.waiting_wire_choice)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="Привязать сейчас")],
-                [KeyboardButton(text="Нет")],
-                [KeyboardButton(text="Отмена")],
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        )
-        await query.message.answer("Привязать оплату к заказу сейчас?", reply_markup=kb)
+        wire_pref = (payload.get("wire_link_preference") or "later").lower()
+        context = {
+            "entry_id": tx["id"],
+            "amount": str(amount),
+            "comment": comment,
+        }
+        if wire_pref == "now":
+            await state.update_data(wire_link_context=context)
+            if not await _prompt_wire_order_selection(query.message, state):
+                await _exit_wire_link_pending(
+                    query.message,
+                    state,
+                    custom_text="Нет заказов, ожидающих оплату по р/с. Оплата помечена как ожидающая заказа.",
+                )
+            return
+        await _mark_wire_entry_pending(context["entry_id"], context["comment"])
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Оплата по р/с зарегистрирована. Привяжите её позже через «Привязать оплату».", reply_markup=admin_root_kb())
         return
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
@@ -7009,39 +7030,43 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
 @dp.message(IncomeFSM.waiting_wire_choice, F.text)
 async def income_wire_choice(msg: Message, state: FSMContext):
     choice = (msg.text or "").strip().lower()
-    if choice == "отмена":
-        await _mark_wire_pending_from_state(state)
+    if choice in {"отмена", "cancel"}:
         await state.clear()
         await state.set_state(AdminMenuFSM.root)
-        return await msg.answer("Готово. Привязать оплату можно позже командой /link_payment.", reply_markup=admin_root_kb())
+        return await msg.answer("Операция отменена.", reply_markup=admin_root_kb())
+    if choice in {"назад"}:
+        await state.set_state(IncomeFSM.waiting_comment)
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Без комментария")],
+                [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        return await msg.answer("Комментарий? (введите текст или нажмите «Без комментария»)", reply_markup=kb)
+    data = await state.get_data()
+    method = data.get("method")
+    amount = Decimal(data.get("amount"))
+    comment = data.get("comment") or "поступление денег в кассу"
+    if "прив" in choice or choice in {"да", "давай"}:
+        await state.update_data(wire_link_preference="now")
+        return await _send_income_confirm(msg, state, amount, method, comment)
     if choice in {"нет", "не", "потом"}:
-        await _mark_wire_pending_from_state(state)
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        return await msg.answer("Ок, оплату можно привязать позже командой /link_payment.", reply_markup=admin_root_kb())
-    if "прив" in choice:
-        ctx = (await state.get_data()).get("wire_link_context")
-        if not ctx:
-            await state.clear()
-            await state.set_state(AdminMenuFSM.root)
-            return await msg.answer("Нет данных по оплате. Попробуйте ещё раз командой /link_payment.", reply_markup=admin_root_kb())
-        await state.update_data(wire_link_context=ctx)
-        if not await _prompt_wire_order_selection(msg, state):
-            await _exit_wire_link_pending(
-                msg,
-                state,
-                custom_text="Нет заказов, ожидающих оплату. Оплата помечена как ожидающая заказа.",
-            )
-        return
-    return await msg.answer("Ответьте «Привязать сейчас» или «Нет».", reply_markup=ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Привязать сейчас")],
-            [KeyboardButton(text="Нет")],
-            [KeyboardButton(text="Отмена")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    ))
+        await state.update_data(wire_link_preference="later")
+        return await _send_income_confirm(msg, state, amount, method, comment)
+    return await msg.answer(
+        "Ответьте «Привязать сейчас» или «Нет».",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Привязать сейчас")],
+                [KeyboardButton(text="Нет")],
+                [KeyboardButton(text="Назад"), KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
 
 
 @dp.callback_query(F.data == "wire_nudge:link")
@@ -7834,11 +7859,6 @@ async def _exit_wire_link_pending(msg: Message, state: FSMContext, custom_text: 
     )
 
 
-async def _mark_wire_pending_from_state(state: FSMContext):
-    ctx = (await state.get_data()).get("wire_link_context") or {}
-    await _mark_wire_entry_pending(ctx.get("entry_id"), ctx.get("comment"))
-
-
 async def _fetch_orders_waiting_wire(limit: int = 30) -> list[asyncpg.Record]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -7880,7 +7900,6 @@ def _format_wire_order_line(row: Mapping[str, Any], *, reveal_phone: bool = Fals
 async def _prompt_wire_order_selection(msg: Message, state: FSMContext) -> bool:
     rows = await _fetch_orders_waiting_wire()
     if not rows:
-        await msg.answer("Нет заказов, ожидающих оплату по р/с. Привяжите оплату позже.")
         return False
     lines = ["Заказы, ожидающие оплату по р/с:"]
     for row in rows:
