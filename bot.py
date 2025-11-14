@@ -652,7 +652,9 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             phone_value = contact_info.get("phone")
     if not phone_value:
         return False
-    digits = re.sub(r"[^0-9]", "", phone_value)
+    digits_raw = re.sub(r"[^0-9]", "", phone_value)
+    digits_norm = only_digits(normalize_phone_for_db(phone_value))
+    digits = digits_norm or digits_raw
     if not digits:
         return False
 
