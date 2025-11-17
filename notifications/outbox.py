@@ -8,7 +8,7 @@ from decimal import Decimal
 import json
 import logging
 import re
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 import asyncpg
 

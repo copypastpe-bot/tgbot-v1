@@ -96,10 +96,6 @@ async def _set_preferred_channel(conn: asyncpg.Connection, client_id: int, chann
     )
 
 
-def _schedule_followup(contact: ClientContact, text: str) -> None:
-    _cancel_followup(contact.client_id)
-
-
 def _cancel_followup(client_id: int) -> None:
     task = _followup_tasks.pop(client_id, None)
     if task:
@@ -109,38 +105,6 @@ def _cancel_followup(client_id: int) -> None:
 def cancel_followup_for_client(client_id: int) -> None:
     """Expose follow-up cancellation for external consumers (e.g. webhook)."""
     _cancel_followup(client_id)
-
-
-async def schedule_followup_for_client(
-    client_id: int,
-    *,
-    phone: str,
-    name: str,
-    text: str,
-) -> None:
-    if WA_FOLLOWUP_DISABLED:
-        return
-    _cancel_followup(client_id)
-
-    async def _task() -> None:
-        try:
-            await asyncio.sleep(FOLLOWUP_DELAY_SECONDS)
-            logger.info("Follow-up via WhatsApp for client %s", client_id)
-            await send_text_to_phone(
-                WHATSAPP_CHANNEL,
-                phone=phone,
-                name=name,
-                text=text,
-            )
-        except asyncio.CancelledError:  # pragma: no cover
-            logger.debug("Follow-up task for client %s cancelled", client_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Follow-up send failed for client %s: %s", client_id, exc)
-        finally:
-            _followup_tasks.pop(client_id, None)
-
-    loop = asyncio.get_running_loop()
-    _followup_tasks[client_id] = loop.create_task(_task())
 
 
 async def schedule_followup_for_client(
