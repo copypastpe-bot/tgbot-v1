@@ -505,8 +505,37 @@ async def apply_provider_status_update(
             message_id,
         )
         if not row:
-            logger.info("Notification message %s not found for webhook", message_id)
-            return False
+            # try lead_logs fallback
+            lead_row = await conn.fetchrow(
+                "SELECT id, status FROM lead_logs WHERE wahelp_message_id=$1 LIMIT 1",
+                message_id,
+            )
+            if not lead_row:
+                logger.info("Notification message %s not found for webhook", message_id)
+                return False
+            updates: list[str] = ["last_status_payload = $1::jsonb", "updated_at = NOW()"]
+            params: list[Any] = [json.dumps(payload, ensure_ascii=False)]
+            idx = 2
+            if normalized_status:
+                updates.append(f"status = ${idx}")
+                params.append(normalized_status)
+                idx += 1
+            if normalized_status in {"delivered", "read"}:
+                updates.append(f"delivered_at = COALESCE(delivered_at, ${idx})")
+                params.append(event_time)
+                idx += 1
+            if normalized_status == "read":
+                updates.append(f"read_at = COALESCE(read_at, ${idx})")
+                params.append(event_time)
+                idx += 1
+            if normalized_status == "failed":
+                updates.append(f"failed_at = COALESCE(failed_at, ${idx})")
+                params.append(event_time)
+                idx += 1
+            params.append(lead_row["id"])
+            sql = "UPDATE lead_logs SET " + ", ".join(updates) + " WHERE id = ${}".format(idx)
+            await conn.execute(sql, *params)
+            return True
 
         updates: list[str] = ["last_status_payload = $1::jsonb", "updated_at = NOW()"]
         params: list[Any] = [json.dumps(payload, ensure_ascii=False)]

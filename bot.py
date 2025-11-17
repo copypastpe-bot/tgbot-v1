@@ -150,6 +150,12 @@ PROMO_REMINDER_FIRST_GAP_MONTHS = 8
 PROMO_REMINDER_SECOND_GAP_MONTHS = 2
 PROMO_RANDOM_DELAY_RANGE = (1, 10)
 PROMO_BONUS_TTL_DAYS = 365
+LEADS_PROMO_CAMPAIGN = os.getenv("LEADS_PROMO_CAMPAIGN", "week1")
+LEADS_MAX_PER_DAY = 50
+LEADS_SEND_START_HOUR = 10  # MSK
+LEADS_MIN_INTERVAL_SEC = 60
+LEADS_MAX_INTERVAL_SEC = 600
+MARKETING_LOG_CHAT_ID = int(os.getenv("MARKETING_LOG_CHAT_ID", "-1005025733003"))
 MAX_ORDER_MASTERS = 5
 BDAY_TEMPLATE_KEYS = (
     "birthday_congrats_variant_1",
@@ -168,6 +174,7 @@ notification_rules: NotificationRules | None = None
 notification_worker: NotificationWorker | None = None
 wahelp_webhook: WahelpWebhookServer | None = None
 wire_reminder_task: asyncio.Task | None = None
+leads_promo_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
 
 # === Ignore group/supergroup/channel updates; work only in private chats ===
@@ -288,10 +295,12 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
             delivered_at timestamptz,
             read_at timestamptz,
             failed_at timestamptz,
+            last_status_payload jsonb,
             response_kind text,
             response_text text,
             response_at timestamptz,
-            created_at timestamptz NOT NULL DEFAULT NOW()
+            created_at timestamptz NOT NULL DEFAULT NOW(),
+            updated_at timestamptz NOT NULL DEFAULT NOW()
         );
         """
     )
@@ -299,6 +308,13 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_lead_logs_message ON lead_logs(wahelp_message_id) WHERE wahelp_message_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_lead_logs_campaign ON lead_logs(campaign);
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE lead_logs
+        ADD COLUMN IF NOT EXISTS last_status_payload jsonb,
+        ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
         """
     )
     await conn.execute(
@@ -319,6 +335,299 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
         ADD COLUMN IF NOT EXISTS response_kind text;
         """
     )
+
+LEADS_PROMO_CAMPAIGNS: dict[str, list[str]] = {
+    "week1": [
+        "🚀 Ракета Клин\nДарим вам 300 бонусов на следующие 30 дней. Можно использовать на уборку или химчистку мебели и матрасов.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+        "Здравствуйте! Мы из «Ракета Клин». На ваш счёт начислено 300 бонусов (действуют 30 дней). Используйте на любую химчистку или уборку.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+    ],
+    "week2": [
+        "🪑 Подарок! При чистке дивана или матраса — бесплатная чистка двух кухонных стульев или пуфика.\nБез спешки и мелкого текста — просто приятный бонус.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+        "Чистим диван или матрас? 🎁 Подарим чистку 2 стульев или пуфика — в знак внимания.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+    ],
+    "week3": [
+        "🎁 На ваш счёт начислено 500 бонусов, они действуют 30 дней. Можно использовать на уборку или химчистку мебели и матрасов.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+        "Небольшой повод обновить уют дома ✨ — 500 бонусов на 30 дней. Потратьте их на любую химчистку или уборку.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+    ],
+    "week4": [
+        "🔖 Скидка 10 % на наши услуги для вас. Если нужна уборка или чистка мебели — самое время.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+        "Минус 10 % на уборку и химчистку мебели. Акция действует 30 дней 🙂\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+    ],
+    "week5": [
+        "💸 Скидка 500 ₽ на любой заказ — уборка или чистка мебели и матрасов. Акция действует 30 дней.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+        "Немного сэкономим вам бюджет 🙂 — минус 500 ₽ на заказ. Услуги по уборке и химчистке мебели, действует 30 дней.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+    ],
+    "week6": [
+        "🧊 При заказе генеральной уборки — мойка холодильника в подарок. Чистота и свежесть без лишних слов.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+        "Дом любит заботу ✨ — закажите генеральную уборку, и мойка холодильника войдёт в подарок.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
+    ],
+}
+
+LEADS_AUTO_REPLY = "Спасибо! Свяжемся с вами в ближайшее время."
+
+
+def _extract_wahelp_message_id(payload: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    data = payload.get("data")
+    candidates: Sequence[str] = ("message_id", "id", "wahelp_id")
+    if isinstance(data, Mapping):
+        for key in candidates:
+            val = data.get(key)
+            if val:
+                return str(val)
+        message = data.get("message")
+        if isinstance(message, Mapping):
+            for key in candidates:
+                val = message.get(key)
+                if val:
+                    return str(val)
+    for key in candidates:
+        val = payload.get(key)
+        if val:
+            return str(val)
+    return None
+
+
+async def _log_lead_send(
+    conn: asyncpg.Connection,
+    *,
+    lead_id: int,
+    campaign: str,
+    variant: int,
+    wahelp_message_id: str | None,
+    status: str = "sent",
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO lead_logs (
+            lead_id, campaign, variant, wahelp_message_id, status, sent_at, created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+        """,
+        lead_id,
+        campaign,
+        variant,
+        wahelp_message_id,
+        status,
+    )
+
+
+async def _update_lead_log_status(
+    conn: asyncpg.Connection,
+    *,
+    wahelp_message_id: str,
+    status: str,
+    event_time: datetime,
+) -> bool:
+    row = await conn.fetchrow(
+        """
+        SELECT id, status
+        FROM lead_logs
+        WHERE wahelp_message_id=$1
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        wahelp_message_id,
+    )
+    if not row:
+        return False
+    updates: list[str] = ["status = $2", "updated_at = NOW()"]
+    params: list[Any] = [wahelp_message_id, status]
+    idx = 3
+    if status in {"delivered", "read"}:
+        updates.append(f"delivered_at = COALESCE(delivered_at, ${idx})")
+        params.append(event_time)
+        idx += 1
+    if status == "read":
+        updates.append(f"read_at = COALESCE(read_at, ${idx})")
+        params.append(event_time)
+        idx += 1
+    if status == "failed":
+        updates.append(f"failed_at = COALESCE(failed_at, ${idx})")
+        params.append(event_time)
+        idx += 1
+    sql = "UPDATE lead_logs SET " + ", ".join(updates) + " WHERE wahelp_message_id = $1"
+    await conn.execute(sql, *params)
+    return True
+
+
+async def _log_lead_response(
+    conn: asyncpg.Connection,
+    *,
+    lead_id: int,
+    response_kind: str,
+    response_text: str,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO lead_logs (
+            lead_id, campaign, variant, status, response_kind, response_text, response_at, created_at
+        )
+        VALUES ($1, 'inbound', NULL, 'received', $2, $3, NOW(), NOW())
+        """,
+        lead_id,
+        response_kind,
+        response_text,
+    )
+
+
+async def _pick_leads_variant(conn: asyncpg.Connection, campaign: str) -> int:
+    sent_count = await conn.fetchval(
+        "SELECT COUNT(*) FROM lead_logs WHERE campaign=$1 AND status='sent'",
+        campaign,
+    )
+    return 1 if sent_count % 100 < 50 else 2
+
+
+def _get_leads_campaign_text(campaign: str, variant: int) -> str:
+    variants = LEADS_PROMO_CAMPAIGNS.get(campaign) or []
+    idx = max(1, min(len(variants), variant)) - 1
+    return variants[idx]
+
+
+async def _select_leads_for_campaign(conn: asyncpg.Connection, *, campaign: str, limit: int) -> list[asyncpg.Record]:
+    return await conn.fetch(
+        """
+        SELECT id, phone, full_name, name, promo_last_sent_at
+        FROM leads
+        WHERE NOT COALESCE(promo_stop, false)
+          AND phone IS NOT NULL
+          AND phone <> ''
+          AND (promo_last_sent_at IS NULL OR promo_last_sent_at <= NOW() - INTERVAL '4 months')
+        ORDER BY promo_last_sent_at NULLS FIRST, id
+        LIMIT $1
+        """,
+        limit,
+    )
+
+
+async def _send_leads_campaign_batch() -> None:
+    if pool is None:
+        return
+    campaign = LEADS_PROMO_CAMPAIGN
+    if campaign not in LEADS_PROMO_CAMPAIGNS:
+        logger.warning("Unknown leads campaign: %s", campaign)
+        return
+    async with pool.acquire() as conn:
+        leads = await _select_leads_for_campaign(conn, campaign=campaign, limit=LEADS_MAX_PER_DAY)
+    if not leads:
+        logger.info("No leads to send for campaign %s", campaign)
+        return
+    sent = delivered = read = failed = 0
+    responses_interest = responses_stop = responses_other = 0
+    for idx, lead in enumerate(leads):
+        async with pool.acquire() as conn:
+            variant = await _pick_leads_variant(conn, campaign)
+        text = _get_leads_campaign_text(campaign, variant)
+        name = lead["full_name"] or lead["name"] or "Клиент"
+        phone = lead["phone"]
+        wahelp_payload = None
+        wahelp_message_id = None
+        try:
+            resp = await send_text_to_phone(
+                "leads",
+                phone=phone,
+                name=name,
+                text=text,
+            )
+            wahelp_payload = resp if isinstance(resp, Mapping) else None
+            wahelp_message_id = _extract_wahelp_message_id(wahelp_payload)
+            sent += 1
+            async with pool.acquire() as conn:
+                await _log_lead_send(
+                    conn,
+                    lead_id=lead["id"],
+                    campaign=campaign,
+                    variant=variant,
+                    wahelp_message_id=wahelp_message_id,
+                    status="sent",
+                )
+                await conn.execute(
+                    """
+                    UPDATE leads
+                    SET promo_last_sent_at = NOW(),
+                        promo_last_campaign = $2,
+                        promo_last_variant = $3,
+                        last_updated = NOW()
+                    WHERE id = $1
+                    """,
+                    lead["id"],
+                    campaign,
+                    variant,
+                )
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
+            async with pool.acquire() as conn:
+                await _log_lead_send(
+                    conn,
+                    lead_id=lead["id"],
+                    campaign=campaign,
+                    variant=variant,
+                    wahelp_message_id=wahelp_message_id,
+                    status="failed",
+                )
+        if idx < len(leads) - 1:
+            await asyncio.sleep(random.randint(LEADS_MIN_INTERVAL_SEC, LEADS_MAX_INTERVAL_SEC))
+
+    # Подсчёт статусов/реакций за сегодня
+    today_start_msk = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_msk.astimezone(timezone.utc)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT status, count(*) AS cnt
+            FROM lead_logs
+            WHERE sent_at >= $1
+              AND campaign = $2
+            GROUP BY status
+            """,
+            today_start_utc,
+            campaign,
+        )
+        for row in rows:
+            if row["status"] == "sent":
+                sent = row["cnt"]
+            elif row["status"] == "delivered":
+                delivered = row["cnt"]
+            elif row["status"] == "read":
+                read = row["cnt"]
+            elif row["status"] == "failed":
+                failed = row["cnt"]
+        resp_rows = await conn.fetch(
+            """
+            SELECT response_kind, count(*) AS cnt
+            FROM lead_logs
+            WHERE response_at >= $1
+              AND campaign = 'inbound'
+            GROUP BY response_kind
+            """,
+            today_start_utc,
+        )
+        for row in resp_rows:
+            kind = (row["response_kind"] or "").lower()
+            if kind == "interest":
+                responses_interest = row["cnt"]
+            elif kind == "stop":
+                responses_stop = row["cnt"]
+            else:
+                responses_other += row["cnt"]
+    summary_lines = [
+        f"Промо лиды ({campaign})",
+        f"Отправлено: {sent}",
+        f"Доставлено: {delivered}",
+        f"Прочитано: {read}",
+        f"1: {responses_interest}",
+        f"STOP: {responses_stop}",
+        f"Другое: {responses_other}",
+        f"Failed: {failed}",
+    ]
+    try:
+        await bot.send_message(MARKETING_LOG_CHAT_ID, "\n".join(summary_lines))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to send marketing summary: %s", exc)
+
 
 
 async def ensure_order_masters_schema(conn: asyncpg.Connection) -> None:
@@ -700,7 +1009,52 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             digits,
         )
         if not client:
-            return False
+            lead = await conn.fetchrow(
+                """
+                SELECT id, full_name, name, phone
+                FROM leads
+                WHERE regexp_replace(COALESCE(phone,''), '[^0-9]+', '', 'g') = $1
+                LIMIT 1
+                """,
+                digits,
+            )
+            if not lead:
+                return False
+
+            if is_stop:
+                await conn.execute(
+                    """
+                    UPDATE leads
+                    SET promo_stop = TRUE,
+                        promo_stop_at = NOW(),
+                        last_updated = NOW()
+                    WHERE id=$1
+                    """,
+                    lead["id"],
+                )
+                await _log_lead_response(conn, lead_id=lead["id"], response_kind="stop", response_text=normalized_text)
+                return True
+
+            if is_interest:
+                await _log_lead_response(conn, lead_id=lead["id"], response_kind="interest", response_text=normalized_text)
+                try:
+                    await send_text_to_phone("leads", phone=lead["phone"], name=lead.get("full_name") or lead.get("name") or "Клиент", text=LEADS_AUTO_REPLY)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to send auto-reply to lead %s: %s", lead["id"], exc)
+                msg_admin = (
+                    "Лид откликнулся на промо (1)\n"
+                    f"Имя: {(lead.get('full_name') or lead.get('name') or 'Лид')}\n"
+                    f"Телефон: {lead.get('phone') or 'неизвестно'}"
+                )
+                for admin_id in ADMIN_TG_IDS:
+                    try:
+                        await bot.send_message(admin_id, msg_admin)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Failed to notify admin %s about lead interest: %s", admin_id, exc)
+                return True
+
+            await _log_lead_response(conn, lead_id=lead["id"], response_kind="other", response_text=normalized_text)
+            return True
         rating_order = None
         if rating_score is not None:
             rating_order = await _select_pending_rating_order(conn, client["id"])
@@ -9150,7 +9504,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
@@ -9175,6 +9529,10 @@ async def main():
     if promo_task is None:
         promo_task = asyncio.create_task(
             schedule_daily_job(11, 0, run_promo_reminders, "promo_reminders")
+        )
+    if leads_promo_task is None:
+        leads_promo_task = asyncio.create_task(
+            schedule_daily_job(LEADS_SEND_START_HOUR, 0, _send_leads_campaign_batch, "leads_promo")
         )
     if wire_reminder_task is None:
         wire_reminder_task = asyncio.create_task(
