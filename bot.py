@@ -267,6 +267,42 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
     )
     await conn.execute(
         """
+        ALTER TABLE leads
+        ADD COLUMN IF NOT EXISTS promo_last_sent_at timestamptz,
+        ADD COLUMN IF NOT EXISTS promo_stop boolean NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS promo_stop_at timestamptz,
+        ADD COLUMN IF NOT EXISTS promo_last_campaign text,
+        ADD COLUMN IF NOT EXISTS promo_last_variant smallint
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lead_logs (
+            id bigserial PRIMARY KEY,
+            lead_id bigint NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+            campaign text NOT NULL,
+            variant smallint,
+            wahelp_message_id text,
+            status text NOT NULL,
+            sent_at timestamptz,
+            delivered_at timestamptz,
+            read_at timestamptz,
+            failed_at timestamptz,
+            response_kind text,
+            response_text text,
+            response_at timestamptz,
+            created_at timestamptz NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lead_logs_message ON lead_logs(wahelp_message_id) WHERE wahelp_message_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_lead_logs_campaign ON lead_logs(campaign);
+        """
+    )
+    await conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS promo_reengagements (
             client_id integer PRIMARY KEY REFERENCES clients(id) ON DELETE CASCADE,
             last_variant_sent smallint NOT NULL DEFAULT 0,
