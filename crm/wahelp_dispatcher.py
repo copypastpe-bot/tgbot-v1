@@ -62,10 +62,7 @@ async def send_with_rules(
                 text=text,
             )
             await _set_preferred_channel(conn, contact.client_id, channel)
-            if channel == TELEGRAM_CHANNEL and not WA_FOLLOWUP_DISABLED:
-                _schedule_followup(contact, text)
-            else:
-                _cancel_followup(contact.client_id)
+            _cancel_followup(contact.client_id)
             logger.info("Message sent via %s to client %s", channel, contact.client_id)
             return SendResult(channel=channel, response=response if isinstance(response, Mapping) else None)
         except WahelpAPIError as exc:
@@ -100,30 +97,7 @@ async def _set_preferred_channel(conn: asyncpg.Connection, client_id: int, chann
 
 
 def _schedule_followup(contact: ClientContact, text: str) -> None:
-    if WA_FOLLOWUP_DISABLED:
-        return
-    """Schedule WhatsApp reminder if Telegram isn't confirmed within 24h."""
     _cancel_followup(contact.client_id)
-
-    async def _task() -> None:
-        try:
-            await asyncio.sleep(FOLLOWUP_DELAY_SECONDS)
-            logger.info("Follow-up via WhatsApp for client %s", contact.client_id)
-            await send_text_to_phone(
-                WHATSAPP_CHANNEL,
-                phone=contact.phone,
-                name=contact.name,
-                text=text,
-            )
-        except asyncio.CancelledError:  # pragma: no cover
-            logger.debug("Follow-up task for client %s cancelled", contact.client_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Follow-up send failed for client %s: %s", contact.client_id, exc)
-        finally:
-            _followup_tasks.pop(contact.client_id, None)
-
-    loop = asyncio.get_running_loop()
-    _followup_tasks[contact.client_id] = loop.create_task(_task())
 
 
 def _cancel_followup(client_id: int) -> None:
@@ -135,3 +109,67 @@ def _cancel_followup(client_id: int) -> None:
 def cancel_followup_for_client(client_id: int) -> None:
     """Expose follow-up cancellation for external consumers (e.g. webhook)."""
     _cancel_followup(client_id)
+
+
+async def schedule_followup_for_client(
+    client_id: int,
+    *,
+    phone: str,
+    name: str,
+    text: str,
+) -> None:
+    if WA_FOLLOWUP_DISABLED:
+        return
+    _cancel_followup(client_id)
+
+    async def _task() -> None:
+        try:
+            await asyncio.sleep(FOLLOWUP_DELAY_SECONDS)
+            logger.info("Follow-up via WhatsApp for client %s", client_id)
+            await send_text_to_phone(
+                WHATSAPP_CHANNEL,
+                phone=phone,
+                name=name,
+                text=text,
+            )
+        except asyncio.CancelledError:  # pragma: no cover
+            logger.debug("Follow-up task for client %s cancelled", client_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Follow-up send failed for client %s: %s", client_id, exc)
+        finally:
+            _followup_tasks.pop(client_id, None)
+
+    loop = asyncio.get_running_loop()
+    _followup_tasks[client_id] = loop.create_task(_task())
+
+
+async def schedule_followup_for_client(
+    client_id: int,
+    phone: str,
+    name: str,
+    text: str,
+) -> None:
+    """Schedule WA follow-up 24h after delivery if not read."""
+    if WA_FOLLOWUP_DISABLED:
+        return
+    _cancel_followup(client_id)
+
+    async def _task() -> None:
+        try:
+            await asyncio.sleep(FOLLOWUP_DELAY_SECONDS)
+            logger.info("Follow-up via WhatsApp for client %s", client_id)
+            await send_text_to_phone(
+                WHATSAPP_CHANNEL,
+                phone=phone,
+                name=name,
+                text=text,
+            )
+        except asyncio.CancelledError:  # pragma: no cover
+            logger.debug("Follow-up task for client %s cancelled", client_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Follow-up send failed for client %s: %s", client_id, exc)
+        finally:
+            _followup_tasks.pop(client_id, None)
+
+    loop = asyncio.get_running_loop()
+    _followup_tasks[client_id] = loop.create_task(_task())

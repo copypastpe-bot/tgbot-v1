@@ -23,6 +23,7 @@ from .wahelp_dispatcher import (
     ClientContact,
     SendResult,
     cancel_followup_for_client,
+    schedule_followup_for_client,
     send_with_rules,
 )
 
@@ -42,4 +43,5 @@ __all__ = [
     "SendResult",
     "send_with_rules",
     "cancel_followup_for_client",
+    "schedule_followup_for_client",
 ]

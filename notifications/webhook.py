@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable, Mapping
 import asyncpg
 from aiohttp import web
 
-from crm import cancel_followup_for_client
+from crm import cancel_followup_for_client, schedule_followup_for_client
 from .outbox import apply_provider_status_update
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,7 @@ class WahelpWebhookServer:
             self.pool,
             payload,
             cancel_followup=cancel_followup_for_client,
+            schedule_followup_on_delivered=schedule_followup_for_client,
         )
         if not handled and not custom_handled:
             logger.debug("Webhook payload ignored: %s", payload)
