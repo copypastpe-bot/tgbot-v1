@@ -10,6 +10,7 @@ Priority:
 
 from __future__ import annotations
 
+import os
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ TELEGRAM_CHANNEL: ChannelKind = "clients_tg"
 WHATSAPP_CHANNEL: ChannelKind = "clients_wa"
 
 FOLLOWUP_DELAY_SECONDS = 24 * 60 * 60  # 24h
+WA_FOLLOWUP_DISABLED = os.getenv("WA_FOLLOWUP_DISABLED", "").lower() in {"1", "true", "yes", "on"}
 _followup_tasks: dict[int, asyncio.Task] = {}
 
 
@@ -60,7 +62,7 @@ async def send_with_rules(
                 text=text,
             )
             await _set_preferred_channel(conn, contact.client_id, channel)
-            if channel == TELEGRAM_CHANNEL:
+            if channel == TELEGRAM_CHANNEL and not WA_FOLLOWUP_DISABLED:
                 _schedule_followup(contact, text)
             else:
                 _cancel_followup(contact.client_id)
@@ -98,6 +100,8 @@ async def _set_preferred_channel(conn: asyncpg.Connection, client_id: int, chann
 
 
 def _schedule_followup(contact: ClientContact, text: str) -> None:
+    if WA_FOLLOWUP_DISABLED:
+        return
     """Schedule WhatsApp reminder if Telegram isn't confirmed within 24h."""
     _cancel_followup(contact.client_id)
 
