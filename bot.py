@@ -473,11 +473,14 @@ async def _log_lead_response(
 
 
 async def _pick_leads_variant(conn: asyncpg.Connection, campaign: str) -> int:
-    sent_count = await conn.fetchval(
-        "SELECT COUNT(*) FROM lead_logs WHERE campaign=$1 AND status='sent'",
+    sent_today = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM lead_logs
+        WHERE campaign=$1 AND status='sent' AND sent_at >= (NOW() AT TIME ZONE 'UTC' - INTERVAL '0 seconds')
+        """,
         campaign,
     )
-    return 1 if sent_count % 100 < 50 else 2
+    return 1 if sent_today % 2 == 0 else 2
 
 
 def _get_leads_campaign_text(campaign: str, variant: int) -> str:
@@ -516,9 +519,17 @@ async def _send_leads_campaign_batch() -> None:
         return
     sent = delivered = read = failed = 0
     responses_interest = responses_stop = responses_other = 0
+    today_start_msk = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_msk.astimezone(timezone.utc)
+    async with pool.acquire() as conn:
+        sent_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM lead_logs WHERE campaign=$1 AND status='sent' AND sent_at >= $2",
+            campaign,
+            today_start_utc,
+        )
     for idx, lead in enumerate(leads):
-        async with pool.acquire() as conn:
-            variant = await _pick_leads_variant(conn, campaign)
+        variant = 1 if sent_today % 2 == 0 else 2
+        sent_today += 1
         text = _get_leads_campaign_text(campaign, variant)
         name = lead["full_name"] or lead["name"] or "Клиент"
         phone = lead["phone"]
