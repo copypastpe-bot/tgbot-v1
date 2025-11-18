@@ -367,6 +367,7 @@ LEADS_PROMO_CAMPAIGNS: dict[str, list[str]] = {
 
 LEADS_AUTO_REPLY = "Спасибо! Свяжемся с вами в ближайшее время."
 STOP_AUTO_REPLY = "Вы отписаны от промо рассылки и акций. Если понадобимся, просто напишите нам.\nraketaclean.ru +79040437523"
+CLIENT_PROMO_INTEREST_REPLY = "Спасибо! Свяжемся с вами в ближайшее время."
 
 
 def _extract_wahelp_message_id(payload: Mapping[str, Any] | None) -> str | None:
@@ -961,7 +962,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             rating_score = int(rating_match.group(1))
         except ValueError:
             rating_score = None
-    is_stop = normalized_lower in {"stop", "стоп"}
+    is_stop = normalized_lower in {"stop", "стоп", "стоn", "стоp"}
     is_interest = normalized_lower.startswith("1")
     if not (is_stop or is_interest):
         if rating_score is None:
@@ -1112,6 +1113,15 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                 client["id"],
             )
             await _notify_admins_about_promo_interest(client, normalized_text)
+            try:
+                await send_text_to_phone(
+                    "clients_tg",
+                    phone=client["phone"],
+                    name=client["full_name"] or "Клиент",
+                    text=CLIENT_PROMO_INTEREST_REPLY,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to send interest auto-reply to client %s: %s", client["id"], exc)
             return True
 
     return False
