@@ -12,6 +12,14 @@ logs/
 # Secrets
 .env
 .env.*
+.env.example
+!.env.example
+.env.localbackup
+*.csv
+
+# Data/exports
+backups/
+import/
 
 # OS/editor junk
 .DS_Store
