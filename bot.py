@@ -497,6 +497,7 @@ async def _select_leads_for_campaign(conn: asyncpg.Connection, *, campaign: str,
         WHERE NOT COALESCE(promo_stop, false)
           AND phone IS NOT NULL
           AND phone <> ''
+          AND tg_id IS NOT NULL
           AND (promo_last_sent_at IS NULL OR promo_last_sent_at <= NOW() - INTERVAL '4 months')
         ORDER BY promo_last_sent_at NULLS FIRST, id
         LIMIT $1
