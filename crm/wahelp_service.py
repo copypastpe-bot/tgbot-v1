@@ -41,6 +41,7 @@ load_dotenv()
 _base_url = os.getenv("WAHELP_API_BASE", DEFAULT_BASE_URL)
 _login = os.getenv("WAHELP_LOGIN")
 _password = os.getenv("WAHELP_PASSWORD")
+_static_token = os.getenv("WAHELP_ACCESS_TOKEN") or os.getenv("WAHELP_CLIENTS_TOKEN")
 
 _credentials: WahelpCredentials | None = None
 _auth_manager: WahelpAuthManager | None = None
@@ -56,9 +57,13 @@ else:
 def get_wahelp_client() -> WahelpClient:
     global _client, _auth_manager
     if _client is None:
-        if _credentials is None:
-            raise RuntimeError("Wahelp client is not configured. Check WAHELP_LOGIN/WAHELP_PASSWORD in .env")
+        if _credentials is None and not _static_token:
+            raise RuntimeError("Wahelp client is not configured. Check WAHELP_LOGIN/WAHELP_PASSWORD or WAHELP_ACCESS_TOKEN in .env")
         _auth_manager = WahelpAuthManager(credentials=_credentials, timeout=timeout)
+        if _static_token:
+            # preload token if provided explicitly (bypasses login/refresh until expiry)
+            _auth_manager._token = _static_token  # type: ignore[attr-defined]
+            _auth_manager._expires_at = 10**12  # distant future
         _client = WahelpClient(auth_manager=_auth_manager)
     return _client
 
