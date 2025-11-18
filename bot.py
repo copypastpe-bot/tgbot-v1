@@ -151,6 +151,7 @@ PROMO_REMINDER_FIRST_GAP_MONTHS = 8
 PROMO_REMINDER_SECOND_GAP_MONTHS = 2
 PROMO_RANDOM_DELAY_RANGE = (1, 10)
 PROMO_BONUS_TTL_DAYS = 365
+PROMO_DAILY_LIMIT = 20
 LEADS_PROMO_CAMPAIGN = os.getenv("LEADS_PROMO_CAMPAIGN", "week1")
 LEADS_MAX_PER_DAY = 50
 LEADS_SEND_START_HOUR = 10  # MSK
@@ -899,70 +900,38 @@ async def _process_promo_stage(conn: asyncpg.Connection, stage: int) -> int:
               AND c.phone <> ''
               AND c.phone_digits IS NOT NULL
               AND c.last_order_at IS NOT NULL
-              AND c.last_order_at >= (NOW() - INTERVAL '8 months') - INTERVAL '1 day'
-              AND c.last_order_at < (NOW() - INTERVAL '8 months')
+              AND c.last_order_at <= (NOW() - INTERVAL '8 months')
               AND COALESCE(c.notifications_enabled, true)
               AND NOT COALESCE(c.promo_opt_out, false)
-              AND COALESCE(pr.last_variant_sent, 0) = 0
+              AND COALESCE(pr.response_kind, '') <> 'stop'
+            ORDER BY pr.last_sent_at NULLS FIRST, c.id
+            LIMIT $1
             """,
+            PROMO_DAILY_LIMIT,
         )
         if not rows:
             return 0
         count = 0
-        next_due = _add_months(datetime.now(timezone.utc), PROMO_REMINDER_SECOND_GAP_MONTHS)
         for row in rows:
             if await _schedule_promo_notification(conn, client_id=row["client_id"], event_key="promo_reengage_first"):
                 await conn.execute(
                     """
-                    INSERT INTO promo_reengagements (client_id, last_variant_sent, last_sent_at, next_send_at, responded_at)
-                    VALUES ($1, 1, NOW(), $2, NULL)
+                    INSERT INTO promo_reengagements (client_id, last_variant_sent, last_sent_at, next_send_at, responded_at, response_kind)
+                    VALUES ($1, 1, NOW(), NULL, NULL, NULL)
                     ON CONFLICT (client_id) DO UPDATE
                     SET last_variant_sent = 1,
                         last_sent_at = NOW(),
-                        next_send_at = $2,
-                        responded_at = NULL
+                        next_send_at = NULL,
+                        responded_at = NULL,
+                        response_kind = NULL
                     """,
                     row["client_id"],
-                    next_due,
                 )
                 count += 1
         return count
 
     if stage == 2:
-        rows = await conn.fetch(
-            """
-            SELECT c.id AS client_id
-            FROM promo_reengagements pr
-            JOIN clients c ON c.id = pr.client_id
-            WHERE pr.last_variant_sent = 1
-              AND pr.next_send_at IS NOT NULL
-              AND pr.next_send_at <= NOW()
-              AND pr.responded_at IS NULL
-              AND NOT COALESCE(c.promo_opt_out, false)
-              AND COALESCE(c.notifications_enabled, true)
-              AND c.phone IS NOT NULL
-              AND c.phone <> ''
-              AND c.phone_digits IS NOT NULL
-              AND (c.last_order_at IS NULL OR c.last_order_at <= pr.last_sent_at)
-            """,
-        )
-        if not rows:
-            return 0
-        count = 0
-        for row in rows:
-            if await _schedule_promo_notification(conn, client_id=row["client_id"], event_key="promo_reengage_second"):
-                await conn.execute(
-                    """
-                    UPDATE promo_reengagements
-                    SET last_variant_sent = 2,
-                        last_sent_at = NOW(),
-                        next_send_at = NULL
-                    WHERE client_id = $1
-                    """,
-                    row["client_id"],
-                )
-                count += 1
-        return count
+        return 0
 
     return 0
 
