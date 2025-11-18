@@ -365,6 +365,7 @@ LEADS_PROMO_CAMPAIGNS: dict[str, list[str]] = {
 }
 
 LEADS_AUTO_REPLY = "Спасибо! Свяжемся с вами в ближайшее время."
+STOP_AUTO_REPLY = "Вы отписаны от промо рассылки и акций. Если понадобимся, просто напишите нам.\nraketaclean.ru +79040437523"
 
 
 def _extract_wahelp_message_id(payload: Mapping[str, Any] | None) -> str | None:
@@ -1034,19 +1035,28 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             if not lead:
                 return False
 
-            if is_stop:
-                await conn.execute(
-                    """
-                    UPDATE leads
-                    SET promo_stop = TRUE,
-                        promo_stop_at = NOW(),
-                        last_updated = NOW()
-                    WHERE id=$1
-                    """,
-                    lead["id"],
+        if is_stop:
+            await conn.execute(
+                """
+                UPDATE leads
+                SET promo_stop = TRUE,
+                    promo_stop_at = NOW(),
+                    last_updated = NOW()
+                WHERE id=$1
+                """,
+                lead["id"],
+            )
+            await _log_lead_response(conn, lead_id=lead["id"], response_kind="stop", response_text=normalized_text)
+            try:
+                await send_text_to_phone(
+                    "leads",
+                    phone=lead["phone"],
+                    name=lead.get("full_name") or lead.get("name") or "Лид",
+                    text=STOP_AUTO_REPLY,
                 )
-                await _log_lead_response(conn, lead_id=lead["id"], response_kind="stop", response_text=normalized_text)
-                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to send stop auto-reply to lead %s: %s", lead["id"], exc)
+            return True
 
             if is_interest:
                 await _log_lead_response(conn, lead_id=lead["id"], response_kind="interest", response_text=normalized_text)
@@ -1110,6 +1120,15 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                 """,
                 client["id"],
             )
+            try:
+                await send_text_to_phone(
+                    "clients_tg",
+                    phone=client["phone"],
+                    name=client["full_name"] or "Клиент",
+                    text=STOP_AUTO_REPLY,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to send stop auto-reply to client %s: %s", client["id"], exc)
             return True
 
         if is_interest:
