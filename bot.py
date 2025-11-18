@@ -108,6 +108,7 @@ from notifications import (
     load_notification_rules,
     start_wahelp_webhook,
 )
+from crm import send_text_to_phone
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
 # Разрешаем пробелы, дефисы и скобки в пользовательском вводе
