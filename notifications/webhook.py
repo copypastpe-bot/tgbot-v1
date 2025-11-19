@@ -66,16 +66,18 @@ class WahelpWebhookServer:
 
         logger.info("Wahelp webhook payload: %s", payload)
 
+        normalized_payload = _normalize_payload(payload)
+
         custom_handled = False
         if self.inbound_handler is not None:
             try:
-                custom_handled = await self.inbound_handler(payload)
+                custom_handled = await self.inbound_handler(normalized_payload)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Inbound handler failed: %s", exc)
 
         handled = await apply_provider_status_update(
             self.pool,
-            payload,
+            normalized_payload,
             cancel_followup=cancel_followup_for_client,
             schedule_followup_on_delivered=schedule_followup_for_client,
         )
@@ -95,6 +97,21 @@ async def start_wahelp_webhook(
     server = WahelpWebhookServer(pool, token=token, inbound_handler=inbound_handler)
     await server.start(host, port)
     return server
+
+
+def _normalize_payload(payload: Mapping[str, Any] | Any) -> Mapping[str, Any] | Any:
+    if not isinstance(payload, Mapping):
+        return payload
+    if "data" in payload:
+        return payload
+    inner = payload.get("payload")
+    if isinstance(inner, Mapping):
+        normalized = dict(payload)
+        normalized["data"] = inner
+        if "event" not in normalized:
+            normalized["event"] = payload.get("action")
+        return normalized
+    return payload
 
 
 __all__ = ["WahelpWebhookServer", "start_wahelp_webhook"]
