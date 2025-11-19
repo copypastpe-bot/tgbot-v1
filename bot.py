@@ -992,7 +992,8 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             "SELECT id, full_name, phone FROM clients WHERE phone_digits=$1 LIMIT 1",
             digits,
         )
-        if not client:
+        lead = None
+        if client is None:
             lead = await conn.fetchrow(
                 """
                 SELECT id, full_name, name, phone
@@ -1005,33 +1006,38 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             if not lead:
                 return False
 
-        if is_stop:
-            await conn.execute(
-                """
-                UPDATE leads
-                SET promo_stop = TRUE,
-                    promo_stop_at = NOW(),
-                    last_updated = NOW()
-                WHERE id=$1
-                """,
-                lead["id"],
-            )
-            await _log_lead_response(conn, lead_id=lead["id"], response_kind="stop", response_text=normalized_text)
-            try:
-                await send_text_to_phone(
-                    "leads",
-                    phone=lead["phone"],
-                    name=lead.get("full_name") or lead.get("name") or "Лид",
-                    text=STOP_AUTO_REPLY,
+            if is_stop:
+                await conn.execute(
+                    """
+                    UPDATE leads
+                    SET promo_stop = TRUE,
+                        promo_stop_at = NOW(),
+                        last_updated = NOW()
+                    WHERE id=$1
+                    """,
+                    lead["id"],
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to send stop auto-reply to lead %s: %s", lead["id"], exc)
-            return True
+                await _log_lead_response(conn, lead_id=lead["id"], response_kind="stop", response_text=normalized_text)
+                try:
+                    await send_text_to_phone(
+                        "leads",
+                        phone=lead["phone"],
+                        name=lead.get("full_name") or lead.get("name") or "Лид",
+                        text=STOP_AUTO_REPLY,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to send stop auto-reply to lead %s: %s", lead["id"], exc)
+                return True
 
             if is_interest:
                 await _log_lead_response(conn, lead_id=lead["id"], response_kind="interest", response_text=normalized_text)
                 try:
-                    await send_text_to_phone("leads", phone=lead["phone"], name=lead.get("full_name") or lead.get("name") or "Клиент", text=LEADS_AUTO_REPLY)
+                    await send_text_to_phone(
+                        "leads",
+                        phone=lead["phone"],
+                        name=lead.get("full_name") or lead.get("name") or "Лид",
+                        text=LEADS_AUTO_REPLY,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to send auto-reply to lead %s: %s", lead["id"], exc)
                 msg_admin = (
@@ -1048,8 +1054,9 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
 
             await _log_lead_response(conn, lead_id=lead["id"], response_kind="other", response_text=normalized_text)
             return True
+
         rating_order = None
-        if rating_score is not None:
+        if rating_score is not None and client:
             rating_order = await _select_pending_rating_order(conn, client["id"])
 
         if rating_score is not None and rating_order:
