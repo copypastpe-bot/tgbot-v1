@@ -64,6 +64,8 @@ class WahelpWebhookServer:
         except Exception:
             return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
 
+        logger.info("Wahelp webhook payload: %s", payload)
+
         custom_handled = False
         if self.inbound_handler is not None:
             try:
