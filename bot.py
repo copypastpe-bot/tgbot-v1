@@ -108,7 +108,7 @@ from notifications import (
     load_notification_rules,
     start_wahelp_webhook,
 )
-from crm import send_text_to_phone
+from crm import send_text_to_phone, WahelpAPIError
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
 # Разрешаем пробелы, дефисы и скобки в пользовательском вводе
@@ -154,6 +154,7 @@ PROMO_BONUS_TTL_DAYS = 365
 PROMO_DAILY_LIMIT = 20
 LEADS_PROMO_CAMPAIGN = os.getenv("LEADS_PROMO_CAMPAIGN", "week1")
 LEADS_MAX_PER_DAY = 0
+LEADS_RATE_LIMIT_INTERVAL = int(os.getenv("LEADS_RATE_LIMIT_INTERVAL", 60))  # seconds between lead messages
 LEADS_SEND_START_HOUR = 10  # MSK
 LEADS_MIN_INTERVAL_SEC = 60
 LEADS_MAX_INTERVAL_SEC = 600
@@ -576,6 +577,7 @@ async def _send_leads_campaign_batch() -> None:
             campaign,
             today_start_utc,
         )
+    rate_limits_reached = 0
     for idx, lead in enumerate(leads):
         variant = 1 if sent_today % 2 == 0 else 2
         sent_today += 1
@@ -616,6 +618,32 @@ async def _send_leads_campaign_batch() -> None:
                     campaign,
                     variant,
                 )
+        except WahelpAPIError as exc:
+            error_text = str(exc)
+            if "Too Many Requests" in error_text or "Слишком много попыток" in error_text:
+                rate_limits_reached += 1
+                logger.warning("Lead promo rate limited, stopping batch: %s", exc)
+                async with pool.acquire() as conn:
+                    await _log_lead_send(
+                        conn,
+                        lead_id=lead["id"],
+                        campaign=campaign,
+                        variant=variant,
+                        wahelp_message_id=wahelp_message_id,
+                        status="failed",
+                    )
+                break
+            failed += 1
+            logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
+            async with pool.acquire() as conn:
+                await _log_lead_send(
+                    conn,
+                    lead_id=lead["id"],
+                    campaign=campaign,
+                    variant=variant,
+                    wahelp_message_id=wahelp_message_id,
+                    status="failed",
+                )
         except Exception as exc:  # noqa: BLE001
             failed += 1
             logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
@@ -628,8 +656,9 @@ async def _send_leads_campaign_batch() -> None:
                     wahelp_message_id=wahelp_message_id,
                     status="failed",
                 )
+
         if idx < len(leads) - 1:
-            await asyncio.sleep(random.randint(LEADS_MIN_INTERVAL_SEC, LEADS_MAX_INTERVAL_SEC))
+            await asyncio.sleep(LEADS_RATE_LIMIT_INTERVAL)
 
     # Подсчёт статусов/реакций за сегодня
     today_start_msk = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -3049,9 +3078,14 @@ async def run_birthday_jobs() -> None:
 async def run_promo_reminders() -> None:
     if pool is None:
         return
+    now_utc = datetime.now(timezone.utc)
     async with pool.acquire() as conn:
+        if not await _should_run_daily_job(conn, "promo_reminders", now_utc):
+            logger.info("promo_reminders already run today, skipping")
+            return
         stage_one = await _process_promo_stage(conn, 1)
         stage_two = await _process_promo_stage(conn, 2)
+        await _mark_daily_job_run(conn, "promo_reminders", now_utc)
     logger.info("Promo reminders queued: first=%s second=%s", stage_one, stage_two)
 
 
