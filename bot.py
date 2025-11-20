@@ -3036,6 +3036,7 @@ async def run_birthday_jobs() -> None:
         if len(errors) > 10:
             lines.append(f"… ещё {len(errors) - 10} строк")
 
+    async with pool.acquire() as conn:
         await _mark_daily_job_run(conn, "birthday_jobs", now_utc)
 
     if MONEY_FLOW_CHAT_ID:
