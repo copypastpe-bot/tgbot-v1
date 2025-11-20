@@ -256,6 +256,7 @@ async def _get_next_bonus_expire_date(conn: asyncpg.Connection, client_id: int) 
         WHERE client_id = $1
           AND delta > 0
           AND expires_at IS NOT NULL
+          AND expires_at >= NOW()
         ORDER BY expires_at
         LIMIT 1
         """,
