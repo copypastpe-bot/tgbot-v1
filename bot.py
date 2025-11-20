@@ -153,7 +153,7 @@ PROMO_RANDOM_DELAY_RANGE = (1, 10)
 PROMO_BONUS_TTL_DAYS = 365
 PROMO_DAILY_LIMIT = 20
 LEADS_PROMO_CAMPAIGN = os.getenv("LEADS_PROMO_CAMPAIGN", "week1")
-LEADS_MAX_PER_DAY = 50
+LEADS_MAX_PER_DAY = 0
 LEADS_SEND_START_HOUR = 10  # MSK
 LEADS_MIN_INTERVAL_SEC = 60
 LEADS_MAX_INTERVAL_SEC = 600
@@ -335,6 +335,17 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
         """
         ALTER TABLE promo_reengagements
         ADD COLUMN IF NOT EXISTS response_kind text;
+        """
+    )
+
+
+async def ensure_daily_job_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_job_runs (
+            job_name text PRIMARY KEY,
+            last_run timestamptz NOT NULL
+        );
         """
     )
 
@@ -2930,8 +2941,36 @@ async def _expire_old_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str]]
     return expired, errors
 
 
+async def _should_run_daily_job(conn: asyncpg.Connection, job_name: str, now_utc: datetime) -> bool:
+    row = await conn.fetchrow("SELECT last_run FROM daily_job_runs WHERE job_name=$1", job_name)
+    if row and row["last_run"]:
+        last_local = row["last_run"].astimezone(MOSCOW_TZ)
+        if last_local.date() >= now_utc.astimezone(MOSCOW_TZ).date():
+            return False
+    return True
+
+
+async def _mark_daily_job_run(conn: asyncpg.Connection, job_name: str, now_utc: datetime) -> None:
+    await conn.execute(
+        """
+        INSERT INTO daily_job_runs (job_name, last_run)
+        VALUES ($1, $2)
+        ON CONFLICT (job_name)
+        DO UPDATE SET last_run = EXCLUDED.last_run
+        """,
+        job_name,
+        now_utc,
+    )
+
+
 async def run_birthday_jobs() -> None:
+    if pool is None:
+        return
+    now_utc = datetime.now(timezone.utc)
     async with pool.acquire() as conn:
+        if not await _should_run_daily_job(conn, "birthday_jobs", now_utc):
+            logger.info("birthday_jobs already run today, skipping")
+            return
         accrued, accrual_errors, refresh_expired = await _accrue_birthday_bonuses(conn)
         expired, expire_errors = await _expire_old_bonuses(conn)
         yesterday = datetime.now(MOSCOW_TZ).date() - timedelta(days=1)
@@ -2996,6 +3035,8 @@ async def run_birthday_jobs() -> None:
             lines.append(f"- {err}")
         if len(errors) > 10:
             lines.append(f"… ещё {len(errors) - 10} строк")
+
+        await _mark_daily_job_run(conn, "birthday_jobs", now_utc)
 
     if MONEY_FLOW_CHAT_ID:
         try:
@@ -9569,6 +9610,7 @@ async def main():
         await _ensure_bonus_posted_column(_conn)
         await ensure_notification_schema(_conn)
         await ensure_promo_schema(_conn)
+        await ensure_daily_job_schema(_conn)
         await ensure_order_masters_schema(_conn)
         await ensure_orders_wire_schema(_conn)
         await ensure_cashbook_wire_schema(_conn)
