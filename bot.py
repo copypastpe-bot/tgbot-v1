@@ -368,6 +368,7 @@ LEADS_PROMO_CAMPAIGNS: dict[str, list[str]] = {
 LEADS_AUTO_REPLY = "Спасибо! Свяжемся с вами в ближайшее время."
 STOP_AUTO_REPLY = "Вы отписаны от промо рассылки и акций. Если понадобимся, просто напишите нам.\nraketaclean.ru +79040437523"
 CLIENT_PROMO_INTEREST_REPLY = "Спасибо! Свяжемся с вами в ближайшее время."
+LEADS_AUTO_REPLY_CAMPAIGN_PREFIX = "inbound_auto_reply"
 
 
 def _extract_wahelp_message_id(payload: Mapping[str, Any] | None) -> str | None:
@@ -398,7 +399,7 @@ async def _log_lead_send(
     *,
     lead_id: int,
     campaign: str,
-    variant: int,
+    variant: int | None,
     wahelp_message_id: str | None,
     status: str = "sent",
 ) -> None:
@@ -473,6 +474,38 @@ async def _log_lead_response(
         lead_id,
         response_kind,
         response_text,
+    )
+
+
+async def _send_lead_auto_reply(
+    conn: asyncpg.Connection,
+    *,
+    lead_row: Mapping[str, Any],
+    response_kind: str,
+    text: str,
+) -> None:
+    status = "sent"
+    wahelp_message_id: str | None = None
+    try:
+        name = lead_row["full_name"] or lead_row["name"] or "Лид"
+        resp = await send_text_to_phone(
+            "leads",
+            phone=lead_row["phone"],
+            name=name,
+            text=text,
+        )
+        payload = resp if isinstance(resp, Mapping) else None
+        wahelp_message_id = _extract_wahelp_message_id(payload)
+    except Exception as exc:  # noqa: BLE001
+        status = "failed"
+        logger.warning("Failed to send %s auto-reply to lead %s: %s", response_kind, lead_row["id"], exc)
+    await _log_lead_send(
+        conn,
+        lead_id=lead_row["id"],
+        campaign=f"{LEADS_AUTO_REPLY_CAMPAIGN_PREFIX}_{response_kind}",
+        variant=None,
+        wahelp_message_id=wahelp_message_id,
+        status=status,
     )
 
 
@@ -1018,28 +1051,22 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                     lead["id"],
                 )
                 await _log_lead_response(conn, lead_id=lead["id"], response_kind="stop", response_text=normalized_text)
-                try:
-                    await send_text_to_phone(
-                        "leads",
-                        phone=lead["phone"],
-                        name=lead.get("full_name") or lead.get("name") or "Лид",
-                        text=STOP_AUTO_REPLY,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to send stop auto-reply to lead %s: %s", lead["id"], exc)
+                await _send_lead_auto_reply(
+                    conn,
+                    lead_row=lead,
+                    response_kind="stop",
+                    text=STOP_AUTO_REPLY,
+                )
                 return True
 
             if is_interest:
                 await _log_lead_response(conn, lead_id=lead["id"], response_kind="interest", response_text=normalized_text)
-                try:
-                    await send_text_to_phone(
-                        "leads",
-                        phone=lead["phone"],
-                        name=lead.get("full_name") or lead.get("name") or "Лид",
-                        text=LEADS_AUTO_REPLY,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to send auto-reply to lead %s: %s", lead["id"], exc)
+                await _send_lead_auto_reply(
+                    conn,
+                    lead_row=lead,
+                    response_kind="interest",
+                    text=LEADS_AUTO_REPLY,
+                )
                 msg_admin = (
                     "Лид откликнулся на промо (1)\n"
                     f"Имя: {(lead.get('full_name') or lead.get('name') or 'Лид')}\n"
@@ -2987,12 +3014,23 @@ async def run_promo_reminders() -> None:
 
 
 async def schedule_daily_job(hour_msk: int, minute_msk: int, job_coro, job_name: str) -> None:
+    next_run: datetime | None = None
     while True:
         now_local = datetime.now(MOSCOW_TZ)
-        target = now_local.replace(hour=hour_msk, minute=minute_msk, second=0, microsecond=0)
-        if target <= now_local:
-            target += timedelta(days=1)
-        wait_seconds = (target - now_local).total_seconds()
+        if next_run is None:
+            next_run = now_local.replace(hour=hour_msk, minute=minute_msk, second=0, microsecond=0)
+
+        if next_run <= now_local:
+            logging.info("Missed %s schedule, running immediately", job_name)
+            try:
+                await job_coro()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Daily job %s failed: %s", job_name, exc)
+                await asyncio.sleep(60)
+            next_run = next_run + timedelta(days=1)
+            continue
+
+        wait_seconds = (next_run - now_local).total_seconds()
         logging.info("Next %s run scheduled in %.0f seconds", job_name, wait_seconds)
         await asyncio.sleep(wait_seconds)
         try:
@@ -3000,6 +3038,7 @@ async def schedule_daily_job(hour_msk: int, minute_msk: int, job_coro, job_name:
         except Exception as exc:  # noqa: BLE001
             logging.exception("Daily job %s failed: %s", job_name, exc)
             await asyncio.sleep(60)
+        next_run = next_run + timedelta(days=1)
 
 def withdraw_nav_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
