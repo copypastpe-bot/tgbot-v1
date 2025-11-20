@@ -158,6 +158,13 @@ LEADS_RATE_LIMIT_INTERVAL = int(os.getenv("LEADS_RATE_LIMIT_INTERVAL", 60))  # s
 LEADS_SEND_START_HOUR = 10  # MSK
 LEADS_MIN_INTERVAL_SEC = 60
 LEADS_MAX_INTERVAL_SEC = 600
+CHANNEL_ALIAS_TO_KIND = {
+    "clients_tg": "clients_tg",
+    "clients_telegram": "clients_tg",
+    "clients_wa": "clients_wa",
+    "clients_whatsapp": "clients_wa",
+    "leads": "leads",
+}
 MARKETING_LOG_CHAT_ID = int(os.getenv("MARKETING_LOG_CHAT_ID", "-1005025733003"))
 MAX_ORDER_MASTERS = 5
 BDAY_TEMPLATE_KEYS = (
@@ -383,6 +390,15 @@ CLIENT_PROMO_INTEREST_REPLY = "Спасибо! Свяжемся с вами в �
 LEADS_AUTO_REPLY_CAMPAIGN_PREFIX = "inbound_auto_reply"
 
 
+def _resolve_channel_kind(alias: str | None, default: str) -> str:
+    if alias:
+        key = alias.strip().lower()
+        mapped = CHANNEL_ALIAS_TO_KIND.get(key)
+        if mapped:
+            return mapped
+    return default
+
+
 def _extract_wahelp_message_id(payload: Mapping[str, Any] | None) -> str | None:
     if not isinstance(payload, Mapping):
         return None
@@ -495,13 +511,14 @@ async def _send_lead_auto_reply(
     lead_row: Mapping[str, Any],
     response_kind: str,
     text: str,
+    channel_kind: str = "leads",
 ) -> None:
     status = "sent"
     wahelp_message_id: str | None = None
     try:
         name = lead_row["full_name"] or lead_row["name"] or "Лид"
         resp = await send_text_to_phone(
-            "leads",
+            channel_kind,
             phone=lead_row["phone"],
             name=name,
             text=text,
@@ -1019,6 +1036,12 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
     destination = str(data.get("destination") or data.get("direction") or "").lower()
     if destination in {"", "from_operator", "operator"}:
         return False
+    channel_alias = None
+    channel_info = data.get("channel")
+    if isinstance(channel_info, Mapping):
+        alias_val = channel_info.get("alias") or channel_info.get("name")
+        if alias_val:
+            channel_alias = str(alias_val)
     text = data.get("message")
     if isinstance(text, Mapping):
         text = text.get("text") or text.get("message")
@@ -1080,6 +1103,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                 return False
 
             if is_stop:
+                channel_kind = _resolve_channel_kind(channel_alias, "leads")
                 await conn.execute(
                     """
                     UPDATE leads
@@ -1096,16 +1120,19 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                     lead_row=lead,
                     response_kind="stop",
                     text=STOP_AUTO_REPLY,
+                    channel_kind=channel_kind,
                 )
                 return True
 
             if is_interest:
+                channel_kind = _resolve_channel_kind(channel_alias, "leads")
                 await _log_lead_response(conn, lead_id=lead["id"], response_kind="interest", response_text=normalized_text)
                 await _send_lead_auto_reply(
                     conn,
                     lead_row=lead,
                     response_kind="interest",
                     text=LEADS_AUTO_REPLY,
+                    channel_kind=channel_kind,
                 )
                 msg_admin = (
                     "Лид откликнулся на промо (1)\n"
@@ -1144,6 +1171,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             return False
 
         if is_stop:
+            channel_kind = _resolve_channel_kind(channel_alias, "clients_tg")
             await conn.execute(
                 """
                 UPDATE clients
@@ -1166,7 +1194,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             )
             try:
                 await send_text_to_phone(
-                    "clients_tg",
+                    channel_kind,
                     phone=client["phone"],
                     name=client["full_name"] or "Клиент",
                     text=STOP_AUTO_REPLY,
@@ -1176,6 +1204,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             return True
 
         if is_interest:
+            channel_kind = _resolve_channel_kind(channel_alias, "clients_tg")
             await conn.execute(
                 """
                 UPDATE promo_reengagements
@@ -1189,7 +1218,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             await _notify_admins_about_promo_interest(client, normalized_text)
             try:
                 await send_text_to_phone(
-                    "clients_tg",
+                    channel_kind,
                     phone=client["phone"],
                     name=client["full_name"] or "Клиент",
                     text=CLIENT_PROMO_INTEREST_REPLY,
