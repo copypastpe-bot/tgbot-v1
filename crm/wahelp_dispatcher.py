@@ -66,6 +66,9 @@ async def send_with_rules(
             logger.info("Message sent via %s to client %s", channel, contact.client_id)
             return SendResult(channel=channel, response=response if isinstance(response, Mapping) else None)
         except WahelpAPIError as exc:
+            if channel == TELEGRAM_CHANNEL and _is_messenger_missing_error(exc):
+                await _set_preferred_channel(conn, contact.client_id, WHATSAPP_CHANNEL)
+                contact.preferred_channel = WHATSAPP_CHANNEL
             logger.warning("Send via %s failed for client %s: %s", channel, contact.client_id, exc)
             last_error = exc
             continue
@@ -137,3 +140,8 @@ async def schedule_followup_for_client(
 
     loop = asyncio.get_running_loop()
     _followup_tasks[client_id] = loop.create_task(_task())
+
+
+def _is_messenger_missing_error(error: WahelpAPIError) -> bool:
+    text = str(error)
+    return "Мессенджер не подключен" in text or "messenger" in text.lower() and "not connected" in text.lower()

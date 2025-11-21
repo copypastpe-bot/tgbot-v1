@@ -3071,6 +3071,23 @@ async def run_birthday_jobs() -> None:
             start_utc,
             end_utc,
         ) or 0
+        tg_pending_rows = await conn.fetch(
+            """
+            SELECT nm.client_id,
+                   nm.sent_at,
+                   c.phone
+            FROM notification_messages nm
+            JOIN clients c ON c.id = nm.client_id
+            WHERE nm.channel = 'clients_tg'
+              AND nm.status = 'sent'
+              AND nm.sent_at >= $1
+              AND nm.sent_at < $2
+            ORDER BY nm.sent_at
+            """,
+            start_utc,
+            end_utc,
+        )
+        tg_pending_count = len(tg_pending_rows)
     total_expired = expired + refresh_expired
 
     lines = [
@@ -3087,6 +3104,20 @@ async def run_birthday_jobs() -> None:
             f"Ответ 1: {promo_interests}",
         ]
     )
+    if tg_pending_count:
+        lines.extend(
+            [
+                "",
+                "⚠️ TG сообщения без delivered/read:",
+                f"Всего: {tg_pending_count}",
+            ]
+        )
+        for row in tg_pending_rows[:5]:
+            sent_local = row["sent_at"].astimezone(MOSCOW_TZ)
+            phone = row["phone"] or f"id {row['client_id']}"
+            lines.append(f"- {phone}: {sent_local:%d.%m %H:%M}")
+        if tg_pending_count > 5:
+            lines.append(f"… ещё {tg_pending_count - 5}")
     errors = (accrual_errors + expire_errors)
     if errors:
         lines.append("\nОшибки:")
