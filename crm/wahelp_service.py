@@ -93,15 +93,22 @@ def _get_channel_config(kind: ChannelKind) -> WahelpChannelConfig:
 async def ensure_user_in_channel(
     channel_kind: ChannelKind,
     *,
-    phone: str,
+    phone: str | None,
     name: str | None = None,
+    tg_username: str | None = None,
 ) -> int:
     client = get_wahelp_client()
     cfg = get_project_config(channel_kind)
     channel_uuid = get_channel_uuid(channel_kind)
-    payload: dict[str, str] = {"phone": phone}
+    payload: dict[str, str] = {}
+    if phone:
+        payload["phone"] = phone
+    if tg_username:
+        payload["username"] = tg_username.lstrip("@")
     if name:
         payload["name"] = name
+    if not payload.get("phone") and not payload.get("username"):
+        raise ValueError("Either phone or tg_username must be provided for Wahelp ensure_user")
     resp = await client.ensure_user(cfg, channel_uuid=channel_uuid, user_payload=payload)
     user_id = _extract_user_id(resp)
     logger.debug("Wahelp ensure_user %s -> %s", channel_kind, user_id)
@@ -128,11 +135,24 @@ async def send_text_message(
 async def send_text_to_phone(
     channel_kind: ChannelKind,
     *,
-    phone: str,
+    phone: str | None,
     name: str | None = None,
     text: str,
+    tg_username: str | None = None,
+    use_username: bool = False,
 ) -> dict:
-    user_id = await ensure_user_in_channel(channel_kind, phone=phone, name=name)
+    normalized_username = tg_username.lstrip("@") if tg_username else None
+    if use_username and not normalized_username:
+        raise ValueError("tg_username must be provided when use_username=True")
+    phone_lookup = None if (use_username and normalized_username) else phone
+    if phone_lookup is None and not normalized_username:
+        raise ValueError("Either phone or tg_username must be provided for Wahelp send")
+    user_id = await ensure_user_in_channel(
+        channel_kind,
+        phone=phone_lookup,
+        name=name,
+        tg_username=normalized_username,
+    )
     return await send_text_message(channel_kind, user_id=user_id, text=text)
 
 

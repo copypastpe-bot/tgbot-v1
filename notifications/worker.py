@@ -102,7 +102,9 @@ class NotificationWorker:
             client_id=entry.client_id,
             phone=entry.client_phone,
             name=(entry.client_name or "Клиент"),
+            tg_username=entry.client_tg_username,
             preferred_channel=entry.client_preferred_channel,
+            recipient_kind=entry.recipient_kind,
         )
         message_text = render_template(entry.template, entry.payload)
 

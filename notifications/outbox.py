@@ -41,6 +41,7 @@ class NotificationOutboxEntry:
     client_phone: str | None
     client_name: str | None
     client_preferred_channel: str | None
+    client_tg_username: str | None
     notifications_enabled: bool
 
 
@@ -231,7 +232,7 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
     if client_ids:
         client_rows = await conn.fetch(
             """
-            SELECT id, full_name, phone, wahelp_preferred_channel, COALESCE(notifications_enabled, true) AS notifications_enabled
+            SELECT id, full_name, phone, wahelp_preferred_channel, tg_username, COALESCE(notifications_enabled, true) AS notifications_enabled
             FROM clients
             WHERE id = ANY($1::int[])
             """,
@@ -242,6 +243,7 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 "full_name": crow["full_name"],
                 "phone": crow["phone"],
                 "preferred": crow["wahelp_preferred_channel"],
+                "tg_username": crow["tg_username"],
                 "enabled": bool(crow["notifications_enabled"]),
             }
     entries: list[NotificationOutboxEntry] = []
@@ -264,6 +266,7 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 client_phone=client_info.get("phone"),
                 client_name=client_info.get("full_name"),
                 client_preferred_channel=client_info.get("preferred"),
+                client_tg_username=client_info.get("tg_username"),
                 notifications_enabled=client_info.get("enabled", True),
             )
         )

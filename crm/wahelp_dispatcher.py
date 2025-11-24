@@ -1,11 +1,11 @@
 """
 Message routing rules for Wahelp channels.
 
-Priority:
-- Default to Telegram (clients_tg).
-- On failure, send via WhatsApp (clients_wa).
-- If Telegram succeeds, schedule WhatsApp follow-up after 24h (can be cancelled if not needed).
-- When delivery succeeds on a channel, mark it as preferred for future messages.
+Updated priority:
+- If tg_username is known, try Telegram via username first and remember it as preferred on success.
+- Without tg_username, try WhatsApp by phone first, fallback to Telegram by phone.
+- Leads always use the Telegram leads channel (username first when available).
+- Any "messenger not connected" error flips preference to the fallback channel for future sends.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import os
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 import asyncpg
 
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_CHANNEL: ChannelKind = "clients_tg"
 WHATSAPP_CHANNEL: ChannelKind = "clients_wa"
+LEADS_CHANNEL: ChannelKind = "leads"
 
 FOLLOWUP_DELAY_SECONDS = 24 * 60 * 60  # 24h
 WA_FOLLOWUP_DISABLED = os.getenv("WA_FOLLOWUP_DISABLED", "").lower() in {"1", "true", "yes", "on"}
@@ -36,7 +37,9 @@ class ClientContact:
     client_id: int
     phone: str
     name: str
+    tg_username: str | None = None
     preferred_channel: ChannelKind | None = None
+    recipient_kind: str = "client"
 
 
 @dataclass(slots=True)
@@ -45,30 +48,39 @@ class SendResult:
     response: Mapping[str, object] | None = None
 
 
+@dataclass(slots=True)
+class ChannelAttempt:
+    channel: ChannelKind
+    address_kind: Literal["phone", "username"] = "phone"
+
+
 async def send_with_rules(
     conn: asyncpg.Connection,
     contact: ClientContact,
     *,
     text: str,
 ) -> SendResult:
-    channels = _build_channel_sequence(contact.preferred_channel)
+    attempts = _build_channel_sequence(contact)
     last_error: Exception | None = None
-    for channel in channels:
+    for attempt in attempts:
+        channel = attempt.channel
         try:
             response = await send_text_to_phone(
                 channel,
                 phone=contact.phone,
                 name=contact.name,
                 text=text,
+                tg_username=contact.tg_username,
+                use_username=attempt.address_kind == "username",
             )
-            await _set_preferred_channel(conn, contact.client_id, channel)
-            _cancel_followup(contact.client_id)
+            if contact.recipient_kind == "client":
+                await _set_preferred_channel(conn, contact.client_id, channel)
+                _cancel_followup(contact.client_id)
             logger.info("Message sent via %s to client %s", channel, contact.client_id)
             return SendResult(channel=channel, response=response if isinstance(response, Mapping) else None)
         except WahelpAPIError as exc:
-            if channel == TELEGRAM_CHANNEL and _is_messenger_missing_error(exc):
-                await _set_preferred_channel(conn, contact.client_id, WHATSAPP_CHANNEL)
-                contact.preferred_channel = WHATSAPP_CHANNEL
+            if _is_messenger_missing_error(exc):
+                await _handle_messenger_missing(conn, contact, channel)
             logger.warning("Send via %s failed for client %s: %s", channel, contact.client_id, exc)
             last_error = exc
             continue
@@ -77,13 +89,46 @@ async def send_with_rules(
     raise RuntimeError("All Wahelp channels failed without exception")
 
 
-def _build_channel_sequence(preferred: ChannelKind | None) -> Sequence[ChannelKind]:
+def _build_channel_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
+    if contact.recipient_kind == "lead":
+        return _build_lead_sequence(contact)
+    attempts: list[ChannelAttempt] = []
+    if contact.tg_username:
+        attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="username"))
+    attempts.extend(_build_client_phone_attempts(contact))
+    return tuple(_deduplicate_attempts(attempts))
+
+
+def _build_lead_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
+    attempts: list[ChannelAttempt] = []
+    if contact.tg_username:
+        attempts.append(ChannelAttempt(channel=LEADS_CHANNEL, address_kind="username"))
+    attempts.append(ChannelAttempt(channel=LEADS_CHANNEL, address_kind="phone"))
+    return tuple(_deduplicate_attempts(attempts))
+
+
+def _build_client_phone_attempts(contact: ClientContact) -> list[ChannelAttempt]:
+    order: Sequence[ChannelKind]
+    preferred = contact.preferred_channel
     if preferred == WHATSAPP_CHANNEL:
-        return (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
-    if preferred == TELEGRAM_CHANNEL:
-        return (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
-    # default priority: Telegram first
-    return (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
+        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
+    elif preferred == TELEGRAM_CHANNEL:
+        order = (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
+    else:
+        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
+    return [ChannelAttempt(channel=chan, address_kind="phone") for chan in order]
+
+
+def _deduplicate_attempts(attempts: Sequence[ChannelAttempt]) -> list[ChannelAttempt]:
+    seen: set[tuple[ChannelKind, str]] = set()
+    result: list[ChannelAttempt] = []
+    for attempt in attempts:
+        key = (attempt.channel, attempt.address_kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(attempt)
+    return result
 
 
 async def _set_preferred_channel(conn: asyncpg.Connection, client_id: int, channel: ChannelKind) -> None:
@@ -145,3 +190,20 @@ async def schedule_followup_for_client(
 def _is_messenger_missing_error(error: WahelpAPIError) -> bool:
     text = str(error)
     return "Мессенджер не подключен" in text or "messenger" in text.lower() and "not connected" in text.lower()
+
+
+async def _handle_messenger_missing(
+    conn: asyncpg.Connection,
+    contact: ClientContact,
+    failed_channel: ChannelKind,
+) -> None:
+    if contact.recipient_kind != "client":
+        return
+    if failed_channel == TELEGRAM_CHANNEL:
+        fallback = WHATSAPP_CHANNEL
+    elif failed_channel == WHATSAPP_CHANNEL:
+        fallback = TELEGRAM_CHANNEL
+    else:
+        return
+    await _set_preferred_channel(conn, contact.client_id, fallback)
+    contact.preferred_channel = fallback
