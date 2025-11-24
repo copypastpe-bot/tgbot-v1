@@ -295,6 +295,12 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
     )
     await conn.execute(
         """
+        ALTER TABLE leads
+        ADD COLUMN IF NOT EXISTS wahelp_user_id_leads bigint
+        """
+    )
+    await conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS lead_logs (
             id bigserial PRIMARY KEY,
             lead_id bigint NOT NULL REFERENCES leads(id) ON DELETE CASCADE,

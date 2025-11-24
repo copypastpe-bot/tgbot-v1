@@ -93,6 +93,10 @@ async def ensure_notification_schema(conn: asyncpg.Connection) -> None:
         """
         ALTER TABLE clients
         ADD COLUMN IF NOT EXISTS wahelp_preferred_channel text;
+        ALTER TABLE clients
+        ADD COLUMN IF NOT EXISTS wahelp_user_id_tg bigint;
+        ALTER TABLE clients
+        ADD COLUMN IF NOT EXISTS wahelp_user_id_wa bigint;
         """
     )
     await conn.execute(
