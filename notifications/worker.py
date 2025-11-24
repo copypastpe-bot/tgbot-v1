@@ -93,6 +93,10 @@ class NotificationWorker:
             async with self.pool.acquire() as conn:
                 await cancel_outbox_entry(conn, entry, "notifications disabled")
             return
+        if entry.client_requires_connection:
+            async with self.pool.acquire() as conn:
+                await cancel_outbox_entry(conn, entry, "wahelp requires connection")
+            return
         if not entry.client_phone:
             async with self.pool.acquire() as conn:
                 await cancel_outbox_entry(conn, entry, "client phone missing")
@@ -102,8 +106,10 @@ class NotificationWorker:
             client_id=entry.client_id,
             phone=entry.client_phone,
             name=(entry.client_name or "Клиент"),
-            tg_username=entry.client_tg_username,
             preferred_channel=entry.client_preferred_channel,
+            wa_user_id=entry.client_user_id_wa,
+            tg_user_id=entry.client_user_id_tg,
+            requires_connection=entry.client_requires_connection,
             recipient_kind=entry.recipient_kind,
         )
         message_text = render_template(entry.template, entry.payload)

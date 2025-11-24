@@ -42,6 +42,9 @@ class NotificationOutboxEntry:
     client_name: str | None
     client_preferred_channel: str | None
     client_tg_username: str | None
+    client_user_id_wa: int | None
+    client_user_id_tg: int | None
+    client_requires_connection: bool
     notifications_enabled: bool
 
 
@@ -97,6 +100,29 @@ async def ensure_notification_schema(conn: asyncpg.Connection) -> None:
         ADD COLUMN IF NOT EXISTS wahelp_user_id_tg bigint;
         ALTER TABLE clients
         ADD COLUMN IF NOT EXISTS wahelp_user_id_wa bigint;
+        ALTER TABLE clients
+        ADD COLUMN IF NOT EXISTS wahelp_requires_connection boolean NOT NULL DEFAULT false;
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wahelp_delivery_issues (
+            id bigserial PRIMARY KEY,
+            entity_kind text NOT NULL,
+            entity_id bigint NOT NULL,
+            channel text,
+            phone text,
+            reason text NOT NULL,
+            details text,
+            created_at timestamptz NOT NULL DEFAULT NOW(),
+            resolved_at timestamptz
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_wahelp_delivery_issues_entity
+        ON wahelp_delivery_issues(entity_kind, entity_id, COALESCE(channel,''));
         """
     )
     await conn.execute(
@@ -236,7 +262,7 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
     if client_ids:
         client_rows = await conn.fetch(
             """
-            SELECT id, full_name, phone, wahelp_preferred_channel, tg_username, COALESCE(notifications_enabled, true) AS notifications_enabled
+            SELECT id, full_name, phone, wahelp_preferred_channel, tg_username, wahelp_user_id_wa, wahelp_user_id_tg, COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection, COALESCE(notifications_enabled, true) AS notifications_enabled
             FROM clients
             WHERE id = ANY($1::int[])
             """,
@@ -248,6 +274,9 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 "phone": crow["phone"],
                 "preferred": crow["wahelp_preferred_channel"],
                 "tg_username": crow["tg_username"],
+                "user_id_wa": crow["wahelp_user_id_wa"],
+                "user_id_tg": crow["wahelp_user_id_tg"],
+                "requires_connection": bool(crow["wahelp_requires_connection"]),
                 "enabled": bool(crow["notifications_enabled"]),
             }
     entries: list[NotificationOutboxEntry] = []
@@ -271,6 +300,9 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 client_name=client_info.get("full_name"),
                 client_preferred_channel=client_info.get("preferred"),
                 client_tg_username=client_info.get("tg_username"),
+                client_user_id_wa=client_info.get("user_id_wa"),
+                client_user_id_tg=client_info.get("user_id_tg"),
+                client_requires_connection=client_info.get("requires_connection", False),
                 notifications_enabled=client_info.get("enabled", True),
             )
         )

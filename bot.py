@@ -108,7 +108,7 @@ from notifications import (
     load_notification_rules,
     start_wahelp_webhook,
 )
-from crm import send_text_to_phone, WahelpAPIError
+from crm import ClientContact, send_with_rules, WahelpAPIError
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
 # Разрешаем пробелы, дефисы и скобки в пользовательском вводе
@@ -296,7 +296,8 @@ async def ensure_promo_schema(conn: asyncpg.Connection) -> None:
     await conn.execute(
         """
         ALTER TABLE leads
-        ADD COLUMN IF NOT EXISTS wahelp_user_id_leads bigint
+        ADD COLUMN IF NOT EXISTS wahelp_user_id_leads bigint,
+        ADD COLUMN IF NOT EXISTS wahelp_requires_connection boolean NOT NULL DEFAULT false
         """
     )
     await conn.execute(
@@ -524,13 +525,17 @@ async def _send_lead_auto_reply(
     wahelp_message_id: str | None = None
     try:
         name = lead_row["full_name"] or lead_row["name"] or "Лид"
-        resp = await send_text_to_phone(
-            channel_kind,
+        contact = ClientContact(
+            client_id=lead_row["id"],
             phone=lead_row["phone"],
             name=name,
-            text=text,
+            preferred_channel=channel_kind,
+            recipient_kind="lead",
+            lead_user_id=lead_row.get("wahelp_user_id_leads"),
+            requires_connection=bool(lead_row.get("wahelp_requires_connection")),
         )
-        payload = resp if isinstance(resp, Mapping) else None
+        result = await send_with_rules(conn, contact, text=text)
+        payload = result.response if isinstance(result.response, Mapping) else None
         wahelp_message_id = _extract_wahelp_message_id(payload)
     except Exception as exc:  # noqa: BLE001
         status = "failed"
@@ -565,7 +570,9 @@ def _get_leads_campaign_text(campaign: str, variant: int) -> str:
 async def _select_leads_for_campaign(conn: asyncpg.Connection, *, campaign: str, limit: int) -> list[asyncpg.Record]:
     return await conn.fetch(
         """
-        SELECT id, phone, full_name, name, promo_last_sent_at
+        SELECT id, phone, full_name, name, promo_last_sent_at,
+               wahelp_user_id_leads,
+               COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection
         FROM leads
         WHERE NOT COALESCE(promo_stop, false)
           AND phone IS NOT NULL
@@ -588,101 +595,104 @@ async def _send_leads_campaign_batch() -> None:
         return
     async with pool.acquire() as conn:
         leads = await _select_leads_for_campaign(conn, campaign=campaign, limit=LEADS_MAX_PER_DAY)
-    if not leads:
-        logger.info("No leads to send for campaign %s", campaign)
-        return
-    sent = delivered = read = failed = 0
-    responses_interest = responses_stop = responses_other = 0
-    today_start_msk = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_start_utc = today_start_msk.astimezone(timezone.utc)
-    async with pool.acquire() as conn:
+        if not leads:
+            logger.info("No leads to send for campaign %s", campaign)
+            return
+        sent = delivered = read = failed = 0
+        responses_interest = responses_stop = responses_other = 0
+        today_start_msk = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_utc = today_start_msk.astimezone(timezone.utc)
         sent_today = await conn.fetchval(
             "SELECT COUNT(*) FROM lead_logs WHERE campaign=$1 AND status='sent' AND sent_at >= $2",
             campaign,
             today_start_utc,
         )
-    rate_limits_reached = 0
-    for idx, lead in enumerate(leads):
-        variant = 1 if sent_today % 2 == 0 else 2
-        sent_today += 1
-        text = _get_leads_campaign_text(campaign, variant)
-        name = lead["full_name"] or lead["name"] or "Клиент"
-        phone = lead["phone"]
-        wahelp_payload = None
-        wahelp_message_id = None
-        try:
-            resp = await send_text_to_phone(
-                "leads",
+        rate_limits_reached = 0
+        for idx, lead in enumerate(leads):
+            if lead.get("wahelp_requires_connection"):
+                logger.info("Skipping lead %s due to missing Wahelp connection", lead["id"])
+                failed += 1
+                continue
+            variant = 1 if sent_today % 2 == 0 else 2
+            sent_today += 1
+            text = _get_leads_campaign_text(campaign, variant)
+            name = lead["full_name"] or lead["name"] or "Клиент"
+            phone = lead["phone"]
+            wahelp_payload = None
+            wahelp_message_id = None
+            try:
+            contact = ClientContact(
+                client_id=lead["id"],
                 phone=phone,
                 name=name,
-                text=text,
+                preferred_channel="leads",
+                recipient_kind="lead",
+                lead_user_id=lead.get("wahelp_user_id_leads"),
+                requires_connection=bool(lead.get("wahelp_requires_connection")),
             )
-            wahelp_payload = resp if isinstance(resp, Mapping) else None
+            result = await send_with_rules(conn, contact, text=text)
+            wahelp_payload = result.response if isinstance(result.response, Mapping) else None
             wahelp_message_id = _extract_wahelp_message_id(wahelp_payload)
             sent += 1
-            async with pool.acquire() as conn:
-                await _log_lead_send(
-                    conn,
-                    lead_id=lead["id"],
-                    campaign=campaign,
-                    variant=variant,
-                    wahelp_message_id=wahelp_message_id,
-                    status="sent",
-                )
-                await conn.execute(
-                    """
-                    UPDATE leads
-                    SET promo_last_sent_at = NOW(),
-                        promo_last_campaign = $2,
-                        promo_last_variant = $3,
-                        last_updated = NOW()
-                    WHERE id = $1
-                    """,
-                    lead["id"],
-                    campaign,
-                    variant,
-                )
-        except WahelpAPIError as exc:
+            await _log_lead_send(
+                conn,
+                lead_id=lead["id"],
+                campaign=campaign,
+                variant=variant,
+                wahelp_message_id=wahelp_message_id,
+                status="sent",
+            )
+            await conn.execute(
+                """
+                UPDATE leads
+                SET promo_last_sent_at = NOW(),
+                    promo_last_campaign = $2,
+                    promo_last_variant = $3,
+                    last_updated = NOW()
+                WHERE id = $1
+                """,
+                lead["id"],
+                campaign,
+                variant,
+            )
+            except WahelpAPIError as exc:
             error_text = str(exc)
             if "Too Many Requests" in error_text or "Слишком много попыток" in error_text:
                 rate_limits_reached += 1
                 logger.warning("Lead promo rate limited, stopping batch: %s", exc)
-                async with pool.acquire() as conn:
-                    await _log_lead_send(
-                        conn,
-                        lead_id=lead["id"],
-                        campaign=campaign,
-                        variant=variant,
-                        wahelp_message_id=wahelp_message_id,
-                        status="failed",
-                    )
+                await _log_lead_send(
+                    conn,
+                    lead_id=lead["id"],
+                    campaign=campaign,
+                    variant=variant,
+                    wahelp_message_id=wahelp_message_id,
+                    status="failed",
+                )
                 break
             failed += 1
             logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
-            async with pool.acquire() as conn:
-                await _log_lead_send(
-                    conn,
-                    lead_id=lead["id"],
-                    campaign=campaign,
-                    variant=variant,
-                    wahelp_message_id=wahelp_message_id,
-                    status="failed",
-                )
-        except Exception as exc:  # noqa: BLE001
+            await _log_lead_send(
+                conn,
+                lead_id=lead["id"],
+                campaign=campaign,
+                variant=variant,
+                wahelp_message_id=wahelp_message_id,
+                status="failed",
+            )
+            except Exception as exc:  # noqa: BLE001
             failed += 1
             logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
-            async with pool.acquire() as conn:
-                await _log_lead_send(
-                    conn,
-                    lead_id=lead["id"],
-                    campaign=campaign,
-                    variant=variant,
-                    wahelp_message_id=wahelp_message_id,
-                    status="failed",
-                )
+            await _log_lead_send(
+                conn,
+                lead_id=lead["id"],
+                campaign=campaign,
+                variant=variant,
+                wahelp_message_id=wahelp_message_id,
+                status="failed",
+            )
 
-        if idx < len(leads) - 1:
-            await asyncio.sleep(LEADS_RATE_LIMIT_INTERVAL)
+            if idx < len(leads) - 1:
+                await asyncio.sleep(LEADS_RATE_LIMIT_INTERVAL)
 
     # Подсчёт статусов/реакций за сегодня
     today_start_msk = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1092,14 +1102,22 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
 
     async with pool.acquire() as conn:
         client = await conn.fetchrow(
-            "SELECT id, full_name, phone FROM clients WHERE phone_digits=$1 LIMIT 1",
+            """
+            SELECT id, full_name, phone, wahelp_preferred_channel,
+                   wahelp_user_id_wa, wahelp_user_id_tg,
+                   COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection
+            FROM clients
+            WHERE phone_digits=$1
+            LIMIT 1
+            """,
             digits,
         )
         lead = None
         if client is None:
             lead = await conn.fetchrow(
                 """
-                SELECT id, full_name, name, phone
+                SELECT id, full_name, name, phone, wahelp_user_id_leads,
+                       COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection
                 FROM leads
                 WHERE regexp_replace(COALESCE(phone,''), '[^0-9]+', '', 'g') = $1
                 LIMIT 1
@@ -1200,12 +1218,16 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                 client["id"],
             )
             try:
-                await send_text_to_phone(
-                    channel_kind,
+                contact = ClientContact(
+                    client_id=client["id"],
                     phone=client["phone"],
                     name=client["full_name"] or "Клиент",
-                    text=STOP_AUTO_REPLY,
+                    preferred_channel=channel_kind or client.get("wahelp_preferred_channel"),
+                    wa_user_id=client.get("wahelp_user_id_wa"),
+                    tg_user_id=client.get("wahelp_user_id_tg"),
+                    requires_connection=bool(client.get("wahelp_requires_connection")),
                 )
+                await send_with_rules(conn, contact, text=STOP_AUTO_REPLY)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to send stop auto-reply to client %s: %s", client["id"], exc)
             return True
@@ -1224,12 +1246,16 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             )
             await _notify_admins_about_promo_interest(client, normalized_text)
             try:
-                await send_text_to_phone(
-                    channel_kind,
+                contact = ClientContact(
+                    client_id=client["id"],
                     phone=client["phone"],
                     name=client["full_name"] or "Клиент",
-                    text=CLIENT_PROMO_INTEREST_REPLY,
+                    preferred_channel=channel_kind or client.get("wahelp_preferred_channel"),
+                    wa_user_id=client.get("wahelp_user_id_wa"),
+                    tg_user_id=client.get("wahelp_user_id_tg"),
+                    requires_connection=bool(client.get("wahelp_requires_connection")),
                 )
+                await send_with_rules(conn, contact, text=CLIENT_PROMO_INTEREST_REPLY)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to send interest auto-reply to client %s: %s", client["id"], exc)
             return True
