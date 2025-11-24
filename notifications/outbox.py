@@ -360,26 +360,60 @@ async def cancel_outbox_entry(conn: asyncpg.Connection, entry: NotificationOutbo
     )
 
 
+_MESSAGE_ID_KEYS: tuple[str, ...] = (
+    "message_id",
+    "messageid",
+    "message_uuid",
+    "messageuuid",
+    "wahelp_id",
+    "wahelpid",
+    "msg_id",
+    "msgid",
+)
+
+
+def _extract_id_from_mapping(
+    data: Mapping[str, Any] | None,
+    *,
+    allow_plain_id: bool = False,
+) -> str | None:
+    if not isinstance(data, Mapping):
+        return None
+    for key, value in data.items():
+        if value is None:
+            continue
+        normalized = key.lower().replace("-", "_")
+        if normalized in _MESSAGE_ID_KEYS:
+            return str(value)
+    if allow_plain_id:
+        plain_id = data.get("id")
+        if plain_id:
+            return str(plain_id)
+    return None
+
+
 def extract_provider_message_id(payload: Mapping[str, Any] | None) -> str | None:
     if not isinstance(payload, Mapping):
         return None
-    candidates: Sequence[str] = ("message_id", "id", "wahelp_id")
+    direct = _extract_id_from_mapping(payload)
+    if direct:
+        return direct
     data = payload.get("data")
+    data_id = _extract_id_from_mapping(data)
+    if data_id:
+        return data_id
+    message_section = None
     if isinstance(data, Mapping):
-        for key in candidates:
-            val = data.get(key)
-            if val:
-                return str(val)
-        message = data.get("message")
-        if isinstance(message, Mapping):
-            for key in candidates:
-                val = message.get(key)
-                if val:
-                    return str(val)
-    for key in candidates:
-        val = payload.get(key)
-        if val:
-            return str(val)
+        message_section = data.get("message")
+        msg_direct = _extract_id_from_mapping(message_section, allow_plain_id=True)
+        if msg_direct:
+            return msg_direct
+    # Sometimes Wahelp nests payload deeper inside message -> data -> payload
+    if isinstance(message_section, Mapping):
+        inner = message_section.get("payload")
+        inner_id = _extract_id_from_mapping(inner, allow_plain_id=True)
+        if inner_id:
+            return inner_id
     return None
 
 
@@ -477,12 +511,16 @@ async def apply_provider_status_update(
                 handled_any = True
         return handled_any
 
+    event_name = str(payload.get("event") or payload.get("type") or "")
     message_id = extract_provider_message_id(payload)
     if not message_id:
-        logger.debug("Webhook payload missing message id: %s", payload)
+        logger.warning(
+            "Webhook payload missing message id. event=%s payload=%s",
+            event_name,
+            payload,
+        )
         return False
 
-    event_name = str(payload.get("event") or payload.get("type") or "")
     status_value = None
     status_time = None
     channel_alias = None
