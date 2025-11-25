@@ -789,7 +789,9 @@ async def _send_leads_campaign_batch() -> None:
         f"Failed: {failed}",
     ]
     try:
-        await bot.send_message(MARKETING_LOG_CHAT_ID, "\n".join(summary_lines))
+        target_chat = LOGS_CHAT_ID or MARKETING_LOG_CHAT_ID
+        if target_chat:
+            await bot.send_message(target_chat, "\n".join(summary_lines))
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to send marketing summary: %s", exc)
 
