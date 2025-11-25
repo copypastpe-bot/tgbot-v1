@@ -15,7 +15,7 @@ import os
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Literal, Mapping, Sequence
+from typing import Awaitable, Callable, Literal, Mapping, Sequence
 
 import asyncpg
 
@@ -57,6 +57,16 @@ class ChannelAttempt:
     channel: ChannelKind
     address_kind: Literal["user_id", "phone"] = "phone"
     user_id: int | None = None
+
+
+MissingMessengerLogger = Callable[[ClientContact, ChannelKind, str], Awaitable[None]]
+_missing_logger: MissingMessengerLogger | None = None
+
+
+def set_missing_messenger_logger(callback: MissingMessengerLogger | None) -> None:
+    """Register optional logger that reports contacts without messengers."""
+    global _missing_logger
+    _missing_logger = callback
 
 
 async def send_with_rules(
@@ -281,6 +291,7 @@ async def _mark_requires_connection(
     reason: str,
     channel: ChannelKind,
 ) -> None:
+    already_flagged = contact.requires_connection
     if contact.recipient_kind == "lead":
         await conn.execute(
             "UPDATE leads SET wahelp_requires_connection=true, last_updated = NOW() WHERE id=$1",
@@ -305,3 +316,12 @@ async def _mark_requires_connection(
         reason[:200],
     )
     contact.requires_connection = True
+    if not already_flagged and _missing_logger is not None:
+        try:
+            await _missing_logger(contact, channel, reason)
+        except Exception:  # pragma: no cover - logging best-effort
+            logger.exception(
+                "Failed to notify about missing messenger for %s %s",
+                contact.recipient_kind,
+                contact.client_id,
+            )

@@ -108,7 +108,13 @@ from notifications import (
     load_notification_rules,
     start_wahelp_webhook,
 )
-from crm import ClientContact, send_with_rules, WahelpAPIError
+from crm import (
+    ChannelKind,
+    ClientContact,
+    WahelpAPIError,
+    send_with_rules,
+    set_missing_messenger_logger,
+)
 
 # Проверка формата телефона: допускаем +7XXXXXXXXXX, 8XXXXXXXXXX или 9XXXXXXXXX
 # Разрешаем пробелы, дефисы и скобки в пользовательском вводе
@@ -132,6 +138,7 @@ for part in re.split(r"[ ,;]+", _admin_ids_env.strip()):
 # chat ids for notifications (2 чата: «Заказы подтверждения» и «Ракета деньги»)
 ORDERS_CONFIRM_CHAT_ID = int(os.getenv("ORDERS_CONFIRM_CHAT_ID", "0") or "0")  # Заказы подтверждения (в т.ч. З/П)
 MONEY_FLOW_CHAT_ID     = int(os.getenv("MONEY_FLOW_CHAT_ID", "0") or "0")      # «Ракета деньги»
+LOGS_CHAT_ID           = int(os.getenv("LOGS_CHAT_ID", "0") or "0")
 WAHELP_WEBHOOK_HOST = os.getenv("WAHELP_WEBHOOK_HOST", "0.0.0.0")
 WAHELP_WEBHOOK_PORT = int(os.getenv("WAHELP_WEBHOOK_PORT", "0") or "0")
 WAHELP_WEBHOOK_TOKEN = os.getenv("WAHELP_WEBHOOK_TOKEN")
@@ -177,6 +184,41 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+
+async def _log_missing_messenger(contact: ClientContact, channel: ChannelKind, reason: str) -> None:
+    if LOGS_CHAT_ID == 0:
+        return
+    phone = contact.phone or "номер не указан"
+    name = contact.name or "Без имени"
+    client_lines: list[str] = []
+    lead_lines: list[str] = []
+    if contact.recipient_kind == "lead":
+        lead_lines.append(phone)
+    else:
+        client_lines.append(f"{phone} / {name}")
+
+    def _append_section(title: str, entries: list[str]) -> list[str]:
+        block = [title]
+        block.extend(entries or ["—"])
+        return block
+
+    lines: list[str] = []
+    lines.extend(_append_section("У клиентов нет месенджера:", client_lines))
+    lines.append("")
+    lines.extend(_append_section("У лидов нет месенджера:", lead_lines))
+    if reason:
+        lines.append("")
+        lines.append(f"Причина: {reason}")
+    lines.append(f"Канал: {channel}")
+    try:
+        await bot.send_message(LOGS_CHAT_ID, "\n".join(lines))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to send Wahelp delivery log: %s", exc)
+
+
+set_missing_messenger_logger(_log_missing_messenger)
+
 BASE_DIR = Path(__file__).resolve().parent
 NOTIFICATION_RULES_PATH = BASE_DIR / "docs" / "notification_rules.json"
 
