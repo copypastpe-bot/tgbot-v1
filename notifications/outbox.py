@@ -41,7 +41,6 @@ class NotificationOutboxEntry:
     client_phone: str | None
     client_name: str | None
     client_preferred_channel: str | None
-    client_tg_username: str | None
     client_user_id_wa: int | None
     client_user_id_tg: int | None
     client_requires_connection: bool
@@ -262,7 +261,7 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
     if client_ids:
         client_rows = await conn.fetch(
             """
-            SELECT id, full_name, phone, wahelp_preferred_channel, tg_username, wahelp_user_id_wa, wahelp_user_id_tg, COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection, COALESCE(notifications_enabled, true) AS notifications_enabled
+            SELECT id, full_name, phone, wahelp_preferred_channel, wahelp_user_id_wa, wahelp_user_id_tg, COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection, COALESCE(notifications_enabled, true) AS notifications_enabled
             FROM clients
             WHERE id = ANY($1::int[])
             """,
@@ -273,7 +272,6 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 "full_name": crow["full_name"],
                 "phone": crow["phone"],
                 "preferred": crow["wahelp_preferred_channel"],
-                "tg_username": crow["tg_username"],
                 "user_id_wa": crow["wahelp_user_id_wa"],
                 "user_id_tg": crow["wahelp_user_id_tg"],
                 "requires_connection": bool(crow["wahelp_requires_connection"]),
@@ -299,7 +297,6 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 client_phone=client_info.get("phone"),
                 client_name=client_info.get("full_name"),
                 client_preferred_channel=client_info.get("preferred"),
-                client_tg_username=client_info.get("tg_username"),
                 client_user_id_wa=client_info.get("user_id_wa"),
                 client_user_id_tg=client_info.get("user_id_tg"),
                 client_requires_connection=client_info.get("requires_connection", False),
