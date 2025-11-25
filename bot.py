@@ -621,45 +621,56 @@ async def _send_leads_campaign_batch() -> None:
             wahelp_payload = None
             wahelp_message_id = None
             try:
-            contact = ClientContact(
-                client_id=lead["id"],
-                phone=phone,
-                name=name,
-                preferred_channel="leads",
-                recipient_kind="lead",
-                lead_user_id=lead.get("wahelp_user_id_leads"),
-                requires_connection=bool(lead.get("wahelp_requires_connection")),
-            )
-            result = await send_with_rules(conn, contact, text=text)
-            wahelp_payload = result.response if isinstance(result.response, Mapping) else None
-            wahelp_message_id = _extract_wahelp_message_id(wahelp_payload)
-            sent += 1
-            await _log_lead_send(
-                conn,
-                lead_id=lead["id"],
-                campaign=campaign,
-                variant=variant,
-                wahelp_message_id=wahelp_message_id,
-                status="sent",
-            )
-            await conn.execute(
-                """
-                UPDATE leads
-                SET promo_last_sent_at = NOW(),
-                    promo_last_campaign = $2,
-                    promo_last_variant = $3,
-                    last_updated = NOW()
-                WHERE id = $1
-                """,
-                lead["id"],
-                campaign,
-                variant,
-            )
+                contact = ClientContact(
+                    client_id=lead["id"],
+                    phone=phone,
+                    name=name,
+                    preferred_channel="leads",
+                    recipient_kind="lead",
+                    lead_user_id=lead.get("wahelp_user_id_leads"),
+                    requires_connection=bool(lead.get("wahelp_requires_connection")),
+                )
+                result = await send_with_rules(conn, contact, text=text)
+                wahelp_payload = result.response if isinstance(result.response, Mapping) else None
+                wahelp_message_id = _extract_wahelp_message_id(wahelp_payload)
+                sent += 1
+                await _log_lead_send(
+                    conn,
+                    lead_id=lead["id"],
+                    campaign=campaign,
+                    variant=variant,
+                    wahelp_message_id=wahelp_message_id,
+                    status="sent",
+                )
+                await conn.execute(
+                    """
+                    UPDATE leads
+                    SET promo_last_sent_at = NOW(),
+                        promo_last_campaign = $2,
+                        promo_last_variant = $3,
+                        last_updated = NOW()
+                    WHERE id = $1
+                    """,
+                    lead["id"],
+                    campaign,
+                    variant,
+                )
             except WahelpAPIError as exc:
-            error_text = str(exc)
-            if "Too Many Requests" in error_text or "Слишком много попыток" in error_text:
-                rate_limits_reached += 1
-                logger.warning("Lead promo rate limited, stopping batch: %s", exc)
+                error_text = str(exc)
+                if "Too Many Requests" in error_text or "Слишком много попыток" in error_text:
+                    rate_limits_reached += 1
+                    logger.warning("Lead promo rate limited, stopping batch: %s", exc)
+                    await _log_lead_send(
+                        conn,
+                        lead_id=lead["id"],
+                        campaign=campaign,
+                        variant=variant,
+                        wahelp_message_id=wahelp_message_id,
+                        status="failed",
+                    )
+                    break
+                failed += 1
+                logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
                 await _log_lead_send(
                     conn,
                     lead_id=lead["id"],
@@ -668,28 +679,17 @@ async def _send_leads_campaign_batch() -> None:
                     wahelp_message_id=wahelp_message_id,
                     status="failed",
                 )
-                break
-            failed += 1
-            logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
-            await _log_lead_send(
-                conn,
-                lead_id=lead["id"],
-                campaign=campaign,
-                variant=variant,
-                wahelp_message_id=wahelp_message_id,
-                status="failed",
-            )
             except Exception as exc:  # noqa: BLE001
-            failed += 1
-            logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
-            await _log_lead_send(
-                conn,
-                lead_id=lead["id"],
-                campaign=campaign,
-                variant=variant,
-                wahelp_message_id=wahelp_message_id,
-                status="failed",
-            )
+                failed += 1
+                logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
+                await _log_lead_send(
+                    conn,
+                    lead_id=lead["id"],
+                    campaign=campaign,
+                    variant=variant,
+                    wahelp_message_id=wahelp_message_id,
+                    status="failed",
+                )
 
             if idx < len(leads) - 1:
                 await asyncio.sleep(LEADS_RATE_LIMIT_INTERVAL)
