@@ -432,7 +432,7 @@ def extract_provider_message_id(payload: Mapping[str, Any] | None) -> str | None
     if direct:
         return direct
     data = payload.get("data")
-    data_id = _extract_id_from_mapping(data)
+    data_id = _extract_id_from_mapping(data, allow_plain_id=True)
     if data_id:
         return data_id
     message_section = None
