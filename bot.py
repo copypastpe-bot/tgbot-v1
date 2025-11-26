@@ -701,7 +701,7 @@ async def _send_leads_campaign_batch() -> None:
                 error_text = str(exc)
                 if "Too Many Requests" in error_text or "Слишком много попыток" in error_text:
                     rate_limits_reached += 1
-                    logger.warning("Lead promo rate limited, stopping batch: %s", exc)
+                    logger.warning("Lead promo rate limited (lead=%s): %s", lead["id"], exc)
                     await _log_lead_send(
                         conn,
                         lead_id=lead["id"],
@@ -710,7 +710,8 @@ async def _send_leads_campaign_batch() -> None:
                         wahelp_message_id=wahelp_message_id,
                         status="failed",
                     )
-                    break
+                    failed += 1
+                    continue
                 failed += 1
                 logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
                 await _log_lead_send(
