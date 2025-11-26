@@ -161,8 +161,8 @@ PROMO_BONUS_TTL_DAYS = 365
 PROMO_DAILY_LIMIT = 30
 LEADS_PROMO_CAMPAIGN = os.getenv("LEADS_PROMO_CAMPAIGN", "week1")
 LEADS_MAX_PER_DAY = int(os.getenv("LEADS_MAX_PER_DAY", "20"))
-LEADS_RATE_LIMIT_INTERVAL = int(os.getenv("LEADS_RATE_LIMIT_INTERVAL", 60))  # seconds between lead messages
-LEADS_SEND_START_HOUR = 10  # MSK
+LEADS_RATE_LIMIT_INTERVAL = int(os.getenv("LEADS_RATE_LIMIT_INTERVAL", 60))  # legacy env; random interval is used instead
+LEADS_SEND_START_HOUR = 14  # MSK
 LEADS_MIN_INTERVAL_SEC = 60
 LEADS_MAX_INTERVAL_SEC = 600
 CHANNEL_ALIAS_TO_KIND = {
@@ -592,21 +592,20 @@ async def _send_lead_auto_reply(
     )
 
 
-async def _pick_leads_variant(conn: asyncpg.Connection, campaign: str) -> int:
-    sent_today = await conn.fetchval(
-        """
-        SELECT COUNT(*) FROM lead_logs
-        WHERE campaign=$1 AND status='sent' AND sent_at >= (NOW() AT TIME ZONE 'UTC' - INTERVAL '0 seconds')
-        """,
-        campaign,
-    )
-    return 1 if sent_today % 2 == 0 else 2
-
-
 def _get_leads_campaign_text(campaign: str, variant: int) -> str:
     variants = LEADS_PROMO_CAMPAIGNS.get(campaign) or []
     idx = max(1, min(len(variants), variant)) - 1
     return variants[idx]
+
+
+def _random_leads_interval() -> int:
+    return random.randint(LEADS_MIN_INTERVAL_SEC, LEADS_MAX_INTERVAL_SEC)
+
+
+async def _sleep_between_leads(current_index: int, total: int) -> None:
+    if current_index >= total - 1:
+        return
+    await asyncio.sleep(_random_leads_interval())
 
 
 async def _select_leads_for_campaign(conn: asyncpg.Connection, *, campaign: str, limit: int) -> list[asyncpg.Record]:
@@ -631,10 +630,13 @@ async def _select_leads_for_campaign(conn: asyncpg.Connection, *, campaign: str,
 async def _send_leads_campaign_batch() -> None:
     if pool is None:
         return
+    available_campaigns = list(LEADS_PROMO_CAMPAIGNS.keys())
+    if not available_campaigns:
+        logger.warning("No leads promo campaigns defined")
+        return
     campaign = LEADS_PROMO_CAMPAIGN
     if campaign not in LEADS_PROMO_CAMPAIGNS:
-        logger.warning("Unknown leads campaign: %s", campaign)
-        return
+        campaign = available_campaigns[0]
     async with pool.acquire() as conn:
         leads = await _select_leads_for_campaign(conn, campaign=campaign, limit=LEADS_MAX_PER_DAY)
         if not leads:
@@ -644,20 +646,17 @@ async def _send_leads_campaign_batch() -> None:
         responses_interest = responses_stop = responses_other = 0
         today_start_msk = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
         today_start_utc = today_start_msk.astimezone(timezone.utc)
-        sent_today = await conn.fetchval(
-            "SELECT COUNT(*) FROM lead_logs WHERE campaign=$1 AND status='sent' AND sent_at >= $2",
-            campaign,
-            today_start_utc,
-        )
-        rate_limits_reached = 0
+        total_leads = len(leads)
         for idx, lead in enumerate(leads):
             if lead.get("wahelp_requires_connection"):
                 logger.info("Skipping lead %s due to missing Wahelp connection", lead["id"])
                 failed += 1
+                await _sleep_between_leads(idx, total_leads)
                 continue
-            variant = 1 if sent_today % 2 == 0 else 2
-            sent_today += 1
-            text = _get_leads_campaign_text(campaign, variant)
+            current_campaign = random.choice(available_campaigns)
+            variants = LEADS_PROMO_CAMPAIGNS.get(current_campaign) or []
+            variant = random.randint(1, len(variants)) if variants else 1
+            text = _get_leads_campaign_text(current_campaign, variant)
             name = lead["full_name"] or lead["name"] or "Клиент"
             phone = lead["phone"]
             wahelp_payload = None
@@ -679,7 +678,7 @@ async def _send_leads_campaign_batch() -> None:
                 await _log_lead_send(
                     conn,
                     lead_id=lead["id"],
-                    campaign=campaign,
+                    campaign=current_campaign,
                     variant=variant,
                     wahelp_message_id=wahelp_message_id,
                     status="sent",
@@ -694,48 +693,51 @@ async def _send_leads_campaign_batch() -> None:
                     WHERE id = $1
                     """,
                     lead["id"],
-                    campaign,
+                    current_campaign,
                     variant,
                 )
             except WahelpAPIError as exc:
                 error_text = str(exc)
                 if "Too Many Requests" in error_text or "Слишком много попыток" in error_text:
-                    rate_limits_reached += 1
                     logger.warning("Lead promo rate limited (lead=%s): %s", lead["id"], exc)
                     await _log_lead_send(
                         conn,
                         lead_id=lead["id"],
-                        campaign=campaign,
+                        campaign=current_campaign,
                         variant=variant,
                         wahelp_message_id=wahelp_message_id,
                         status="failed",
                     )
                     failed += 1
+                    await _sleep_between_leads(idx, total_leads)
                     continue
                 failed += 1
                 logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
                 await _log_lead_send(
                     conn,
                     lead_id=lead["id"],
-                    campaign=campaign,
+                    campaign=current_campaign,
                     variant=variant,
                     wahelp_message_id=wahelp_message_id,
                     status="failed",
                 )
+                await _sleep_between_leads(idx, total_leads)
+                continue
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 logger.warning("Lead promo send failed (lead=%s): %s", lead["id"], exc)
                 await _log_lead_send(
                     conn,
                     lead_id=lead["id"],
-                    campaign=campaign,
+                    campaign=current_campaign,
                     variant=variant,
                     wahelp_message_id=wahelp_message_id,
                     status="failed",
                 )
+                await _sleep_between_leads(idx, total_leads)
+                continue
 
-            if idx < len(leads) - 1:
-                await asyncio.sleep(LEADS_RATE_LIMIT_INTERVAL)
+            await _sleep_between_leads(idx, total_leads)
 
     # Подсчёт статусов/реакций за сегодня
     today_start_msk = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -746,11 +748,11 @@ async def _send_leads_campaign_batch() -> None:
             SELECT status, count(*) AS cnt
             FROM lead_logs
             WHERE sent_at >= $1
-              AND campaign = $2
+              AND campaign = ANY($2::text[])
             GROUP BY status
             """,
             today_start_utc,
-            campaign,
+            available_campaigns,
         )
         for row in rows:
             if row["status"] == "sent":
@@ -780,7 +782,7 @@ async def _send_leads_campaign_batch() -> None:
             else:
                 responses_other += row["cnt"]
     summary_lines = [
-        f"Промо лиды ({campaign})",
+        f"Промо лиды ({', '.join(available_campaigns)})",
         f"Отправлено: {sent}",
         f"Доставлено: {delivered}",
         f"Прочитано: {read}",
