@@ -210,7 +210,13 @@ async def schedule_followup_for_client(
 
 def _is_messenger_missing_error(error: WahelpAPIError) -> bool:
     text = str(error)
-    return "Мессенджер не подключен" in text or "messenger" in text.lower() and "not connected" in text.lower()
+    lowered = text.lower()
+    return (
+        "мессенджер не подключен" in text
+        or ("messenger" in lowered and "not connected" in lowered)
+        or "слишком много попыток" in lowered
+        or "too many requests" in lowered
+    )
 
 
 async def _handle_messenger_missing(
