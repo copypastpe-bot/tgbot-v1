@@ -5246,6 +5246,85 @@ async def build_payment_methods_report_text(start_utc: datetime, end_utc: dateti
     lines.append(f"Итого: {format_money(total_income)}₽")
     return "\n".join(lines)
 
+
+def _today_period_bounds() -> tuple[datetime, datetime, str]:
+    today_local = datetime.now(MOSCOW_TZ).date()
+    start_local = datetime.combine(today_local, time.min, tzinfo=MOSCOW_TZ)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+    label = today_local.strftime("%d.%m.%Y")
+    return start_utc, end_utc, label
+
+
+async def build_daily_cash_summary_text() -> str:
+    start_utc, end_utc, label = _today_period_bounds()
+    return await build_cash_report_text_for_period(start_utc, end_utc, label)
+
+
+async def build_profit_summary_text() -> str:
+    start_utc, end_utc, label = _today_period_bounds()
+    return await build_profit_report_text_for_period(start_utc, end_utc, label)
+
+
+async def build_daily_orders_admin_summary_text() -> str:
+    if pool is None:
+        return "Нет подключения к базе."
+    start_utc, end_utc, label = _today_period_bounds()
+    async with pool.acquire() as conn:
+        totals = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS orders_cnt,
+                   COALESCE(SUM(o.amount_total),0)::numeric(12,2) AS total_sum,
+                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS money_cash
+            FROM orders o
+            LEFT JOIN order_payments op ON op.order_id = o.id
+            WHERE o.created_at >= $1 AND o.created_at < $2
+            """,
+            start_utc,
+            end_utc,
+        )
+        rows = await conn.fetch(
+            """
+            SELECT o.id,
+                   o.created_at AT TIME ZONE 'UTC' AS created_utc,
+                   COALESCE(c.full_name,'—') AS client_name,
+                   COALESCE(o.payment_method,'—') AS payment_method,
+                   o.amount_cash::numeric(12,2) AS cash,
+                   o.amount_total::numeric(12,2) AS total
+            FROM orders o
+            LEFT JOIN clients c ON c.id = o.client_id
+            WHERE o.created_at >= $1 AND o.created_at < $2
+            ORDER BY o.created_at DESC
+            LIMIT 10
+            """,
+            start_utc,
+            end_utc,
+        )
+    count = totals["orders_cnt"] or 0
+    total_sum = Decimal(totals["total_sum"] or 0)
+    money_cash = Decimal(totals["money_cash"] or 0)
+    lines = [
+        f"📋 Заказы за {label}",
+        f"Всего заказов: {count}",
+        f"Сумма чеков: {format_money(total_sum)}₽",
+        f"Оплачено деньгами: {format_money(money_cash)}₽",
+    ]
+    if rows:
+        lines.append("")
+        lines.append("Последние заказы:")
+        for row in rows:
+            dt = row["created_utc"].astimezone(MOSCOW_TZ).strftime("%H:%M")
+            client = row["client_name"]
+            payment = f"{row['payment_method']} — {format_money(Decimal(row['cash'] or 0))}₽"
+            lines.append(
+                f"#{row['id']} {dt} | {client} | {payment} | {format_money(Decimal(row['total'] or 0))}₽"
+            )
+    else:
+        lines.append("")
+        lines.append("За сегодня заказов не было.")
+    return "\n".join(lines)
+
 # ===== /cash admin command =====
 @dp.message(Command("cash"))
 async def cash_report(msg: Message, state: FSMContext):
