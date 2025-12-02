@@ -3163,6 +3163,11 @@ async def _mark_daily_job_run(conn: asyncpg.Connection, job_name: str, now_utc: 
     )
 
 
+async def send_daily_reports() -> None:
+    """Placeholder daily reports job to keep scheduler stable."""
+    logging.info("send_daily_reports placeholder run — no action configured")
+
+
 async def run_birthday_jobs() -> None:
     if pool is None:
         return
