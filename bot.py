@@ -9530,7 +9530,7 @@ async def commit_order(msg: Message, state: FSMContext):
             payment_rows: list[tuple[str, Decimal]] = []
             total_parts_amount = Decimal("0")
             for entry in payment_parts_data:
-                method_label = entry.get("method") or payment_method
+                method_label = norm_pay_method_py(entry.get("method") or payment_method)
                 try:
                     amount_value = Decimal(str(entry.get("amount", "0")))
                 except Exception:
@@ -9556,6 +9556,7 @@ async def commit_order(msg: Message, state: FSMContext):
                     method_label,
                     amount_value,
                 )
+            non_wire_entries = [(label, amount_value) for label, amount_value in payment_rows if label != "р/с" and amount_value > 0]
 
             street_label = extract_street(client_address_val)
             base_name_for_label = (client_full_name_val or name or "Клиент").strip() or "Клиент"
@@ -9571,8 +9572,17 @@ async def commit_order(msg: Message, state: FSMContext):
                 effective_master_id = int(master_shares[0]["id"])
             if effective_master_id is None:
                 raise RuntimeError("Не удалось определить master_id для записи кассы.")
-            if not is_wire_payment:
-                await _record_order_income(conn, payment_method, cash_payment, order_id, int(effective_master_id), notify_label)
+            if non_wire_entries:
+                income_amount = sum(amount for _, amount in non_wire_entries)
+                income_method = non_wire_entries[0][0]
+                await _record_order_income(
+                    conn,
+                    income_method,
+                    income_amount,
+                    order_id,
+                    int(effective_master_id),
+                    notify_label,
+                )
             await _enqueue_order_completed_notification(
                 conn,
                 order_id=order_id,
