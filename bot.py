@@ -3168,6 +3168,11 @@ async def send_daily_reports() -> None:
     logging.info("send_daily_reports placeholder run — no action configured")
 
 
+async def wire_pending_reminder_job() -> None:
+    """Placeholder for wire reminders until logic restored."""
+    logging.info("wire_pending_reminder_job placeholder run — no action configured")
+
+
 async def run_birthday_jobs() -> None:
     if pool is None:
         return
