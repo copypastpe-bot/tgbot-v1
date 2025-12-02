@@ -1786,7 +1786,7 @@ async def _find_client_by_phone(conn: asyncpg.Connection, phone_input: str):
 
     rec = await conn.fetchrow(
         """
-        SELECT id, full_name, phone, birthday, bonus_balance, status
+        SELECT id, full_name, phone, birthday, bonus_balance, status, address
         FROM clients
         WHERE regexp_replace(COALESCE(phone,''), '[^0-9]+', '', 'g') = ANY($1::text[])
         """,
@@ -7813,6 +7813,14 @@ back_cancel_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
+address_input_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Нет адреса")],
+        [KeyboardButton(text="Отмена")],
+    ],
+    resize_keyboard=True,
+)
+
 
 @dp.message(F.text.lower() == "отмена")
 async def cancel_any(msg: Message, state: FSMContext):
@@ -7913,6 +7921,7 @@ class OrderFSM(StatesGroup):
     pick_extra_master = State()
     maybe_bday = State()
     name_fix = State()
+    waiting_address = State()
     confirm = State()
 
 main_kb = ReplyKeyboardMarkup(
@@ -7955,6 +7964,7 @@ async def got_phone(msg: Message, state: FSMContext):
         data["client_name"] = client["full_name"]
         data["bonus_balance"] = int(client["bonus_balance"] or 0)
         data["birthday"] = client["birthday"]
+        data["client_address"] = (client.get("address") or "").strip()
         await state.update_data(**data)
 
         # Если имя некорректное ИЛИ запись помечена как lead — попросим мастера исправить
@@ -7976,6 +7986,7 @@ async def got_phone(msg: Message, state: FSMContext):
     else:
         data["client_id"] = None
         data["bonus_balance"] = 0
+        data["client_address"] = ""
         await state.update_data(**data)
         await state.set_state(OrderFSM.name)
         return await msg.answer("Клиент не найден. Введите имя клиента:", reply_markup=cancel_kb)
@@ -8790,11 +8801,25 @@ async def _finalize_wire_link_flow(msg: Message, state: FSMContext):
     await state.set_state(AdminMenuFSM.root)
 
 
+async def _ensure_address_before_confirm(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    existing = (data.get("client_address") or "").strip()
+    manual = (data.get("manual_address") or "").strip()
+    if existing or manual:
+        await state.set_state(OrderFSM.confirm)
+        return await show_confirm(msg, state)
+    await state.set_state(OrderFSM.waiting_address)
+    return await msg.answer(
+        "Введите улицу клиента (например, \"ул. Ленина, 10\"). "
+        "Если адрес неизвестен, нажмите «Нет адреса».",
+        reply_markup=address_input_kb,
+    )
+
+
 async def proceed_order_finalize(msg: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("birthday"):
-        await state.set_state(OrderFSM.confirm)
-        return await show_confirm(msg, state)
+        return await _ensure_address_before_confirm(msg, state)
 
     await state.set_state(OrderFSM.maybe_bday)
     return await msg.answer(
@@ -8814,6 +8839,21 @@ async def got_bday(msg: Message, state: FSMContext):
     if val != "-":
         d, m = map(int, val.split("."))
         await state.update_data(new_birthday=date(2000, m, d))
+    return await _ensure_address_before_confirm(msg, state)
+
+
+@dp.message(OrderFSM.waiting_address, F.text)
+async def capture_order_address(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    if not text:
+        return await msg.answer(
+            "Введите улицу клиента или нажмите «Нет адреса».",
+            reply_markup=address_input_kb,
+        )
+    if text.lower() in {"нет адреса", "-"}:
+        await state.update_data(manual_address="")
+    else:
+        await state.update_data(manual_address=text)
     await state.set_state(OrderFSM.confirm)
     return await show_confirm(msg, state)
 
@@ -8869,10 +8909,17 @@ async def show_confirm(msg: Message, state: FSMContext):
     payment_line = f"💳 Оплата деньгами: {format_money(cash_payment)}₽"
     if payment_breakdown:
         payment_line += f" ({payment_breakdown})"
+    address_preview = (data.get("manual_address") or "").strip()
+    if not address_preview:
+        address_preview = (data.get("client_address") or "").strip()
     text = (
         f"Проверьте:\n"
         f"👤 {name}\n"
         f"📞 {data['phone_in']}\n"
+    )
+    if address_preview:
+        text += f"📍 Адрес: {address_preview}\n"
+    text += (
         f"💈 Чек: {amount} (доп: {upsell})\n"
         f"{payment_line}\n"
         f"🎁 Списано бонусов: {bonus_spent}\n"
@@ -8926,6 +8973,7 @@ async def commit_order(msg: Message, state: FSMContext):
     client_birthday_val: date | None = data.get("birthday")
     if isinstance(client_birthday_val, str):
         client_birthday_val = parse_birthday_str(client_birthday_val)
+    manual_address = (data.get("manual_address") or "").strip()
     payment_parts_data = _payment_parts_from_state(data)
     if not payment_parts_data:
         payment_parts_data = [{"method": payment_method, "amount": str(cash_payment)}]
@@ -8943,14 +8991,19 @@ async def commit_order(msg: Message, state: FSMContext):
     async with pool.acquire() as conn:
         async with conn.transaction():
             client = await conn.fetchrow(
-                "INSERT INTO clients (full_name, phone, bonus_balance, birthday, status) "
-                "VALUES ($1, $2, 0, $3, 'client') "
+                "INSERT INTO clients (full_name, phone, address, bonus_balance, birthday, status) "
+                "VALUES ($1, $2, $4, 0, $3, 'client') "
                 "ON CONFLICT (phone) DO UPDATE SET "
                 "  full_name = COALESCE(EXCLUDED.full_name, clients.full_name), "
                 "  birthday  = COALESCE(EXCLUDED.birthday, clients.birthday), "
-                "  status='client' "
+                "  status='client', "
+                "  address = CASE "
+                "      WHEN (clients.address IS NULL OR clients.address = '') "
+                "           THEN COALESCE(EXCLUDED.address, clients.address) "
+                "      ELSE clients.address "
+                "  END "
                 "RETURNING id, bonus_balance, full_name, phone, address, birthday",
-                name, phone_in, new_bday
+                name, phone_in, new_bday, (manual_address or None)
             )
             client_id = client["id"]
             client_full_name_val = (client["full_name"] or name or "").strip() or None
