@@ -2374,6 +2374,34 @@ def _format_payment_parts(parts: Sequence[Mapping[str, Any]] | None, *, with_cur
     return ", ".join(chunks)
 
 
+def _format_payment_summary(
+    method_totals: Mapping[str, Decimal | float | int],
+    *,
+    multiline: bool = False,
+    html_mode: bool = False,
+) -> str:
+    """Возвращает текстовое представление агрегированных оплат по методам."""
+    if not method_totals:
+        return "—"
+    sorted_items = sorted(
+        method_totals.items(),
+        key=lambda item: Decimal(str(item[1] or 0)),
+        reverse=True,
+    )
+    parts: list[str] = []
+    for method, amount in sorted_items:
+        try:
+            value = Decimal(str(amount or 0))
+        except Exception:
+            continue
+        label = _format_payment_label(method)
+        amount_text = f"{format_money(value)}₽"
+        fragment = f"{label}: {amount_text}"
+        parts.append(fragment if not html_mode else _escape_html(fragment))
+    separator = "\n" if multiline else ", "
+    return separator.join(parts)
+
+
 def _withdrawal_filter_sql(alias: str = "e") -> str:
     """SQL-предикат для строк-изъятий из наличных мастера (не расходы компании)."""
     return (
