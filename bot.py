@@ -451,6 +451,10 @@ CLIENT_PROMO_INTEREST_REPLY = "Спасибо! Свяжемся с вами в �
 LEADS_AUTO_REPLY_CAMPAIGN_PREFIX = "inbound_auto_reply"
 
 
+def _compact_text_for_matching(value: str) -> str:
+    return re.sub(r"[^0-9a-zа-я]+", "", value)
+
+
 def _resolve_channel_kind(alias: str | None, default: str, channel_uuid: str | None = None) -> str:
     if channel_uuid:
         key = channel_uuid.strip().lower()
@@ -1135,6 +1139,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
     if not normalized_text:
         return False
     normalized_lower = normalized_text.lower()
+    normalized_compact = _compact_text_for_matching(normalized_lower)
     rating_score: int | None = None
     rating_match = re.match(r"^([1-5])(?:\D.*)?$", normalized_lower)
     if rating_match:
@@ -1142,7 +1147,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             rating_score = int(rating_match.group(1))
         except ValueError:
             rating_score = None
-    is_stop = normalized_lower in {"stop", "стоп", "стоn", "стоp"}
+    is_stop = normalized_compact in {"stop", "стоп", "стоn", "стоp"}
     is_interest = normalized_lower.startswith("1")
     if not (is_stop or is_interest):
         if rating_score is None:
@@ -8772,6 +8777,17 @@ async def _finalize_wire_link_flow(msg: Message, state: FSMContext):
         order_row = await conn.fetchrow(
             "SELECT client_id FROM orders WHERE id=$1",
             order_id,
+        )
+        await conn.execute(
+            """
+            DELETE FROM cashbook_entries
+            WHERE order_id = $1
+              AND kind = 'income'
+              AND method = 'р/с'
+              AND id <> $2
+            """,
+            order_id,
+            entry_id,
         )
         await conn.execute(
             """
