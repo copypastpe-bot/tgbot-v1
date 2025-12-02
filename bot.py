@@ -1909,6 +1909,71 @@ def _dates_to_utc_bounds(start_date: date, end_date: date) -> tuple[datetime, da
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
+def _resolve_period_dates(normalized: str) -> tuple[date, date]:
+    today = datetime.now(MOSCOW_TZ).date()
+    normalized = (normalized or "").lower()
+    if normalized == "day":
+        return today, today
+    if normalized == "month":
+        start = today.replace(day=1)
+        last_day = calendar.monthrange(start.year, start.month)[1]
+        return start, start.replace(day=last_day)
+    if normalized == "year":
+        return date(today.year, 1, 1), date(today.year, 12, 31)
+    if normalized == "week":
+        start = today - timedelta(days=today.weekday())
+        end = start + timedelta(days=6)
+        return start, end
+    # default → single day (today)
+    return today, today
+
+
+async def _build_report_text(kind: str | None, data: Mapping[str, Any], normalized_period: str, state: FSMContext) -> str:
+    start_date, end_date = _resolve_period_dates(normalized_period)
+    start_utc, end_utc = _dates_to_utc_bounds(start_date, end_date)
+    label = _format_period_label(start_date, end_date)
+    return await _build_interval_report_text(
+        kind,
+        data,
+        start_date,
+        end_date,
+        start_utc,
+        end_utc,
+        label,
+        state,
+    )
+
+
+async def _build_interval_report_text(
+    kind: str | None,
+    data: Mapping[str, Any],
+    start_date: date,
+    end_date: date,
+    start_utc: datetime,
+    end_utc: datetime,
+    label: str,
+    state: FSMContext,
+) -> str:
+    normalized_kind = (kind or "").strip().lower()
+    if normalized_kind in {"касса", "cash"}:
+        return await build_cash_report_text_for_period(start_utc, end_utc, label)
+    if normalized_kind in {"прибыль", "profit"}:
+        return await build_profit_report_text_for_period(start_utc, end_utc, label)
+    if normalized_kind in {"типы оплат", "payments"}:
+        return await build_payment_methods_report_text(start_utc, end_utc, label)
+    if normalized_kind in {"мастер/заказы/оплаты", "master_orders"}:
+        master_id = data.get("report_master_id")
+        if not master_id:
+            return "Сначала выберите мастера."
+        return await build_master_orders_report_text(int(master_id), start_utc, end_utc, label)
+    if normalized_kind in {"мастер/зарплата", "master_salary"}:
+        master_id = data.get("report_master_id")
+        if not master_id:
+            return "Сначала выберите мастера."
+        return await build_salary_summary_text(int(master_id), start_date, end_date)
+    return "Этот отчёт сейчас недоступен."
+
+
 async def build_report_masters_kb(conn) -> tuple[str, ReplyKeyboardMarkup]:
     """
     Построить клавиатуру выбора мастера для отчётов по мастерам.
@@ -3427,21 +3492,21 @@ async def reports_shortcut_payment_types(msg: Message, state: FSMContext):
 async def reports_run_period_day(msg: Message, state: FSMContext):
     data = await state.get_data()
     text = await _build_report_text(data.get("report_kind"), data, "day", state)
-    await msg.answer(text, reply_markup=reports_period_kb())
+    await msg.answer(text, parse_mode=ParseMode.HTML, reply_markup=reports_period_kb())
 
 
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "Месяц")
 async def reports_run_period_month(msg: Message, state: FSMContext):
     data = await state.get_data()
     text = await _build_report_text(data.get("report_kind"), data, "month", state)
-    await msg.answer(text, reply_markup=reports_period_kb())
+    await msg.answer(text, parse_mode=ParseMode.HTML, reply_markup=reports_period_kb())
 
 
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "Год")
 async def reports_run_period_year(msg: Message, state: FSMContext):
     data = await state.get_data()
     text = await _build_report_text(data.get("report_kind"), data, "year", state)
-    await msg.answer(text, reply_markup=reports_period_kb())
+    await msg.answer(text, parse_mode=ParseMode.HTML, reply_markup=reports_period_kb())
 
 
 @dp.message(ReportsFSM.waiting_period_start, F.text.casefold().in_({"отмена", "выйти"}))
@@ -3496,7 +3561,16 @@ async def reports_period_end_input(msg: Message, state: FSMContext):
     start_utc, end_utc = _dates_to_utc_bounds(start_date, end_date)
     label = _format_period_label(start_date, end_date)
     kind = data.get("report_kind")
-    text = await _build_interval_report_text(kind, data, start_utc, end_utc, label, state)
+    text = await _build_interval_report_text(
+        kind,
+        data,
+        start_date,
+        end_date,
+        start_utc,
+        end_utc,
+        label,
+        state,
+    )
     await msg.answer(text, parse_mode=ParseMode.HTML)
     await state.clear()
     await state.set_state(ReportsFSM.waiting_root)
@@ -4836,6 +4910,109 @@ async def payroll_report(msg: Message):
     ]
     await msg.answer(f"ЗП за {period}:\n" + "\n".join(lines))
 
+async def build_master_orders_report_text(master_id: int, start_utc: datetime, end_utc: datetime, label: str) -> str:
+    async with pool.acquire() as conn:
+        master = await conn.fetchrow(
+            "SELECT id, COALESCE(first_name,'') AS fn, COALESCE(last_name,'') AS ln FROM staff WHERE id=$1",
+            master_id,
+        )
+        if not master:
+            return "Мастер не найден."
+        totals = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS orders_cnt,
+                   COALESCE(SUM(o.amount_total),0)::numeric(12,2) AS total_sum,
+                   COALESCE(SUM(o.amount_cash),0)::numeric(12,2) AS cash_sum,
+                   COALESCE(SUM(o.amount_upsell),0)::numeric(12,2) AS upsell_sum,
+                   COALESCE(SUM(o.bonus_spent),0)::numeric(12,2) AS bonus_spent
+            FROM orders o
+            WHERE o.master_id=$1
+              AND o.created_at >= $2
+              AND o.created_at < $3
+            """,
+            master_id,
+            start_utc,
+            end_utc,
+        )
+        pay_rows = await conn.fetch(
+            """
+            SELECT COALESCE(op.method,'прочее') AS method,
+                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS total
+            FROM order_payments op
+            JOIN orders o ON o.id = op.order_id
+            WHERE o.master_id=$1
+              AND o.created_at >= $2
+              AND o.created_at < $3
+            GROUP BY method
+            ORDER BY total DESC
+            """,
+            master_id,
+            start_utc,
+            end_utc,
+        )
+        recent_orders = await conn.fetch(
+            """
+            SELECT o.id,
+                   o.created_at AT TIME ZONE 'Europe/Moscow' AS created_local,
+                   COALESCE(c.full_name,'—') AS client_name,
+                   COALESCE(o.payment_method,'—') AS payment_method,
+                   o.amount_total::numeric(12,2) AS amount_total,
+                   o.amount_cash::numeric(12,2) AS amount_cash
+            FROM orders o
+            LEFT JOIN clients c ON c.id = o.client_id
+            WHERE o.master_id=$1
+              AND o.created_at >= $2
+              AND o.created_at < $3
+            ORDER BY o.created_at DESC
+            LIMIT 10
+            """,
+            master_id,
+            start_utc,
+            end_utc,
+        )
+        cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
+
+    orders_cnt = int(totals["orders_cnt"] or 0) if totals else 0
+    total_sum = Decimal(totals["total_sum"] or 0) if totals else Decimal(0)
+    cash_sum = Decimal(totals["cash_sum"] or 0) if totals else Decimal(0)
+    upsell_sum = Decimal(totals["upsell_sum"] or 0) if totals else Decimal(0)
+    bonus_spent = Decimal(totals["bonus_spent"] or 0) if totals else Decimal(0)
+    master_name = f"{master['fn']} {master['ln']}".strip() or f"Мастер #{master_id}"
+    on_hand = cash_on_orders - withdrawn_total
+    if on_hand < Decimal(0):
+        on_hand = Decimal(0)
+
+    lines = [
+        f"👷 <b>{master_name}</b> — {label}",
+        f"Заказов: {orders_cnt}",
+        f"Сумма чеков: {format_money(total_sum)}₽",
+        f"Наличными: {format_money(cash_sum)}₽",
+        f"Доп. продажи: {format_money(upsell_sum)}₽",
+        f"Списано бонусов: {format_money(bonus_spent)}₽",
+        "",
+        "Наличные у мастера (всего):",
+        f"• На руках: {format_money(on_hand)}₽",
+        f"• Изъято: {format_money(withdrawn_total)}₽",
+    ]
+    if pay_rows:
+        lines.append("")
+        lines.append("Оплаты по методам:")
+        for row in pay_rows:
+            method = row["method"] or "прочее"
+            amount = Decimal(row["total"] or 0)
+            lines.append(f"• {method}: {format_money(amount)}₽")
+    if recent_orders:
+        lines.append("")
+        lines.append("Последние заказы:")
+        for row in recent_orders:
+            dt = row["created_local"].strftime("%d.%m %H:%M")
+            amount_total = format_money(Decimal(row["amount_total"] or 0))
+            amount_cash = format_money(Decimal(row["amount_cash"] or 0))
+            client = row["client_name"]
+            method = row["payment_method"]
+            lines.append(f"#{row['id']} • {dt} • {client} • {amount_total}₽ (нал: {amount_cash}₽, {method})")
+    return "\n".join(lines)
+
 # ---- helper for /cash (aggregates; year -> monthly details)
 async def build_cash_report_text_for_period(start_utc: datetime, end_utc: datetime, label: str) -> str:
     async with pool.acquire() as conn:
@@ -5858,7 +6035,7 @@ async def rep_master_period(msg: Message, state: FSMContext):
 
     data = await state.get_data()
     text = await _build_report_text(data.get("report_kind"), data, normalized, state)
-    await msg.answer(text, reply_markup=reports_period_kb())
+    await msg.answer(text, parse_mode=ParseMode.HTML, reply_markup=reports_period_kb())
 
 # ===== Leads import (admin) =====
 @dp.message(Command("import_leads_dryrun"))
