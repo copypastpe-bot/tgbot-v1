@@ -167,13 +167,22 @@ LEADS_RATE_LIMIT_INTERVAL = int(os.getenv("LEADS_RATE_LIMIT_INTERVAL", 60))  # l
 LEADS_SEND_START_HOUR = 14  # MSK
 LEADS_MIN_INTERVAL_SEC = 60
 LEADS_MAX_INTERVAL_SEC = 600
-CHANNEL_ALIAS_TO_KIND = {
+CHANNEL_ALIAS_TO_KIND: dict[str, ChannelKind] = {
     "clients_tg": "clients_tg",
     "clients_telegram": "clients_tg",
     "clients_wa": "clients_wa",
     "clients_whatsapp": "clients_wa",
     "leads": "leads",
 }
+CHANNEL_UUID_TO_KIND: dict[str, ChannelKind] = {}
+for _env_name, _kind in (
+    ("WAHELP_CLIENTS_CHANNEL_UUID", "clients_tg"),
+    ("WAHELP_CLIENTS_WA_CHANNEL_UUID", "clients_wa"),
+    ("WAHELP_LEADS_CHANNEL_UUID", "leads"),
+):
+    _uuid = (os.getenv(_env_name) or "").strip().lower()
+    if _uuid:
+        CHANNEL_UUID_TO_KIND[_uuid] = _kind
 MARKETING_LOG_CHAT_ID = int(os.getenv("MARKETING_LOG_CHAT_ID", "-1005025733003"))
 MAX_ORDER_MASTERS = 5
 BDAY_TEMPLATE_KEYS = (
@@ -442,7 +451,12 @@ CLIENT_PROMO_INTEREST_REPLY = "Спасибо! Свяжемся с вами в �
 LEADS_AUTO_REPLY_CAMPAIGN_PREFIX = "inbound_auto_reply"
 
 
-def _resolve_channel_kind(alias: str | None, default: str) -> str:
+def _resolve_channel_kind(alias: str | None, default: str, channel_uuid: str | None = None) -> str:
+    if channel_uuid:
+        key = channel_uuid.strip().lower()
+        mapped = CHANNEL_UUID_TO_KIND.get(key)
+        if mapped:
+            return mapped
     if alias:
         key = alias.strip().lower()
         mapped = CHANNEL_ALIAS_TO_KIND.get(key)
@@ -1103,11 +1117,15 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
     if destination in {"", "from_operator", "operator"}:
         return False
     channel_alias = None
+    channel_uuid = None
     channel_info = data.get("channel")
     if isinstance(channel_info, Mapping):
         alias_val = channel_info.get("alias") or channel_info.get("name")
         if alias_val:
             channel_alias = str(alias_val)
+        uuid_val = channel_info.get("uuid") or channel_info.get("id")
+        if uuid_val:
+            channel_uuid = str(uuid_val)
     text = data.get("message")
     if isinstance(text, Mapping):
         text = text.get("text") or text.get("message")
@@ -1177,7 +1195,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                 return False
 
             if is_stop:
-                channel_kind = _resolve_channel_kind(channel_alias, "leads")
+                channel_kind = _resolve_channel_kind(channel_alias, "leads", channel_uuid)
                 await conn.execute(
                     """
                     UPDATE leads
@@ -1199,7 +1217,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                 return True
 
             if is_interest:
-                channel_kind = _resolve_channel_kind(channel_alias, "leads")
+                channel_kind = _resolve_channel_kind(channel_alias, "leads", channel_uuid)
                 await _log_lead_response(conn, lead_id=lead["id"], response_kind="interest", response_text=normalized_text)
                 await _send_lead_auto_reply(
                     conn,
@@ -1245,7 +1263,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             return False
 
         if is_stop:
-            channel_kind = _resolve_channel_kind(channel_alias, "clients_tg")
+            channel_kind = _resolve_channel_kind(channel_alias, "clients_tg", channel_uuid)
             await conn.execute(
                 """
                 UPDATE clients
@@ -1282,7 +1300,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             return True
 
         if is_interest:
-            channel_kind = _resolve_channel_kind(channel_alias, "clients_tg")
+            channel_kind = _resolve_channel_kind(channel_alias, "clients_tg", channel_uuid)
             await conn.execute(
                 """
                 UPDATE promo_reengagements
@@ -3095,6 +3113,8 @@ async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[
         WHERE birthday IS NOT NULL
           AND EXTRACT(MONTH FROM birthday) = $1
           AND EXTRACT(DAY FROM birthday) = $2
+          AND COALESCE(notifications_enabled, true)
+          AND NOT COALESCE(promo_opt_out, false)
         """,
         today_local.month,
         today_local.day,
