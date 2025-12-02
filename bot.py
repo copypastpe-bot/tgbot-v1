@@ -6893,11 +6893,6 @@ async def tx_remove_confirm(query: CallbackQuery, state: FSMContext):
         await state.set_state(AdminMenuFSM.root)
         await query.message.answer("Транзакция уже была удалена ранее.", reply_markup=admin_root_kb())
         return
-    if res.split()[-1] == "0":
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        await query.message.answer("Транзакция уже была удалена ранее.", reply_markup=admin_root_kb())
-        return
 
     await state.clear()
     await state.set_state(AdminMenuFSM.root)
