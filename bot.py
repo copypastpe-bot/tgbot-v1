@@ -79,6 +79,11 @@ class TxDeleteFSM(StatesGroup):
     waiting_pick = State()
     waiting_confirm = State()
 
+class DividendFSM(StatesGroup):
+    waiting_amount = State()
+    waiting_comment = State()
+    waiting_confirm = State()
+
 
 class OrderDeleteFSM(StatesGroup):
     waiting_date = State()
@@ -190,6 +195,8 @@ BDAY_TEMPLATE_KEYS = (
     "birthday_congrats_variant_2",
     "birthday_congrats_variant_3",
 )
+DIVIDEND_METHOD = "Дивиденды"
+DIVIDEND_COMMENT_PREFIX = "[DIV]"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -2428,12 +2435,28 @@ def _format_payment_summary(
     return separator.join(parts)
 
 
+def _format_dividend_comment(text: str | None) -> str:
+    base = (text or "Дивиденды").strip()
+    if base.upper().startswith(DIVIDEND_COMMENT_PREFIX):
+        return base
+    return f"{DIVIDEND_COMMENT_PREFIX} {base}".strip()
+
+
 def _withdrawal_filter_sql(alias: str = "e") -> str:
     """SQL-предикат для строк-изъятий из наличных мастера (не расходы компании)."""
     return (
         f"({alias}.kind='expense' AND {alias}.method='Наличные' "
         f"AND {alias}.order_id IS NULL AND {alias}.master_id IS NOT NULL "
         f"AND ({alias}.comment ILIKE '[WDR]%' OR {alias}.comment ILIKE 'изъят%'))"
+    )
+
+
+def _non_profit_expense_filter(alias: str = "e") -> str:
+    """SQL-предикат для расходов, которые не учитываются в прибыли (изъятия, дивиденды)."""
+    return (
+        f"({_withdrawal_filter_sql(alias)} "
+        f" OR {alias}.comment ILIKE '{DIVIDEND_COMMENT_PREFIX}%' "
+        f" OR {alias}.method = '{DIVIDEND_METHOD}')"
     )
 
 
@@ -3811,6 +3834,7 @@ async def set_commands():
         BotCommand(command="bonus_backfill", description="Пересчитать бонусы"),
         BotCommand(command="tx_remove", description="Удалить транзакцию"),
         BotCommand(command="order_remove", description="Удалить заказ"),
+        BotCommand(command="dividend", description="Выплата дивидендов"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -5076,7 +5100,7 @@ async def build_cash_report_text_for_period(start_utc: datetime, end_utc: dateti
             f"""
             SELECT
               COALESCE(SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END),0)::numeric(12,2) AS income,
-              COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
+              COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_non_profit_expense_filter("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
             FROM cashbook_entries c
             WHERE c.happened_at >= $1
               AND c.happened_at < $2
@@ -5180,7 +5204,7 @@ async def build_profit_report_text_for_period(start_utc: datetime, end_utc: date
             f"""
             SELECT (c.happened_at AT TIME ZONE 'Europe/Moscow')::date AS day,
                    COALESCE(SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END),0)::numeric(12,2) AS income,
-                   COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
+                   COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_non_profit_expense_filter("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
             FROM cashbook_entries c
             WHERE c.happened_at >= $1
               AND c.happened_at < $2
@@ -7799,6 +7823,111 @@ async def withdraw_start(msg: Message, state: FSMContext):
     return await admin_withdraw_entry(msg, state)
 
 
+@dp.message(Command("dividend"))
+async def dividend_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "manage_income"):
+        return await msg.answer("Только для администраторов.")
+    await state.clear()
+    await state.set_state(DividendFSM.waiting_amount)
+    async with pool.acquire() as conn:
+        balance = await get_cash_balance_excluding_withdrawals(conn)
+    await msg.answer(
+        f"Введите сумму дивидендов (₽). Доступно: {format_money(balance)}₽",
+        reply_markup=cancel_kb,
+    )
+
+
+@dp.message(DividendFSM.waiting_amount, F.text)
+async def dividend_amount_input(msg: Message, state: FSMContext):
+    amount = parse_money(msg.text)
+    if amount is None or amount <= 0:
+        return await msg.answer("Введите положительную сумму в рублях.", reply_markup=cancel_kb)
+    async with pool.acquire() as conn:
+        balance = await get_cash_balance_excluding_withdrawals(conn)
+    if amount > balance:
+        return await msg.answer(
+            f"В кассе сейчас {format_money(balance)}₽. Нельзя изъять больше остатка.",
+            reply_markup=cancel_kb,
+        )
+    await state.update_data(dividend_amount=str(amount))
+    await state.set_state(DividendFSM.waiting_comment)
+    await msg.answer("Комментарий к выплате? (или «Без комментария»)", reply_markup=dividend_comment_kb)
+
+
+@dp.message(DividendFSM.waiting_comment, F.text)
+async def dividend_comment_input(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    if text.lower() == "без комментария":
+        text = "Дивиденды"
+    await state.update_data(dividend_comment=text or "Дивиденды")
+    data = await state.get_data()
+    amount = Decimal(data.get("dividend_amount") or "0")
+    lines = [
+        "Подтвердите выплату дивидендов:",
+        f"Сумма: {format_money(amount)}₽",
+        f"Комментарий: {text or 'Дивиденды'}",
+    ]
+    await state.set_state(DividendFSM.waiting_confirm)
+    await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("dividend_confirm"))
+
+
+@dp.callback_query(DividendFSM.waiting_confirm)
+async def dividend_confirm_handler(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+    if data not in {"dividend_confirm:yes", "dividend_confirm:cancel"}:
+        await query.answer()
+        return
+
+    await query.answer()
+    await query.message.edit_reply_markup(None)
+
+    if data.endswith("cancel"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Выплата дивидендов отменена.", reply_markup=admin_root_kb())
+        return
+
+    payload = await state.get_data()
+    try:
+        amount = Decimal(payload.get("dividend_amount") or "0")
+        comment = payload.get("dividend_comment") or "Дивиденды"
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("dividend confirm payload error: %s", exc)
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Не удалось прочитать данные выплаты. Попробуйте снова.", reply_markup=admin_root_kb())
+        return
+
+    async with pool.acquire() as conn:
+        balance = await get_cash_balance_excluding_withdrawals(conn)
+        if amount > balance:
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            await query.message.answer(
+                f"В кассе сейчас {format_money(balance)}₽. Нельзя изъять больше остатка.",
+                reply_markup=admin_root_kb(),
+            )
+            return
+        formatted_comment = _format_dividend_comment(comment)
+        try:
+            tx = await _record_expense(conn, amount, formatted_comment, method=DIVIDEND_METHOD)
+            new_balance = await get_cash_balance_excluding_withdrawals(conn)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("dividend confirm failed: %s", exc)
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            await query.message.answer(f"Ошибка при проведении выплаты: {exc}", reply_markup=admin_root_kb())
+            return
+
+    when = tx["happened_at"].astimezone(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    await query.message.answer(
+        f"Дивиденды #{tx['id']} проведены: {format_money(amount)}₽ ({when})\nКомментарий: {formatted_comment}\nОстаток кассы: {format_money(new_balance)}₽",
+        reply_markup=admin_root_kb(),
+    )
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+
+
 @dp.message(Command("mysalary"))
 async def my_salary(msg: Message):
     # доступ только для мастеров
@@ -7921,6 +8050,15 @@ address_input_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="Отмена")],
     ],
     resize_keyboard=True,
+)
+
+dividend_comment_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Без комментария")],
+        [KeyboardButton(text="Отмена")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
 )
 
 
