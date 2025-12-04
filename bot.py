@@ -7839,6 +7839,9 @@ async def dividend_start(msg: Message, state: FSMContext):
 
 @dp.message(DividendFSM.waiting_amount, F.text)
 async def dividend_amount_input(msg: Message, state: FSMContext):
+    if (msg.text or "").strip().lower() == "отмена":
+        await cancel_any(msg, state)
+        return
     amount = parse_money(msg.text)
     if amount is None or amount <= 0:
         return await msg.answer("Введите положительную сумму в рублях.", reply_markup=cancel_kb)
@@ -7856,6 +7859,9 @@ async def dividend_amount_input(msg: Message, state: FSMContext):
 
 @dp.message(DividendFSM.waiting_comment, F.text)
 async def dividend_comment_input(msg: Message, state: FSMContext):
+    if (msg.text or "").strip().lower() == "отмена":
+        await cancel_any(msg, state)
+        return
     text = (msg.text or "").strip()
     if text.lower() == "без комментария":
         text = "Дивиденды"
