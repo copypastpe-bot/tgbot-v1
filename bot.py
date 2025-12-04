@@ -650,6 +650,9 @@ async def _select_leads_for_campaign(conn: asyncpg.Connection, *, campaign: str,
 async def _send_leads_campaign_batch() -> None:
     if pool is None:
         return
+    if LEADS_MAX_PER_DAY <= 0:
+        logger.info("Leads promo disabled: LEADS_MAX_PER_DAY=%s", LEADS_MAX_PER_DAY)
+        return
     available_campaigns = list(LEADS_PROMO_CAMPAIGNS.keys())
     if not available_campaigns:
         logger.warning("No leads promo campaigns defined")
