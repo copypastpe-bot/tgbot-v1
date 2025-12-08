@@ -3308,8 +3308,40 @@ async def _mark_daily_job_run(conn: asyncpg.Connection, job_name: str, now_utc: 
 
 
 async def send_daily_reports() -> None:
-    """Placeholder daily reports job to keep scheduler stable."""
-    logging.info("send_daily_reports placeholder run — no action configured")
+    if pool is None:
+        return
+    now_utc = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        if not await _should_run_daily_job(conn, "daily_reports", now_utc):
+            logger.info("daily_reports already run today, skipping")
+            return
+    try:
+        cash_text = await build_daily_cash_summary_text()
+        profit_text = await build_profit_summary_text()
+        orders_text = await build_daily_orders_admin_summary_text()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to build daily reports: %s", exc)
+        return
+
+    combined_finance = f"{cash_text}\n\n{profit_text}"
+    if MONEY_FLOW_CHAT_ID:
+        try:
+            await bot.send_message(MONEY_FLOW_CHAT_ID, combined_finance, parse_mode=ParseMode.HTML)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send daily finance report: %s", exc)
+    else:
+        logger.warning("MONEY_FLOW_CHAT_ID is not set; skipping finance daily report")
+
+    if ORDERS_CONFIRM_CHAT_ID:
+        try:
+            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, orders_text, parse_mode=ParseMode.HTML)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send daily orders report: %s", exc)
+    else:
+        logger.warning("ORDERS_CONFIRM_CHAT_ID is not set; skipping orders daily report")
+
+    async with pool.acquire() as conn:
+        await _mark_daily_job_run(conn, "daily_reports", now_utc)
 
 
 async def wire_pending_reminder_job() -> None:
