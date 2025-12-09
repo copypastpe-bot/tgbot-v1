@@ -41,7 +41,9 @@ load_dotenv()
 _base_url = os.getenv("WAHELP_API_BASE", DEFAULT_BASE_URL)
 _login = os.getenv("WAHELP_LOGIN")
 _password = os.getenv("WAHELP_PASSWORD")
-_static_token = os.getenv("WAHELP_ACCESS_TOKEN") or os.getenv("WAHELP_CLIENTS_TOKEN")
+_static_token = os.getenv("WAHELP_ACCESS_TOKEN")
+if not _static_token and not (_login and _password):
+    _static_token = os.getenv("WAHELP_CLIENTS_TOKEN")
 
 _credentials: WahelpCredentials | None = None
 _auth_manager: WahelpAuthManager | None = None
