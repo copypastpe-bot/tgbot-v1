@@ -79,6 +79,11 @@ class TxDeleteFSM(StatesGroup):
     waiting_pick = State()
     waiting_confirm = State()
 
+class JenyaCardFSM(StatesGroup):
+    waiting_amount = State()
+    waiting_comment = State()
+    waiting_confirm = State()
+
 class DividendFSM(StatesGroup):
     waiting_amount = State()
     waiting_comment = State()
@@ -146,6 +151,8 @@ for part in re.split(r"[ ,;]+", _admin_ids_env.strip()):
 ORDERS_CONFIRM_CHAT_ID = int(os.getenv("ORDERS_CONFIRM_CHAT_ID", "0") or "0")  # Заказы подтверждения (в т.ч. З/П)
 MONEY_FLOW_CHAT_ID     = int(os.getenv("MONEY_FLOW_CHAT_ID", "0") or "0")      # «Ракета деньги»
 LOGS_CHAT_ID           = int(os.getenv("LOGS_CHAT_ID", "0") or "0")
+JENYA_CARD_CHAT_ID     = int(os.getenv("JENYA_CARD_CHAT_ID", "0") or "0")
+JENYA_CARD_INITIAL_BALANCE = Decimal(os.getenv("JENYA_CARD_INITIAL_BALANCE", "0") or "0")
 WAHELP_WEBHOOK_HOST = os.getenv("WAHELP_WEBHOOK_HOST", "0.0.0.0")
 WAHELP_WEBHOOK_PORT = int(os.getenv("WAHELP_WEBHOOK_PORT", "0") or "0")
 WAHELP_WEBHOOK_TOKEN = os.getenv("WAHELP_WEBHOOK_TOKEN")
@@ -424,6 +431,32 @@ async def ensure_daily_job_schema(conn: asyncpg.Connection) -> None:
         );
         """
     )
+
+
+async def ensure_jenya_card_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS jenya_card_entries (
+            id bigserial PRIMARY KEY,
+            kind text NOT NULL,
+            amount numeric(12,2) NOT NULL,
+            comment text,
+            happened_at timestamptz NOT NULL DEFAULT NOW(),
+            created_at timestamptz NOT NULL DEFAULT NOW(),
+            created_by bigint,
+            is_deleted boolean NOT NULL DEFAULT FALSE
+        );
+        """
+    )
+    exists = await conn.fetchval("SELECT 1 FROM jenya_card_entries LIMIT 1")
+    if not exists and JENYA_CARD_INITIAL_BALANCE > 0:
+        await conn.execute(
+            """
+            INSERT INTO jenya_card_entries(kind, amount, comment, happened_at, created_at)
+            VALUES ('opening_balance', $1, 'Начальный остаток', NOW(), NOW())
+            """,
+            JENYA_CARD_INITIAL_BALANCE,
+        )
 
 LEADS_PROMO_CAMPAIGNS: dict[str, list[str]] = {
     "week1": [
@@ -3826,6 +3859,54 @@ async def _record_withdrawal(
     return tx
 
 
+async def _get_jenya_card_balance(conn: asyncpg.Connection) -> Decimal:
+    row = await conn.fetchrow(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN kind IN ('income','opening_balance') THEN amount ELSE 0 END),0) AS income_sum,
+          COALESCE(SUM(CASE WHEN kind='expense' THEN amount ELSE 0 END),0) AS expense_sum
+        FROM jenya_card_entries
+        WHERE COALESCE(is_deleted,false)=FALSE
+        """
+    )
+    inc = Decimal(row["income_sum"] or 0)
+    exp = Decimal(row["expense_sum"] or 0)
+    return inc - exp
+
+
+async def _record_jenya_card_entry(
+    conn: asyncpg.Connection,
+    *,
+    kind: str,
+    amount: Decimal,
+    comment: str,
+    created_by: int,
+) -> asyncpg.Record:
+    entry = await conn.fetchrow(
+        """
+        INSERT INTO jenya_card_entries(kind, amount, comment, happened_at, created_by)
+        VALUES ($1, $2, $3, NOW(), $4)
+        RETURNING id, happened_at
+        """,
+        kind,
+        amount,
+        comment,
+        created_by,
+    )
+    balance = await _get_jenya_card_balance(conn)
+    if JENYA_CARD_CHAT_ID:
+        try:
+            prefix = "➕" if kind in ("income", "opening_balance") else "➖"
+            lines = [
+                f"{prefix}{format_money(amount)}₽ Карта Жени — {comment}",
+                f"Остаток: {format_money(balance)}₽",
+            ]
+            await bot.send_message(JENYA_CARD_CHAT_ID, "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send Jenya card log: %s", exc)
+    return entry, balance
+
+
 # Payment method normalizer (Python side to mirror SQL norm_pay_method)
 def norm_pay_method_py(p: str | None) -> str:
     """
@@ -3867,6 +3948,9 @@ async def set_commands():
         BotCommand(command="tx_remove", description="Удалить транзакцию"),
         BotCommand(command="order_remove", description="Удалить заказ"),
         BotCommand(command="dividend", description="Выплата дивидендов"),
+        BotCommand(command="jenya_card", description="Баланс Карты Жени"),
+        BotCommand(command="jenya_card_income", description="Приход на карту Жени"),
+        BotCommand(command="jenya_card_expense", description="Расход с карты Жени"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -7966,6 +8050,173 @@ async def dividend_confirm_handler(query: CallbackQuery, state: FSMContext):
     await state.set_state(AdminMenuFSM.root)
 
 
+@dp.message(Command("jenya_card"))
+async def jenya_card_status(msg: Message):
+    if not await has_permission(msg.from_user.id, "manage_income"):
+        return await msg.answer("Только для администраторов.")
+    async with pool.acquire() as conn:
+        balance = await _get_jenya_card_balance(conn)
+        rows = await conn.fetch(
+            """
+            SELECT id, kind, amount, comment, happened_at
+            FROM jenya_card_entries
+            WHERE COALESCE(is_deleted,false)=FALSE
+            ORDER BY happened_at DESC, id DESC
+            LIMIT 10
+            """
+        )
+    lines = [f"Карта Жени: {format_money(balance)}₽"]
+    if rows:
+        lines.append("")
+        lines.append("Последние операции:")
+        for row in rows:
+            dt = row["happened_at"].astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
+            amt = format_money(Decimal(row["amount"] or 0))
+            prefix = "+" if row["kind"] in ("income","opening_balance") else "-"
+            comment = (row["comment"] or "—").strip()
+            lines.append(f"{dt} | {prefix}{amt}₽ | {comment}")
+    else:
+        lines.append("Операций пока нет.")
+    await msg.answer("\n".join(lines), reply_markup=admin_root_kb())
+
+
+@dp.message(Command("jenya_card_income"))
+async def jenya_card_income_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "manage_income"):
+        return await msg.answer("Только для администраторов.")
+    await state.clear()
+    await state.update_data(jenya_card_kind="income")
+    async with pool.acquire() as conn:
+        balance = await _get_jenya_card_balance(conn)
+    await state.set_state(JenyaCardFSM.waiting_amount)
+    await msg.answer(
+        f"Введите сумму поступления на карту Жени. Текущий баланс: {format_money(balance)}₽",
+        reply_markup=cancel_kb,
+    )
+
+
+@dp.message(Command("jenya_card_expense"))
+async def jenya_card_expense_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "manage_income"):
+        return await msg.answer("Только для администраторов.")
+    await state.clear()
+    await state.update_data(jenya_card_kind="expense")
+    async with pool.acquire() as conn:
+        balance = await _get_jenya_card_balance(conn)
+    await state.set_state(JenyaCardFSM.waiting_amount)
+    await msg.answer(
+        f"Введите сумму списания с карты Жени. Текущий баланс: {format_money(balance)}₽",
+        reply_markup=cancel_kb,
+    )
+
+
+@dp.message(JenyaCardFSM.waiting_amount, F.text)
+async def jenya_card_amount_input(msg: Message, state: FSMContext):
+    if (msg.text or "").strip().lower() == "отмена":
+        await cancel_any(msg, state)
+        return
+    amount = parse_money(msg.text)
+    if amount is None or amount <= 0:
+        return await msg.answer("Введите положительную сумму.", reply_markup=cancel_kb)
+    data = await state.get_data()
+    kind = data.get("jenya_card_kind") or "income"
+    if kind == "expense":
+        async with pool.acquire() as conn:
+            balance = await _get_jenya_card_balance(conn)
+        if amount > balance:
+            return await msg.answer(
+                f"На карте сейчас {format_money(balance)}₽. Нельзя списать больше.",
+                reply_markup=cancel_kb,
+            )
+    await state.update_data(jenya_card_amount=str(amount))
+    await state.set_state(JenyaCardFSM.waiting_comment)
+    prompt = "Комментарий к операции? (или 'Без комментария')"
+    await msg.answer(prompt, reply_markup=jenya_card_comment_kb)
+
+
+@dp.message(JenyaCardFSM.waiting_comment, F.text)
+async def jenya_card_comment_input(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    if text.lower() == "отмена":
+        await cancel_any(msg, state)
+        return
+    if text.lower() == "без комментария" or not text:
+        text = "Без комментария"
+    await state.update_data(jenya_card_comment=text)
+    data = await state.get_data()
+    amount = Decimal(data.get("jenya_card_amount") or "0")
+    kind = data.get("jenya_card_kind") or "income"
+    action = "поступление" if kind == "income" else "списание"
+    await state.set_state(JenyaCardFSM.waiting_confirm)
+    lines = [
+        f"Подтвердите {action} на карту Жени:",
+        f"Сумма: {format_money(amount)}₽",
+        f"Комментарий: {text}",
+    ]
+    await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("jenya_card"))
+
+
+@dp.callback_query(JenyaCardFSM.waiting_confirm)
+async def jenya_card_confirm_handler(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+    if data not in {"jenya_card:yes", "jenya_card:cancel"}:
+        await query.answer()
+        return
+    await query.answer()
+    await query.message.edit_reply_markup(None)
+    if data.endswith("cancel"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Операция отменена.", reply_markup=admin_root_kb())
+        return
+    payload = await state.get_data()
+    try:
+        amount = Decimal(payload.get("jenya_card_amount") or "0")
+        comment = payload.get("jenya_card_comment") or "Без комментария"
+        kind = payload.get("jenya_card_kind") or "income"
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("jenya_card confirm payload error: %s", exc)
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Не удалось прочитать данные операции.", reply_markup=admin_root_kb())
+        return
+    async with pool.acquire() as conn:
+        balance = await _get_jenya_card_balance(conn)
+        if kind == "expense" and amount > balance:
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            await query.message.answer(
+                f"На карте только {format_money(balance)}₽. Списание отклонено.",
+                reply_markup=admin_root_kb(),
+            )
+            return
+        try:
+            entry, new_balance = await _record_jenya_card_entry(
+                conn,
+                kind=kind,
+                amount=amount,
+                comment=comment,
+                created_by=query.from_user.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("jenya_card record failed: %s", exc)
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            await query.message.answer(f"Ошибка при записи операции: {exc}", reply_markup=admin_root_kb())
+            return
+    when = entry["happened_at"].astimezone(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    prefix = "поступление" if kind == "income" else "списание"
+    text = (
+        f"Карта Жени — {prefix} #{entry['id']}\n"
+        f"Сумма: {format_money(amount)}₽\n"
+        f"Комментарий: {comment}\n"
+        f"Баланс: {format_money(new_balance)}₽\n"
+        f"Время: {when}"
+    )
+    await query.message.answer(text, reply_markup=admin_root_kb())
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+
 @dp.message(Command("mysalary"))
 async def my_salary(msg: Message):
     # доступ только для мастеров
@@ -8091,6 +8342,15 @@ address_input_kb = ReplyKeyboardMarkup(
 )
 
 dividend_comment_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Без комментария")],
+        [KeyboardButton(text="Отмена")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+jenya_card_comment_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Без комментария")],
         [KeyboardButton(text="Отмена")],
@@ -9699,6 +9959,7 @@ async def main():
         await ensure_cashbook_wire_schema(_conn)
         await ensure_orders_rating_schema(_conn)
         await ensure_order_payments_schema(_conn)
+        await ensure_jenya_card_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(
