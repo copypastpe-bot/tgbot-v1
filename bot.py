@@ -65,6 +65,7 @@ class WireLinkFSM(StatesGroup):
 class ExpenseFSM(StatesGroup):
     waiting_amount = State()
     waiting_comment = State()
+    waiting_owner = State()
     waiting_confirm = State()
 
 
@@ -77,11 +78,6 @@ class WithdrawFSM(StatesGroup):
 class TxDeleteFSM(StatesGroup):
     waiting_date = State()
     waiting_pick = State()
-    waiting_confirm = State()
-
-class JenyaCardFSM(StatesGroup):
-    waiting_amount = State()
-    waiting_comment = State()
     waiting_confirm = State()
 
 class DividendFSM(StatesGroup):
@@ -444,8 +440,21 @@ async def ensure_jenya_card_schema(conn: asyncpg.Connection) -> None:
             happened_at timestamptz NOT NULL DEFAULT NOW(),
             created_at timestamptz NOT NULL DEFAULT NOW(),
             created_by bigint,
-            is_deleted boolean NOT NULL DEFAULT FALSE
+            is_deleted boolean NOT NULL DEFAULT FALSE,
+            cash_entry_id bigint
         );
+        """
+    )
+    await conn.execute("ALTER TABLE jenya_card_entries ADD COLUMN IF NOT EXISTS cash_entry_id bigint;")
+    await conn.execute(
+        """
+        DO $$
+        BEGIN
+            ALTER TABLE jenya_card_entries
+                ADD CONSTRAINT jenya_card_entries_cash_entry_id_key UNIQUE (cash_entry_id);
+        EXCEPTION
+            WHEN duplicate_object THEN NULL;
+        END $$;
         """
     )
     exists = await conn.fetchval("SELECT 1 FROM jenya_card_entries LIMIT 1")
@@ -3721,7 +3730,14 @@ async def reports_period_end_input(msg: Message, state: FSMContext):
     await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
 
 
-async def _record_income(conn: asyncpg.Connection, method: str, amount: Decimal, comment: str):
+async def _record_income(
+    conn: asyncpg.Connection,
+    method: str,
+    amount: Decimal,
+    comment: str,
+    *,
+    created_by: int | None = None,
+):
     norm = norm_pay_method_py(method)
     tx = await conn.fetchrow(
         """
@@ -3731,6 +3747,19 @@ async def _record_income(conn: asyncpg.Connection, method: str, amount: Decimal,
         """,
         norm, amount, comment or "Приход",
     )
+    if norm == "Карта Женя":
+        try:
+            await _record_jenya_card_entry(
+                conn,
+                kind="income",
+                amount=amount,
+                comment=comment or "Приход",
+                created_by=created_by,
+                happened_at=tx["happened_at"],
+                cash_entry_id=tx["id"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to mirror Jenya card income for cash tx #%s: %s", tx["id"], exc)
     # notify money-flow chat
     try:
         if MONEY_FLOW_CHAT_ID:
@@ -3814,19 +3843,34 @@ async def _record_order_income(
             order_id,
             master_id,
         )
+    display = comment
+    if notify_label:
+        display = f"{notify_label} / Заказ №{order_id}"
     # notify money-flow chat
     try:
         if MONEY_FLOW_CHAT_ID:
             balance = await get_cash_balance_excluding_withdrawals(conn)
-            if notify_label:
-                display = f"{notify_label} / Заказ №{order_id}"
-            else:
-                display = comment
             line1 = f"✅-{format_money(Decimal(amount))}₽ {display}"
             line2 = f"Касса - {format_money(balance)}₽"
             await bot.send_message(MONEY_FLOW_CHAT_ID, line1 + "\n" + line2)
     except Exception as _e:
         logging.warning("money-flow order income notify failed: %s", _e)
+    if tx and tx.get("id"):
+        try:
+            if norm == "Карта Женя":
+                await _record_jenya_card_entry(
+                    conn,
+                    kind="income",
+                    amount=amount,
+                    comment=display if notify_label else comment,
+                    created_by=None,
+                    happened_at=tx["happened_at"],
+                    cash_entry_id=tx["id"],
+                )
+            else:
+                await _remove_jenya_card_entry(conn, tx["id"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to sync Jenya card for order income #%s: %s", tx["id"], exc)
     return tx
 
 
@@ -3880,31 +3924,76 @@ async def _record_jenya_card_entry(
     kind: str,
     amount: Decimal,
     comment: str,
-    created_by: int,
-) -> asyncpg.Record:
-    entry = await conn.fetchrow(
-        """
-        INSERT INTO jenya_card_entries(kind, amount, comment, happened_at, created_by)
-        VALUES ($1, $2, $3, NOW(), $4)
-        RETURNING id, happened_at
-        """,
-        kind,
-        amount,
-        comment,
-        created_by,
-    )
+    created_by: int | None,
+    happened_at: datetime | None = None,
+    cash_entry_id: int | None = None,
+) -> tuple[asyncpg.Record, Decimal]:
+    happened = happened_at or datetime.now(timezone.utc)
+    entry: asyncpg.Record | None = None
+    if cash_entry_id is not None:
+        entry = await conn.fetchrow(
+            """
+            UPDATE jenya_card_entries
+            SET kind=$2,
+                amount=$3,
+                comment=$4,
+                happened_at=$5,
+                created_by=$6,
+                is_deleted=FALSE
+            WHERE cash_entry_id=$1
+            RETURNING id, happened_at, kind, amount, comment, cash_entry_id
+            """,
+            cash_entry_id,
+            kind,
+            amount,
+            comment,
+            happened,
+            created_by,
+        )
+    if not entry:
+        entry = await conn.fetchrow(
+            """
+            INSERT INTO jenya_card_entries(cash_entry_id, kind, amount, comment, happened_at, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, happened_at, kind, amount, comment, cash_entry_id
+            """,
+            cash_entry_id,
+            kind,
+            amount,
+            comment,
+            happened,
+            created_by,
+        )
     balance = await _get_jenya_card_balance(conn)
     if JENYA_CARD_CHAT_ID:
         try:
             prefix = "➕" if kind in ("income", "opening_balance") else "➖"
+            ref = entry["cash_entry_id"]
+            ref_label = f" (касса №{ref})" if ref else ""
+            line1 = f"{prefix}{format_money(amount)}₽ Карта Жени{ref_label}"
+            if comment:
+                line1 += f" — {comment}"
             lines = [
-                f"{prefix}{format_money(amount)}₽ Карта Жени — {comment}",
+                line1,
                 f"Остаток: {format_money(balance)}₽",
             ]
             await bot.send_message(JENYA_CARD_CHAT_ID, "\n".join(lines))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to send Jenya card log: %s", exc)
     return entry, balance
+
+
+async def _remove_jenya_card_entry(conn: asyncpg.Connection, cash_entry_id: int | None) -> None:
+    if not cash_entry_id:
+        return
+    await conn.execute(
+        """
+        UPDATE jenya_card_entries
+        SET is_deleted=TRUE
+        WHERE cash_entry_id=$1 AND COALESCE(is_deleted,false)=FALSE
+        """,
+        cash_entry_id,
+    )
 
 
 # Payment method normalizer (Python side to mirror SQL norm_pay_method)
@@ -3949,8 +4038,6 @@ async def set_commands():
         BotCommand(command="order_remove", description="Удалить заказ"),
         BotCommand(command="dividend", description="Выплата дивидендов"),
         BotCommand(command="jenya_card", description="Баланс Карты Жени"),
-        BotCommand(command="jenya_card_income", description="Приход на карту Жени"),
-        BotCommand(command="jenya_card_expense", description="Расход с карты Жени"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -6253,11 +6340,40 @@ async def expense_wizard_comment(msg: Message, state: FSMContext):
     data = await state.get_data()
     amount = Decimal(data.get("amount"))
     await state.update_data(comment=txt)
+    await state.set_state(ExpenseFSM.waiting_owner)
+    await msg.answer(
+        "Кто оплачивает расход? Выберите «Дима» (обычная касса) или «Женя» (карта).",
+        reply_markup=expense_owner_kb,
+    )
+
+
+@dp.message(ExpenseFSM.waiting_owner)
+async def expense_wizard_owner(msg: Message, state: FSMContext):
+    choice = (msg.text or "").strip().lower()
+    if choice == "отмена":
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        return await msg.answer("Операция отменена.", reply_markup=admin_root_kb())
+    owner_map = {
+        "дима": "dima",
+        "dima": "dima",
+        "женя": "jenya",
+        "jenya": "jenya",
+    }
+    owner = owner_map.get(choice)
+    if not owner:
+        return await msg.answer("Выберите «Дима» или «Женя» кнопками ниже.", reply_markup=expense_owner_kb)
+    await state.update_data(expense_owner=owner)
+    data = await state.get_data()
+    amount = Decimal(data.get("amount"))
+    comment = data.get("comment") or "Расход"
     await state.set_state(ExpenseFSM.waiting_confirm)
+    owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
     lines = [
         "Подтвердите расход:",
         f"Сумма: {format_money(amount)}₽",
-        f"Комментарий: {txt}",
+        f"Комментарий: {comment}",
+        f"Источник: {owner_label}",
     ]
     await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("expense_confirm"))
 
@@ -7108,6 +7224,7 @@ async def tx_remove_confirm(query: CallbackQuery, state: FSMContext):
                 target_id,
             )
             if row:
+                await _remove_jenya_card_entry(conn, row["id"])
                 balance_after = await get_cash_balance_excluding_withdrawals(conn)
 
     if not row:
@@ -7655,7 +7772,7 @@ async def income_confirm_handler(query: CallbackQuery, state: FSMContext):
 
     async with pool.acquire() as conn:
         try:
-            tx = await _record_income(conn, method, amount, comment)
+            tx = await _record_income(conn, method, amount, comment, created_by=query.from_user.id)
         except Exception as exc:  # noqa: BLE001
             logging.exception("income confirm failed: %s", exc)
             await state.clear()
@@ -7713,6 +7830,7 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
     try:
         amount = Decimal(payload.get("amount") or "0")
         comment = payload.get("comment") or "Расход"
+        owner = (payload.get("expense_owner") or "dima").lower()
     except Exception as exc:  # noqa: BLE001
         logging.exception("expense confirm payload error: %s", exc)
         await state.clear()
@@ -7723,6 +7841,19 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
     async with pool.acquire() as conn:
         try:
             tx = await _record_expense(conn, amount, comment, method="прочее")
+            if owner == "jenya":
+                try:
+                    await _record_jenya_card_entry(
+                        conn,
+                        kind="expense",
+                        amount=amount,
+                        comment=comment,
+                        created_by=query.from_user.id,
+                        happened_at=tx["happened_at"],
+                        cash_entry_id=tx["id"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to mirror Jenya card expense for tx #%s: %s", tx["id"], exc)
         except Exception as exc:  # noqa: BLE001
             logging.exception("expense confirm failed: %s", exc)
             await state.clear()
@@ -7731,8 +7862,9 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
             return
 
     when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
+    owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
     await query.message.answer(
-        f"Расход №{tx['id']}: {format_money(amount)}₽ — {when}\nКомментарий: {comment}",
+        f"Расход №{tx['id']}: {format_money(amount)}₽ — {when}\nКомментарий: {comment}\nИсточник: {owner_label}",
         reply_markup=admin_root_kb(),
     )
     await state.clear()
@@ -7842,7 +7974,7 @@ async def add_income(msg: Message):
     method = norm_pay_method_py(method_raw)
 
     async with pool.acquire() as conn:
-        rec = await _record_income(conn, method, amount, comment)
+        rec = await _record_income(conn, method, amount, comment, created_by=msg.from_user.id)
 
     lines = [
         f"✅ Приход №{rec['id']}",
@@ -7861,13 +7993,26 @@ async def add_expense(msg: Message, command: CommandObject):
 
     # command.args — всё после /expense, например: "123 Тест расхода"
     if not command.args:
-        return await msg.answer("Формат: /expense <сумма> <комментарий>")
+        return await msg.answer("Формат: /expense <сумма> [дима|женя] <комментарий>")
 
-    parts = command.args.split(maxsplit=1)
-    if len(parts) < 2:
-        return await msg.answer("Не указан комментарий. Формат: /expense <сумма> <комментарий>")
+    tokens = command.args.split()
+    if len(tokens) < 2:
+        return await msg.answer("Не указан комментарий. Формат: /expense <сумма> [дима|женя] <комментарий>")
 
-    amount_str, comment = parts
+    amount_str = tokens[0]
+    owner = "dima"
+    comment_tokens = tokens[1:]
+    if comment_tokens:
+        first = comment_tokens[0].lower()
+        if first in {"дима", "dima"}:
+            owner = "dima"
+            comment_tokens = comment_tokens[1:]
+        elif first in {"женя", "jenya"}:
+            owner = "jenya"
+            comment_tokens = comment_tokens[1:]
+    if not comment_tokens:
+        return await msg.answer("Не указан комментарий. После суммы добавьте текст описания расхода.")
+    comment = " ".join(comment_tokens)
 
     try:
         amount = Decimal(amount_str)
@@ -7878,12 +8023,27 @@ async def add_expense(msg: Message, command: CommandObject):
 
     async with pool.acquire() as conn:
         rec = await _record_expense(conn, amount, comment, method="прочее")
+        if owner == "jenya":
+            try:
+                await _record_jenya_card_entry(
+                    conn,
+                    kind="expense",
+                    amount=amount,
+                    comment=comment,
+                    created_by=msg.from_user.id,
+                    happened_at=rec["happened_at"],
+                    cash_entry_id=rec["id"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to mirror Jenya card expense for tx #%s: %s", rec["id"], exc)
+        owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
     await msg.answer(
         "\n".join([
             f"✅ Расход №{rec['id']}",
             f"Сумма: {amount}₽",
             f"Когда: {rec['happened_at']:%Y-%m-%d %H:%M}",
             f"Комментарий: {comment}",
+            f"Источник: {owner_label}",
         ])
     )
 
@@ -8058,7 +8218,7 @@ async def jenya_card_status(msg: Message):
         balance = await _get_jenya_card_balance(conn)
         rows = await conn.fetch(
             """
-            SELECT id, kind, amount, comment, happened_at
+            SELECT id, kind, amount, comment, happened_at, cash_entry_id
             FROM jenya_card_entries
             WHERE COALESCE(is_deleted,false)=FALSE
             ORDER BY happened_at DESC, id DESC
@@ -8074,148 +8234,12 @@ async def jenya_card_status(msg: Message):
             amt = format_money(Decimal(row["amount"] or 0))
             prefix = "+" if row["kind"] in ("income","opening_balance") else "-"
             comment = (row["comment"] or "—").strip()
-            lines.append(f"{dt} | {prefix}{amt}₽ | {comment}")
+            ref = row["cash_entry_id"] or "—"
+            lines.append(f"{dt} | {prefix}{amt}₽ | касса №{ref} | {comment}")
     else:
         lines.append("Операций пока нет.")
     await msg.answer("\n".join(lines), reply_markup=admin_root_kb())
 
-
-@dp.message(Command("jenya_card_income"))
-async def jenya_card_income_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "manage_income"):
-        return await msg.answer("Только для администраторов.")
-    await state.clear()
-    await state.update_data(jenya_card_kind="income")
-    async with pool.acquire() as conn:
-        balance = await _get_jenya_card_balance(conn)
-    await state.set_state(JenyaCardFSM.waiting_amount)
-    await msg.answer(
-        f"Введите сумму поступления на карту Жени. Текущий баланс: {format_money(balance)}₽",
-        reply_markup=cancel_kb,
-    )
-
-
-@dp.message(Command("jenya_card_expense"))
-async def jenya_card_expense_start(msg: Message, state: FSMContext):
-    if not await has_permission(msg.from_user.id, "manage_income"):
-        return await msg.answer("Только для администраторов.")
-    await state.clear()
-    await state.update_data(jenya_card_kind="expense")
-    async with pool.acquire() as conn:
-        balance = await _get_jenya_card_balance(conn)
-    await state.set_state(JenyaCardFSM.waiting_amount)
-    await msg.answer(
-        f"Введите сумму списания с карты Жени. Текущий баланс: {format_money(balance)}₽",
-        reply_markup=cancel_kb,
-    )
-
-
-@dp.message(JenyaCardFSM.waiting_amount, F.text)
-async def jenya_card_amount_input(msg: Message, state: FSMContext):
-    if (msg.text or "").strip().lower() == "отмена":
-        await cancel_any(msg, state)
-        return
-    amount = parse_money(msg.text)
-    if amount is None or amount <= 0:
-        return await msg.answer("Введите положительную сумму.", reply_markup=cancel_kb)
-    data = await state.get_data()
-    kind = data.get("jenya_card_kind") or "income"
-    if kind == "expense":
-        async with pool.acquire() as conn:
-            balance = await _get_jenya_card_balance(conn)
-        if amount > balance:
-            return await msg.answer(
-                f"На карте сейчас {format_money(balance)}₽. Нельзя списать больше.",
-                reply_markup=cancel_kb,
-            )
-    await state.update_data(jenya_card_amount=str(amount))
-    await state.set_state(JenyaCardFSM.waiting_comment)
-    prompt = "Комментарий к операции? (или 'Без комментария')"
-    await msg.answer(prompt, reply_markup=jenya_card_comment_kb)
-
-
-@dp.message(JenyaCardFSM.waiting_comment, F.text)
-async def jenya_card_comment_input(msg: Message, state: FSMContext):
-    text = (msg.text or "").strip()
-    if text.lower() == "отмена":
-        await cancel_any(msg, state)
-        return
-    if text.lower() == "без комментария" or not text:
-        text = "Без комментария"
-    await state.update_data(jenya_card_comment=text)
-    data = await state.get_data()
-    amount = Decimal(data.get("jenya_card_amount") or "0")
-    kind = data.get("jenya_card_kind") or "income"
-    action = "поступление" if kind == "income" else "списание"
-    await state.set_state(JenyaCardFSM.waiting_confirm)
-    lines = [
-        f"Подтвердите {action} на карту Жени:",
-        f"Сумма: {format_money(amount)}₽",
-        f"Комментарий: {text}",
-    ]
-    await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("jenya_card"))
-
-
-@dp.callback_query(JenyaCardFSM.waiting_confirm)
-async def jenya_card_confirm_handler(query: CallbackQuery, state: FSMContext):
-    data = (query.data or "").strip()
-    if data not in {"jenya_card:yes", "jenya_card:cancel"}:
-        await query.answer()
-        return
-    await query.answer()
-    await query.message.edit_reply_markup(None)
-    if data.endswith("cancel"):
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        await query.message.answer("Операция отменена.", reply_markup=admin_root_kb())
-        return
-    payload = await state.get_data()
-    try:
-        amount = Decimal(payload.get("jenya_card_amount") or "0")
-        comment = payload.get("jenya_card_comment") or "Без комментария"
-        kind = payload.get("jenya_card_kind") or "income"
-    except Exception as exc:  # noqa: BLE001
-        logging.exception("jenya_card confirm payload error: %s", exc)
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        await query.message.answer("Не удалось прочитать данные операции.", reply_markup=admin_root_kb())
-        return
-    async with pool.acquire() as conn:
-        balance = await _get_jenya_card_balance(conn)
-        if kind == "expense" and amount > balance:
-            await state.clear()
-            await state.set_state(AdminMenuFSM.root)
-            await query.message.answer(
-                f"На карте только {format_money(balance)}₽. Списание отклонено.",
-                reply_markup=admin_root_kb(),
-            )
-            return
-        try:
-            entry, new_balance = await _record_jenya_card_entry(
-                conn,
-                kind=kind,
-                amount=amount,
-                comment=comment,
-                created_by=query.from_user.id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logging.exception("jenya_card record failed: %s", exc)
-            await state.clear()
-            await state.set_state(AdminMenuFSM.root)
-            await query.message.answer(f"Ошибка при записи операции: {exc}", reply_markup=admin_root_kb())
-            return
-    when = entry["happened_at"].astimezone(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
-    prefix = "поступление" if kind == "income" else "списание"
-    text = (
-        f"Карта Жени — {prefix} #{entry['id']}\n"
-        f"Сумма: {format_money(amount)}₽\n"
-        f"Комментарий: {comment}\n"
-        f"Баланс: {format_money(new_balance)}₽\n"
-        f"Время: {when}"
-    )
-    await query.message.answer(text, reply_markup=admin_root_kb())
-    await state.clear()
-    await state.set_state(AdminMenuFSM.root)
 
 @dp.message(Command("mysalary"))
 async def my_salary(msg: Message):
@@ -8350,9 +8374,9 @@ dividend_comment_kb = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 
-jenya_card_comment_kb = ReplyKeyboardMarkup(
+expense_owner_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Без комментария")],
+        [KeyboardButton(text="Дима"), KeyboardButton(text="Женя")],
         [KeyboardButton(text="Отмена")],
     ],
     resize_keyboard=True,
