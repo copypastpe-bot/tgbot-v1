@@ -166,7 +166,7 @@ BONUS_BIRTHDAY_VALUE = Decimal("300")
 PROMO_BONUS_VALUE = 200
 PROMO_REMINDER_FIRST_GAP_MONTHS = 8
 PROMO_REMINDER_SECOND_GAP_MONTHS = 2
-PROMO_RANDOM_DELAY_RANGE = (1, 10)
+PROMO_RANDOM_DELAY_RANGE = (60, 3600)
 PROMO_BONUS_TTL_DAYS = 365
 PROMO_DAILY_LIMIT = int(os.getenv("PROMO_DAILY_LIMIT", "30"))
 LEADS_PROMO_CAMPAIGN = os.getenv("LEADS_PROMO_CAMPAIGN", "week1")
@@ -1024,8 +1024,8 @@ async def _schedule_promo_notification(
     event_key: str,
 ) -> bool:
     bonus_amount, expire_at = await _ensure_min_bonus_for_promo(conn, client_id)
-    delay_minutes = random.randint(*PROMO_RANDOM_DELAY_RANGE)
-    scheduled_at = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+    delay_seconds = random.randint(*PROMO_RANDOM_DELAY_RANGE)
+    scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
     payload = {
         "bonus": _format_bonus_amount(bonus_amount),
         "expire_date": _format_expire_label(expire_at),
@@ -1088,7 +1088,7 @@ async def _schedule_birthday_congrats(
         client_id,
     )
     event_key = BDAY_TEMPLATE_KEYS[next_variant - 1]
-    delay_seconds = random.randint(60, 600)
+    delay_seconds = random.randint(60, 3600)
     scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
     payload = {
         "bonus_balance": _format_bonus_amount(bonus_balance),
