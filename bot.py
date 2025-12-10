@@ -450,10 +450,17 @@ async def ensure_jenya_card_schema(conn: asyncpg.Connection) -> None:
         """
         DO $$
         BEGIN
-            ALTER TABLE jenya_card_entries
-                ADD CONSTRAINT jenya_card_entries_cash_entry_id_key UNIQUE (cash_entry_id);
-        EXCEPTION
-            WHEN duplicate_object THEN NULL;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE c.conname = 'jenya_card_entries_cash_entry_id_key'
+                  AND t.relname = 'jenya_card_entries'
+            ) THEN
+                ALTER TABLE jenya_card_entries
+                    ADD CONSTRAINT jenya_card_entries_cash_entry_id_key UNIQUE (cash_entry_id);
+            END IF;
         END $$;
         """
     )
