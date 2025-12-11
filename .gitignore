@@ -32,3 +32,4 @@ test.db
 trace.txt
 .env.local
 .venv
+docs/Sheets.json

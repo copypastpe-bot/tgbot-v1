@@ -22,6 +22,9 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from typing import Mapping, Any, Sequence, Callable, List, Dict
+import requests
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleRequest
 
 # ===== FSM State Groups =====
 class AdminMenuFSM(StatesGroup):
@@ -152,6 +155,10 @@ JENYA_CARD_INITIAL_BALANCE = Decimal(os.getenv("JENYA_CARD_INITIAL_BALANCE", "0"
 WAHELP_WEBHOOK_HOST = os.getenv("WAHELP_WEBHOOK_HOST", "0.0.0.0")
 WAHELP_WEBHOOK_PORT = int(os.getenv("WAHELP_WEBHOOK_PORT", "0") or "0")
 WAHELP_WEBHOOK_TOKEN = os.getenv("WAHELP_WEBHOOK_TOKEN")
+SHEETS_CREDENTIALS_PATH = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "docs/Sheets.json")
+TEXTS_SHEET_ID = os.getenv("TEXTS_SHEET_ID")
+TEXTS_PROMO_RANGE = os.getenv("TEXTS_PROMO_RANGE", "promo!A:C")
+TEXTS_BDAY_RANGE = os.getenv("TEXTS_BDAY_RANGE", "birthday!A:C")
 
 # env rules
 MIN_CASH = Decimal(os.getenv("MIN_CASH", "2500"))
@@ -205,6 +212,82 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+_texts_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+TEXTS_CACHE_TTL_SEC = 900
+
+
+def _google_access_token() -> str:
+    if not TEXTS_SHEET_ID or not Path(SHEETS_CREDENTIALS_PATH).exists():
+        raise RuntimeError("Sheets credentials or sheet id not configured")
+    creds = service_account.Credentials.from_service_account_file(
+        SHEETS_CREDENTIALS_PATH,
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    if not creds.valid:
+        creds.refresh(GoogleRequest())
+    return creds.token
+
+
+def _fetch_sheet_rows(range_name: str) -> list[list[str]]:
+    cache_key = f"{TEXTS_SHEET_ID}:{range_name}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _texts_cache.get(cache_key)
+    if cached and cached[0] > now_ts:
+        return cached[1]
+    token = _google_access_token()
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{TEXTS_SHEET_ID}/values/{range_name}"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    rows: list[list[str]] = data.get("values") or []
+    _texts_cache[cache_key] = (now_ts + TEXTS_CACHE_TTL_SEC, rows)
+    return rows
+
+
+def _parse_sheet_texts(rows: list[list[str]]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for row in rows[1:]:  # skip header
+        if len(row) < 2:
+            continue
+        type_val = row[0].strip() if len(row) >= 1 else ""
+        text_val = row[1].strip()
+        date_val = row[2].strip() if len(row) >= 3 else ""
+        if not text_val:
+            continue
+        results.append({"type": type_val, "text": text_val, "date": date_val})
+    if not results:
+        return results
+    # фильтруем по самой свежей дате, если указан столбец
+    dates = [r["date"] for r in results if r.get("date")]
+    if dates:
+        latest = max(dates)
+        results = [r for r in results if r.get("date") == latest]
+    return results
+
+
+def get_promo_texts() -> list[str]:
+    if not TEXTS_SHEET_ID:
+        return []
+    try:
+        rows = _fetch_sheet_rows(TEXTS_PROMO_RANGE)
+        parsed = _parse_sheet_texts(rows)
+        return [p["text"] for p in parsed if p.get("text")]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to fetch promo texts from Sheets: %s", exc)
+        return []
+
+
+def get_birthday_texts() -> list[str]:
+    if not TEXTS_SHEET_ID:
+        return []
+    try:
+        rows = _fetch_sheet_rows(TEXTS_BDAY_RANGE)
+        parsed = _parse_sheet_texts(rows)
+        return [p["text"] for p in parsed if p.get("text")]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to fetch birthday texts from Sheets: %s", exc)
+        return []
 
 
 async def _log_missing_messenger(contact: ClientContact, channel: ChannelKind, reason: str) -> None:
@@ -709,14 +792,16 @@ async def _send_leads_campaign_batch() -> None:
     if LEADS_MAX_PER_DAY <= 0:
         logger.info("Leads promo disabled: LEADS_MAX_PER_DAY=%s", LEADS_MAX_PER_DAY)
         return
+    promo_texts = get_promo_texts()
     available_campaigns = list(LEADS_PROMO_CAMPAIGNS.keys())
-    if not available_campaigns:
-        logger.warning("No leads promo campaigns defined")
-        return
-    campaign = LEADS_PROMO_CAMPAIGN
-    if campaign not in LEADS_PROMO_CAMPAIGNS:
-        campaign = available_campaigns[0]
     async with pool.acquire() as conn:
+        campaign = LEADS_PROMO_CAMPAIGN
+        if not promo_texts:
+            if not available_campaigns:
+                logger.warning("No leads promo campaigns defined")
+                return
+            if campaign not in LEADS_PROMO_CAMPAIGNS:
+                campaign = available_campaigns[0]
         leads = await _select_leads_for_campaign(conn, campaign=campaign, limit=LEADS_MAX_PER_DAY)
         if not leads:
             logger.info("No leads to send for campaign %s", campaign)
@@ -732,10 +817,15 @@ async def _send_leads_campaign_batch() -> None:
                 failed += 1
                 await _sleep_between_leads(idx, total_leads)
                 continue
-            current_campaign = random.choice(available_campaigns)
-            variants = LEADS_PROMO_CAMPAIGNS.get(current_campaign) or []
-            variant = random.randint(1, len(variants)) if variants else 1
-            text = _get_leads_campaign_text(current_campaign, variant)
+            if promo_texts:
+                current_campaign = "sheet"
+                variant = (idx % len(promo_texts)) + 1
+                text = promo_texts[idx % len(promo_texts)]
+            else:
+                current_campaign = random.choice(available_campaigns)
+                variants = LEADS_PROMO_CAMPAIGNS.get(current_campaign) or []
+                variant = random.randint(1, len(variants)) if variants else 1
+                text = _get_leads_campaign_text(current_campaign, variant)
             name = lead["full_name"] or lead["name"] or "Клиент"
             phone = lead["phone"]
             wahelp_payload = None
