@@ -159,6 +159,7 @@ SHEETS_CREDENTIALS_PATH = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "docs/Sheets.js
 TEXTS_SHEET_ID = os.getenv("TEXTS_SHEET_ID")
 TEXTS_PROMO_RANGE = os.getenv("TEXTS_PROMO_RANGE", "promo!A:C")
 TEXTS_BDAY_RANGE = os.getenv("TEXTS_BDAY_RANGE", "birthday!A:C")
+TEXTS_TG_LINK = os.getenv("TEXTS_TG_LINK", "")
 
 # env rules
 MIN_CASH = Decimal(os.getenv("MIN_CASH", "2500"))

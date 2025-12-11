@@ -19,6 +19,7 @@ from .outbox import (
     render_template,
 )
 from .rules import NotificationRules
+from bot import get_promo_texts, get_birthday_texts, TEXTS_TG_LINK
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ class NotificationWorker:
             requires_connection=entry.client_requires_connection,
             recipient_kind=entry.recipient_kind,
         )
-        message_text = render_template(entry.template, entry.payload)
+        message_text = self._build_message_text(entry)
 
         async with self.pool.acquire() as conn:
             try:
@@ -145,6 +146,38 @@ class NotificationWorker:
                 provider_payload=provider_payload,
                 provider_message_id=provider_message_id,
             )
+
+    def _build_message_text(self, entry: NotificationOutboxEntry) -> str:
+        template = entry.template
+        payload = dict(entry.payload)
+        ek = entry.event_key or ""
+        # try sheets for promo/birthday
+        try:
+            if ek.startswith("promo_reengage"):
+                texts = get_promo_texts()
+                if texts:
+                    idx = (entry.id - 1) % len(texts)
+                    template = texts[idx]
+                    template = (
+                        template
+                        .replace("{BONUS_SUM}", "{{bonus}}")
+                        .replace("{BONUS_EXPIRES_AT}", "{{expire_date}}")
+                        .replace("{TG_LINK}", TEXTS_TG_LINK or "")
+                    )
+            elif ek.startswith("birthday_congrats"):
+                texts = get_birthday_texts()
+                if texts:
+                    idx = (entry.id - 1) % len(texts)
+                    template = texts[idx]
+                    template = (
+                        template
+                        .replace("{BONUS_SUM}", "{{bonus_balance}}")
+                        .replace("{BONUS_EXPIRES_AT}", "{{expire_date}}")
+                        .replace("{TG_LINK}", TEXTS_TG_LINK or "")
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Sheet text fallback for %s failed: %s", ek, exc)
+        return render_template(template, payload)
 
 
 __all__ = ["NotificationWorker"]
