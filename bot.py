@@ -10104,7 +10104,13 @@ async def main():
             schedule_daily_job(20, 0, wire_pending_reminder_job, "wire_pending_reminder")
         )
     if notification_rules is not None:
-        notification_worker = NotificationWorker(pool, notification_rules)
+        notification_worker = NotificationWorker(
+            pool,
+            notification_rules,
+            promo_texts_fn=get_promo_texts,
+            birthday_texts_fn=get_birthday_texts,
+            tg_link=TEXTS_TG_LINK,
+        )
         notification_worker.start()
     if WAHELP_WEBHOOK_PORT > 0:
         try:

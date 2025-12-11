@@ -19,7 +19,6 @@ from .outbox import (
     render_template,
 )
 from .rules import NotificationRules
-from bot import get_promo_texts, get_birthday_texts, TEXTS_TG_LINK
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +32,18 @@ class NotificationWorker:
         poll_interval: float = 5.0,
         batch_size: int = 10,
         max_attempts: int = 5,
+        promo_texts_fn=None,
+        birthday_texts_fn=None,
+        tg_link: str = "",
     ) -> None:
         self.pool = pool
         self.rules = rules
         self.poll_interval = poll_interval
         self.batch_size = batch_size
         self.max_attempts = max_attempts
+        self.promo_texts_fn = promo_texts_fn
+        self.birthday_texts_fn = birthday_texts_fn
+        self.tg_link = tg_link
         self._task: asyncio.Task | None = None
         self._stopping = False
 
@@ -153,8 +158,8 @@ class NotificationWorker:
         ek = entry.event_key or ""
         # try sheets for promo/birthday
         try:
-            if ek.startswith("promo_reengage"):
-                texts = get_promo_texts()
+            if ek.startswith("promo_reengage") and callable(self.promo_texts_fn):
+                texts = self.promo_texts_fn() or []
                 if texts:
                     idx = (entry.id - 1) % len(texts)
                     template = texts[idx]
@@ -162,10 +167,10 @@ class NotificationWorker:
                         template
                         .replace("{BONUS_SUM}", "{{bonus}}")
                         .replace("{BONUS_EXPIRES_AT}", "{{expire_date}}")
-                        .replace("{TG_LINK}", TEXTS_TG_LINK or "")
+                        .replace("{TG_LINK}", self.tg_link or "")
                     )
-            elif ek.startswith("birthday_congrats"):
-                texts = get_birthday_texts()
+            elif ek.startswith("birthday_congrats") and callable(self.birthday_texts_fn):
+                texts = self.birthday_texts_fn() or []
                 if texts:
                     idx = (entry.id - 1) % len(texts)
                     template = texts[idx]
@@ -173,7 +178,7 @@ class NotificationWorker:
                         template
                         .replace("{BONUS_SUM}", "{{bonus_balance}}")
                         .replace("{BONUS_EXPIRES_AT}", "{{expire_date}}")
-                        .replace("{TG_LINK}", TEXTS_TG_LINK or "")
+                        .replace("{TG_LINK}", self.tg_link or "")
                     )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Sheet text fallback for %s failed: %s", ek, exc)
