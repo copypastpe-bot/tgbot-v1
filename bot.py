@@ -6361,6 +6361,7 @@ async def _begin_wire_entry_selection(target_msg: Message, state: FSMContext) ->
 async def link_payment_cmd(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "manage_income"):
         return await msg.answer("Только для администраторов.")
+    await _ensure_pending_wire_on_abort(state)
     await state.clear()
     await _begin_wire_entry_selection(msg, state)
 
@@ -6369,6 +6370,7 @@ async def link_payment_cmd(msg: Message, state: FSMContext):
 async def link_payment_menu(msg: Message, state: FSMContext):
     if not await has_permission(msg.from_user.id, "manage_income"):
         return await msg.answer("Только для администраторов.")
+    await _ensure_pending_wire_on_abort(state)
     await state.clear()
     await _begin_wire_entry_selection(msg, state)
 
@@ -6417,9 +6419,8 @@ async def _send_income_confirm(msg: Message, state: FSMContext, amount: Decimal 
 async def wire_link_pick_entry(msg: Message, state: FSMContext):
     raw = (msg.text or "").strip()
     if raw.lower() == "отмена":
-        await state.clear()
-        await state.set_state(AdminMenuFSM.root)
-        return await msg.answer("Ок, привязку можно выполнить позже.", reply_markup=admin_root_kb())
+        await _exit_wire_link_pending(msg, state)
+        return
     if raw.lower() in {"список", "обновить"}:
         return await _begin_wire_entry_selection(msg, state)
     try:
@@ -7960,6 +7961,7 @@ async def income_confirm_handler(query: CallbackQuery, state: FSMContext):
             "comment": comment,
         }
         if wire_pref == "now":
+            await _mark_wire_entry_pending(context["entry_id"], context["comment"])
             await state.update_data(wire_link_context=context)
             if not await _prompt_wire_order_selection(query.message, state):
                 await _exit_wire_link_pending(
@@ -8591,6 +8593,7 @@ async def ensure_master(user_id: int) -> bool:
 
 @dp.message(CommandStart())
 async def start_handler(msg: Message, state: FSMContext):
+    await _ensure_pending_wire_on_abort(state)
     await state.clear()
     global pool
     async with pool.acquire() as conn:
@@ -9236,6 +9239,14 @@ async def _mark_wire_entry_pending(entry_id: int | None, comment: str | None) ->
         entry_id,
         _format_pending_wire_comment(comment),
     )
+
+
+async def _ensure_pending_wire_on_abort(state: FSMContext) -> None:
+    data = await state.get_data()
+    ctx = data.get("wire_link_context") or {}
+    entry_id = ctx.get("entry_id")
+    if entry_id:
+        await _mark_wire_entry_pending(entry_id, ctx.get("comment"))
 
 
 async def _exit_wire_link_pending(msg: Message, state: FSMContext, custom_text: str | None = None):
