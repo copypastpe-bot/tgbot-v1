@@ -15,6 +15,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
     ContentType,
 )
 from aiogram.filters import CommandStart, Command, CommandObject, StateFilter
@@ -3485,8 +3486,62 @@ async def send_daily_reports() -> None:
 
 
 async def wire_pending_reminder_job() -> None:
-    """Placeholder for wire reminders until logic restored."""
-    logging.info("wire_pending_reminder_job placeholder run — no action configured")
+    if pool is None:
+        return
+    now_utc = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        if not await _should_run_daily_job(conn, "wire_pending_reminder", now_utc):
+            logger.info("wire_pending_reminder already run today, skipping")
+            return
+    wire_entries = await _fetch_pending_wire_entries()
+    wire_orders = await _fetch_orders_waiting_wire()
+    if not wire_entries and not wire_orders:
+        logger.info("wire_pending_reminder: nothing pending")
+        async with pool.acquire() as conn:
+            await _mark_daily_job_run(conn, "wire_pending_reminder", now_utc)
+        return
+
+    entry_total = sum(Decimal(row["amount"] or 0) for row in wire_entries)
+    order_total = sum(Decimal(row["amount_total"] or 0) for row in wire_orders)
+
+    lines: list[str] = ["💼 Непривязанные оплаты по р/с"]
+    if wire_entries:
+        lines.append(f"Количество: {len(wire_entries)}")
+        lines.append(f"Сумма: {format_money(entry_total)}₽")
+        for row in wire_entries:
+            lines.append(_format_pending_wire_entry_line(row))
+    else:
+        lines.append("Нет непривязанных оплат.")
+
+    lines.append("")
+    lines.append("📋 Заказы, ожидающие оплату по р/с")
+    if wire_orders:
+        lines.append(f"Количество: {len(wire_orders)}")
+        lines.append(f"Сумма: {format_money(order_total)}₽")
+        for row in wire_orders:
+            lines.append(_format_wire_order_line(row))
+    else:
+        lines.append("Нет заказов в ожидании оплаты.")
+
+    lines.append("")
+    lines.append("Нажмите «Привязать сейчас», чтобы выбрать оплату.")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Привязать сейчас", callback_data="wire_nudge:link")],
+            [InlineKeyboardButton(text="Напомнить завтра", callback_data="wire_nudge:later")],
+        ]
+    )
+    if not ADMIN_TG_IDS:
+        logger.warning("wire_pending_reminder: ADMIN_TG_IDS is empty")
+    else:
+        for admin_id in ADMIN_TG_IDS:
+            try:
+                await bot.send_message(admin_id, "\n".join(lines), reply_markup=kb)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to send wire reminder to %s: %s", admin_id, exc)
+    async with pool.acquire() as conn:
+        await _mark_daily_job_run(conn, "wire_pending_reminder", now_utc)
 
 
 async def run_birthday_jobs() -> None:
@@ -6250,31 +6305,45 @@ async def income_wizard_amount(msg: Message, state: FSMContext):
     await msg.answer("Комментарий? (введите текст или нажмите «Без комментария»)", reply_markup=kb)
 
 
-async def _begin_wire_entry_selection(target_msg: Message, state: FSMContext) -> bool:
+async def _fetch_pending_wire_entries(limit: int = 30) -> list[asyncpg.Record]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, amount, happened_at, comment, awaiting_order
+            SELECT id,
+                   amount,
+                   happened_at,
+                   comment,
+                   awaiting_order
             FROM cashbook_entries
-            WHERE kind='income'
-              AND method='р/с'
+            WHERE kind = 'income'
+              AND method = 'р/с'
               AND order_id IS NULL
               AND awaiting_order
               AND NOT COALESCE(is_deleted, false)
             ORDER BY happened_at
-            LIMIT 30
-            """
+            LIMIT $1
+            """,
+            limit,
         )
+    return rows
+
+
+def _format_pending_wire_entry_line(row: Mapping[str, Any]) -> str:
+    when_local = row["happened_at"].astimezone(MOSCOW_TZ)
+    amount = format_money(Decimal(row["amount"] or 0))
+    flag = " (ожидаем заказ)" if row.get("awaiting_order") else ""
+    return f"#{row['id']}: {amount}₽ — {when_local:%d.%m %H:%M}{flag}"
+
+
+async def _begin_wire_entry_selection(target_msg: Message, state: FSMContext) -> bool:
+    rows = await _fetch_pending_wire_entries()
     if not rows:
         await state.set_state(AdminMenuFSM.root)
         await target_msg.answer("Непривязанных оплат нет.", reply_markup=admin_root_kb())
         return False
     lines = ["Непривязанные оплаты:"]
     for row in rows:
-        when = row["happened_at"].astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
-        amount = format_money(Decimal(row["amount"]))
-        flag = " (ожидаем заказ)" if row["awaiting_order"] else ""
-        lines.append(f"#{row['id']}: {amount}₽ — {when}{flag}")
+        lines.append(_format_pending_wire_entry_line(row))
     await target_msg.answer("\n".join(lines))
     await state.set_state(WireLinkFSM.waiting_entry)
     await target_msg.answer(
