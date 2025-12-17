@@ -45,6 +45,9 @@ class NotificationOutboxEntry:
     client_user_id_tg: int | None
     client_requires_connection: bool
     notifications_enabled: bool
+    bot_tg_user_id: int | None = None
+    bot_started: bool = False
+    preferred_contact: str | None = None
 
 
 def _now_utc() -> datetime:
@@ -261,7 +264,10 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
     if client_ids:
         client_rows = await conn.fetch(
             """
-            SELECT id, full_name, phone, wahelp_preferred_channel, wahelp_user_id_wa, wahelp_user_id_tg, COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection, COALESCE(notifications_enabled, true) AS notifications_enabled
+            SELECT id, full_name, phone, wahelp_preferred_channel, wahelp_user_id_wa, wahelp_user_id_tg, 
+                   COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection, 
+                   COALESCE(notifications_enabled, true) AS notifications_enabled,
+                   bot_tg_user_id, bot_started, preferred_contact
             FROM clients
             WHERE id = ANY($1::int[])
             """,
@@ -276,6 +282,9 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 "user_id_tg": crow["wahelp_user_id_tg"],
                 "requires_connection": bool(crow["wahelp_requires_connection"]),
                 "enabled": bool(crow["notifications_enabled"]),
+                "bot_tg_user_id": crow["bot_tg_user_id"],
+                "bot_started": bool(crow["bot_started"]) if crow["bot_started"] else False,
+                "preferred_contact": crow["preferred_contact"],
             }
     entries: list[NotificationOutboxEntry] = []
     for row in rows:
@@ -301,6 +310,9 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 client_user_id_tg=client_info.get("user_id_tg"),
                 client_requires_connection=client_info.get("requires_connection", False),
                 notifications_enabled=client_info.get("enabled", True),
+                bot_tg_user_id=client_info.get("bot_tg_user_id"),
+                bot_started=client_info.get("bot_started", False),
+                preferred_contact=client_info.get("preferred_contact"),
             )
         )
     return entries

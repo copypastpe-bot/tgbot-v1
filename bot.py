@@ -10190,6 +10190,7 @@ async def main():
             promo_texts_fn=get_promo_texts,
             birthday_texts_fn=get_birthday_texts,
             tg_link=TEXTS_TG_LINK,
+            logs_chat_id=LOGS_CHAT_ID,
         )
         notification_worker.start()
     if WAHELP_WEBHOOK_PORT > 0:

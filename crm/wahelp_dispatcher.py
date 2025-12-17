@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal, Mapping, Sequence
 
 import asyncpg
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramAPIError
 
 from .wahelp_client import WahelpAPIError
 from .wahelp_service import ChannelKind, ensure_user_in_channel, send_text_message
@@ -32,6 +34,8 @@ FOLLOWUP_DELAY_SECONDS = 24 * 60 * 60  # 24h
 WA_FOLLOWUP_DISABLED = os.getenv("WA_FOLLOWUP_DISABLED", "").lower() in {"1", "true", "yes", "on"}
 _followup_tasks: dict[int, asyncio.Task] = {}
 
+CLIENT_BOT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
+
 
 @dataclass
 class ClientContact:
@@ -44,6 +48,9 @@ class ClientContact:
     tg_user_id: int | None = None
     lead_user_id: int | None = None
     requires_connection: bool = False
+    bot_tg_user_id: int | None = None
+    bot_started: bool = False
+    preferred_contact: str | None = None
 
 
 @dataclass(slots=True)
@@ -69,14 +76,128 @@ def set_missing_messenger_logger(callback: MissingMessengerLogger | None) -> Non
     _missing_logger = callback
 
 
+async def send_to_client_bot(
+    bot_tg_user_id: int,
+    text: str,
+    *,
+    logs_chat_id: int | None = None,
+) -> tuple[bool, str | None]:
+    """
+    Отправляет сообщение клиенту через наш клиентский бот напрямую.
+    
+    Returns:
+        (success: bool, error_message: str | None)
+    """
+    if not CLIENT_BOT_TOKEN:
+        return False, "CLIENT_BOT_TOKEN not configured"
+    
+    bot = Bot(token=CLIENT_BOT_TOKEN)
+    try:
+        await bot.send_message(bot_tg_user_id, text)
+        return True, None
+    except TelegramForbiddenError:
+        # Клиент заблокировал бота
+        error_msg = "Client blocked the bot"
+        if logs_chat_id:
+            try:
+                await bot.send_message(
+                    logs_chat_id,
+                    f"❌ Ошибка доставки в бот\n"
+                    f"TG ID: {bot_tg_user_id}\n"
+                    f"Причина: Клиент заблокировал бота"
+                )
+            except Exception:
+                pass
+        return False, error_msg
+    except TelegramBadRequest as e:
+        # Неверный chat_id или другая ошибка запроса
+        error_msg = f"Telegram API error: {e.message}"
+        if logs_chat_id:
+            try:
+                await bot.send_message(
+                    logs_chat_id,
+                    f"❌ Ошибка доставки в бот\n"
+                    f"TG ID: {bot_tg_user_id}\n"
+                    f"Причина: {e.message}"
+                )
+            except Exception:
+                pass
+        return False, error_msg
+    except TelegramAPIError as e:
+        # Другие ошибки Telegram API
+        error_msg = f"Telegram API error: {str(e)}"
+        if logs_chat_id:
+            try:
+                await bot.send_message(
+                    logs_chat_id,
+                    f"❌ Ошибка доставки в бот\n"
+                    f"TG ID: {bot_tg_user_id}\n"
+                    f"Причина: {str(e)}"
+                )
+            except Exception:
+                pass
+        return False, error_msg
+    except Exception as e:
+        # Неожиданные ошибки
+        error_msg = f"Unexpected error: {str(e)}"
+        if logs_chat_id:
+            try:
+                await bot.send_message(
+                    logs_chat_id,
+                    f"❌ Ошибка доставки в бот\n"
+                    f"TG ID: {bot_tg_user_id}\n"
+                    f"Причина: {str(e)}"
+                )
+            except Exception:
+                pass
+        return False, error_msg
+    finally:
+        await bot.session.close()
+
+
 async def send_with_rules(
     conn: asyncpg.Connection,
     contact: ClientContact,
     *,
     text: str,
+    logs_chat_id: int | None = None,
 ) -> SendResult:
     if contact.requires_connection:
         raise WahelpAPIError(0, "Contact requires Wahelp connection", None)
+    
+    # Пробуем отправить через наш клиентский бот, если клиент подписан
+    if (contact.recipient_kind == "client" and 
+        contact.bot_tg_user_id and 
+        contact.bot_started):
+        success, error_msg = await send_to_client_bot(
+            contact.bot_tg_user_id,
+            text,
+            logs_chat_id=logs_chat_id,
+        )
+        if success:
+            # Успешно отправили через бот - обновляем preferred_contact
+            await conn.execute(
+                """
+                UPDATE clients
+                SET preferred_contact = 'bot',
+                    last_updated = NOW()
+                WHERE id = $1
+                """,
+                contact.client_id,
+            )
+            logger.info("Message sent via client bot to client %s", contact.client_id)
+            # Возвращаем специальный канал для логирования
+            return SendResult(channel="client_bot", response={"success": True})
+        else:
+            # Не удалось отправить через бот - логируем и продолжаем с Wahelp
+            logger.warning(
+                "Failed to send via client bot to client %s: %s. Falling back to Wahelp.",
+                contact.client_id,
+                error_msg,
+            )
+            # Не меняем preferred_contact, продолжаем со старой схемой через Wahelp
+    
+    # Продолжаем со старой логикой через Wahelp
     attempts = _build_channel_sequence(contact)
     last_error: Exception | None = None
     last_channel: ChannelKind | None = None

@@ -35,6 +35,7 @@ class NotificationWorker:
         promo_texts_fn=None,
         birthday_texts_fn=None,
         tg_link: str = "",
+        logs_chat_id: int | None = None,
     ) -> None:
         self.pool = pool
         self.rules = rules
@@ -44,6 +45,7 @@ class NotificationWorker:
         self.promo_texts_fn = promo_texts_fn
         self.birthday_texts_fn = birthday_texts_fn
         self.tg_link = tg_link
+        self.logs_chat_id = logs_chat_id
         self._task: asyncio.Task | None = None
         self._stopping = False
 
@@ -117,12 +119,20 @@ class NotificationWorker:
             tg_user_id=entry.client_user_id_tg,
             requires_connection=entry.client_requires_connection,
             recipient_kind=entry.recipient_kind,
+            bot_tg_user_id=entry.bot_tg_user_id,
+            bot_started=entry.bot_started,
+            preferred_contact=entry.preferred_contact,
         )
         message_text = self._build_message_text(entry)
 
         async with self.pool.acquire() as conn:
             try:
-                result = await send_with_rules(conn, contact, text=message_text)
+                result = await send_with_rules(
+                    conn, 
+                    contact, 
+                    text=message_text,
+                    logs_chat_id=self.logs_chat_id,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Notification send failed (id=%s, client=%s): %s",
