@@ -10149,7 +10149,7 @@ async def master_rewash_start(msg: Message, state: FSMContext):
         return await msg.answer("Доступно только мастерам.")
     await state.set_state(MasterFSM.rewash_waiting_date)
     await msg.answer(
-        "Введите дату заказа в формате <b>дд.мм</b> (например, 18.12):",
+        "Введите дату заказа в формате дд.мм (например, 18.12):",
         reply_markup=cancel_kb
     )
 
@@ -10161,28 +10161,32 @@ async def master_rewash_date(msg: Message, state: FSMContext):
     match = re.match(r"^(\d{1,2})\.(\d{1,2})$", date_input)
     if not match:
         return await msg.answer(
-            "Неверный формат. Введите дату в формате <b>дд.мм</b> (например, 18.12):",
+            "Неверный формат. Введите дату в формате дд.мм (например, 18.12):",
             reply_markup=cancel_kb
         )
     
     day, month = int(match.group(1)), int(match.group(2))
     if not (1 <= day <= 31 and 1 <= month <= 12):
         return await msg.answer(
-            "Неверная дата. Введите дату в формате <b>дд.мм</b> (например, 18.12):",
+            "Неверная дата. Введите дату в формате дд.мм (например, 18.12):",
             reply_markup=cancel_kb
         )
     
     # Получаем текущий год
-    now_msk = datetime.now(timezone(timedelta(hours=3)))
+    now_msk = datetime.now(MOSCOW_TZ)
     year = now_msk.year
     
     try:
-        target_date = datetime(year, month, day, tzinfo=timezone(timedelta(hours=3)))
-        date_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        date_end = date_start + timedelta(days=1)
+        # Создаем дату в МСК timezone
+        target_date_local = datetime(year, month, day, tzinfo=MOSCOW_TZ)
+        date_start_local = target_date_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_end_local = date_start_local + timedelta(days=1)
+        # Конвертируем в UTC для сравнения с БД (как в order_remove_pick_date)
+        date_start_utc = date_start_local.astimezone(timezone.utc)
+        date_end_utc = date_end_local.astimezone(timezone.utc)
     except ValueError:
         return await msg.answer(
-            "Неверная дата. Введите дату в формате <b>дд.мм</b> (например, 18.12):",
+            "Неверная дата. Введите дату в формате дд.мм (например, 18.12):",
             reply_markup=cancel_kb
         )
     
@@ -10207,8 +10211,8 @@ async def master_rewash_date(msg: Message, state: FSMContext):
             ORDER BY created_at DESC
             """,
             master_id,
-            date_start,
-            date_end
+            date_start_utc,
+            date_end_utc
         )
     
     if not orders:
@@ -10223,16 +10227,20 @@ async def master_rewash_date(msg: Message, state: FSMContext):
     for o in orders:
         order_id = o["id"]
         created = o["created_at"]
+        # Конвертируем в МСК для отображения (как в order_remove_pick_date)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        created_local = created.astimezone(MOSCOW_TZ)
         amount = o["amount_total"]
         method = o["payment_method"] or "-"
-        time_str = created.astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
+        time_str = created_local.strftime("%H:%M")
         lines.append(f"  #{order_id} | {time_str} | {amount} ₽ | {method}")
     
     lines.append("\nВведите номер заказа (только цифры, например: 168):")
     
     await state.update_data(
-        target_date_start=date_start.isoformat(),
-        target_date_end=date_end.isoformat(),
+        target_date_start=date_start_utc.isoformat(),
+        target_date_end=date_end_utc.isoformat(),
         master_id=master_id
     )
     await state.set_state(MasterFSM.rewash_waiting_order)
@@ -10258,8 +10266,14 @@ async def master_rewash_order(msg: Message, state: FSMContext):
         await state.clear()
         return await msg.answer("Ошибка: данные сессии потеряны. Начните заново.", reply_markup=master_kb)
     
-    date_start = datetime.fromisoformat(date_start_str)
-    date_end = datetime.fromisoformat(date_end_str)
+    # Восстанавливаем UTC даты из state
+    date_start_utc = datetime.fromisoformat(date_start_str)
+    date_end_utc = datetime.fromisoformat(date_end_str)
+    # Убеждаемся, что timezone установлен
+    if date_start_utc.tzinfo is None:
+        date_start_utc = date_start_utc.replace(tzinfo=timezone.utc)
+    if date_end_utc.tzinfo is None:
+        date_end_utc = date_end_utc.replace(tzinfo=timezone.utc)
     
     async with pool.acquire() as conn:
         # Проверяем, что заказ принадлежит мастеру и за эту дату
@@ -10274,8 +10288,8 @@ async def master_rewash_order(msg: Message, state: FSMContext):
             """,
             order_id,
             master_id,
-            date_start,
-            date_end
+            date_start_utc,
+            date_end_utc
         )
         
         if not order:
