@@ -8503,11 +8503,13 @@ async def my_daily_report(msg: Message):
 
 MASTER_SALARY_LABEL = "💼 Зарплата"
 MASTER_INCOME_LABEL = "💰 Приход"
+MASTER_REWASH_LABEL = "🔄 Перемыв"
 
 master_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🧾 Заказ"), KeyboardButton(text="🔍 Клиент")],
         [KeyboardButton(text=MASTER_SALARY_LABEL), KeyboardButton(text=MASTER_INCOME_LABEL)],
+        [KeyboardButton(text=MASTER_REWASH_LABEL)],
     ],
     resize_keyboard=True
 )
@@ -8673,6 +8675,8 @@ main_kb = ReplyKeyboardMarkup(
 class MasterFSM(StatesGroup):
     waiting_phone = State()
     waiting_salary_period = State()
+    rewash_waiting_date = State()
+    rewash_waiting_order = State()
 
 @dp.message(F.text.in_(["🧾 Я ВЫПОЛНИЛ ЗАКАЗ", "🧾 Заказ"]))
 async def start_order(msg: Message, state: FSMContext):
@@ -10137,6 +10141,192 @@ async def master_income(msg: Message):
         for row in rows
     ]
     await msg.answer("Сегодняшний приход по типам оплаты:\n" + "\n".join(lines), reply_markup=master_kb)
+
+# 🔄 Перемыв — отметка перемыва заказа
+@dp.message(F.text == MASTER_REWASH_LABEL)
+async def master_rewash_start(msg: Message, state: FSMContext):
+    if not await ensure_master(msg.from_user.id):
+        return await msg.answer("Доступно только мастерам.")
+    await state.set_state(MasterFSM.rewash_waiting_date)
+    await msg.answer(
+        "Введите дату заказа в формате <b>дд.мм</b> (например, 18.12):",
+        reply_markup=cancel_kb
+    )
+
+@dp.message(MasterFSM.rewash_waiting_date, F.text)
+async def master_rewash_date(msg: Message, state: FSMContext):
+    date_input = msg.text.strip()
+    # Парсим формат дд.мм (год = текущий)
+    import re
+    match = re.match(r"^(\d{1,2})\.(\d{1,2})$", date_input)
+    if not match:
+        return await msg.answer(
+            "Неверный формат. Введите дату в формате <b>дд.мм</b> (например, 18.12):",
+            reply_markup=cancel_kb
+        )
+    
+    day, month = int(match.group(1)), int(match.group(2))
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return await msg.answer(
+            "Неверная дата. Введите дату в формате <b>дд.мм</b> (например, 18.12):",
+            reply_markup=cancel_kb
+        )
+    
+    # Получаем текущий год
+    now_msk = datetime.now(timezone(timedelta(hours=3)))
+    year = now_msk.year
+    
+    try:
+        target_date = datetime(year, month, day, tzinfo=timezone(timedelta(hours=3)))
+        date_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_end = date_start + timedelta(days=1)
+    except ValueError:
+        return await msg.answer(
+            "Неверная дата. Введите дату в формате <b>дд.мм</b> (например, 18.12):",
+            reply_markup=cancel_kb
+        )
+    
+    # Получаем заказы мастера за эту дату
+    async with pool.acquire() as conn:
+        master_row = await conn.fetchrow(
+            "SELECT id FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
+            msg.from_user.id
+        )
+        if not master_row:
+            await state.clear()
+            return await msg.answer("Мастер не найден.", reply_markup=master_kb)
+        
+        master_id = master_row["id"]
+        orders = await conn.fetch(
+            """
+            SELECT id, created_at, amount_total, payment_method
+            FROM orders
+            WHERE master_id = $1
+              AND created_at >= $2
+              AND created_at < $3
+            ORDER BY created_at DESC
+            """,
+            master_id,
+            date_start,
+            date_end
+        )
+    
+    if not orders:
+        await state.clear()
+        return await msg.answer(
+            f"Заказов за {day:02d}.{month:02d}.{year} не найдено.",
+            reply_markup=master_kb
+        )
+    
+    # Формируем список заказов
+    lines = [f"Заказы за {day:02d}.{month:02d}.{year}:"]
+    for o in orders:
+        order_id = o["id"]
+        created = o["created_at"]
+        amount = o["amount_total"]
+        method = o["payment_method"] or "-"
+        time_str = created.astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
+        lines.append(f"  #{order_id} | {time_str} | {amount} ₽ | {method}")
+    
+    lines.append("\nВведите номер заказа (только цифры, например: 168):")
+    
+    await state.update_data(
+        target_date_start=date_start.isoformat(),
+        target_date_end=date_end.isoformat(),
+        master_id=master_id
+    )
+    await state.set_state(MasterFSM.rewash_waiting_order)
+    await msg.answer("\n".join(lines), reply_markup=cancel_kb)
+
+@dp.message(MasterFSM.rewash_waiting_order, F.text)
+async def master_rewash_order(msg: Message, state: FSMContext):
+    order_input = msg.text.strip()
+    try:
+        order_id = int(order_input)
+    except ValueError:
+        return await msg.answer(
+            "Введите номер заказа (только цифры, например: 168):",
+            reply_markup=cancel_kb
+        )
+    
+    data = await state.get_data()
+    master_id = data.get("master_id")
+    date_start_str = data.get("target_date_start")
+    date_end_str = data.get("target_date_end")
+    
+    if not master_id or not date_start_str:
+        await state.clear()
+        return await msg.answer("Ошибка: данные сессии потеряны. Начните заново.", reply_markup=master_kb)
+    
+    date_start = datetime.fromisoformat(date_start_str)
+    date_end = datetime.fromisoformat(date_end_str)
+    
+    async with pool.acquire() as conn:
+        # Проверяем, что заказ принадлежит мастеру и за эту дату
+        order = await conn.fetchrow(
+            """
+            SELECT id, created_at, amount_total
+            FROM orders
+            WHERE id = $1
+              AND master_id = $2
+              AND created_at >= $3
+              AND created_at < $4
+            """,
+            order_id,
+            master_id,
+            date_start,
+            date_end
+        )
+        
+        if not order:
+            return await msg.answer(
+                f"Заказ #{order_id} не найден или не принадлежит вам за указанную дату.",
+                reply_markup=cancel_kb
+            )
+        
+        # Отмечаем перемыв
+        await conn.execute(
+            """
+            UPDATE orders
+            SET rewash_flag = true,
+                rewash_marked_at = NOW(),
+                rewash_marked_by_master_id = $1,
+                rewash_cycle = COALESCE(rewash_cycle, 1)
+            WHERE id = $2
+            """,
+            master_id,
+            order_id
+        )
+        
+        # Получаем имя мастера для уведомления
+        master_info = await conn.fetchrow(
+            "SELECT first_name, last_name FROM staff WHERE id=$1",
+            master_id
+        )
+        master_name = f"{master_info['first_name'] or ''} {master_info['last_name'] or ''}".strip() or f"Мастер #{master_id}"
+    
+    await state.clear()
+    
+    # Уведомление в чат заказов
+    if ORDERS_CONFIRM_CHAT_ID:
+        try:
+            date_str = date_start.strftime("%d.%m.%Y")
+            time_str = order["created_at"].astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
+            notification_text = (
+                f"🔄 <b>Перемыв отмечен</b>\n"
+                f"Мастер: {master_name}\n"
+                f"Заказ: #{order_id}\n"
+                f"Дата заказа: {date_str} {time_str}\n"
+                f"Сумма: {order['amount_total']} ₽"
+            )
+            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, notification_text, parse_mode=ParseMode.HTML)
+        except Exception as exc:
+            logging.warning("Failed to send rewash notification to ORDERS_CONFIRM_CHAT_ID: %s", exc)
+    
+    await msg.answer(
+        f"✅ Перемыв заказа #{order_id} отмечен.\nУведомление отправлено в чат заказов.",
+        reply_markup=master_kb
+    )
 
 # fallback
 
