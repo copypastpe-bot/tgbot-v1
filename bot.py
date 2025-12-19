@@ -7795,6 +7795,14 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
 
     await query.message.answer("\n".join(lines), reply_markup=admin_root_kb())
 
+    # Уведомление в чат заказов
+    if ORDERS_CONFIRM_CHAT_ID:
+        try:
+            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("order_remove notify to ORDERS_CONFIRM_CHAT_ID failed for order_id=%s: %s", order_info["order_id"], exc)
+
+    # Уведомление в чат кассы
     if MONEY_FLOW_CHAT_ID:
         try:
             cash_line = format_money(cash_adjustment)
@@ -7806,7 +7814,7 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
             ]
             await bot.send_message(MONEY_FLOW_CHAT_ID, "\n".join(msg_lines))
         except Exception as exc:  # noqa: BLE001
-            logging.warning("order_remove notify failed for order_id=%s: %s", order_info["order_id"], exc)
+            logging.warning("order_remove notify to MONEY_FLOW_CHAT_ID failed for order_id=%s: %s", order_info["order_id"], exc)
 
 
 @dp.message(Command("bonus_backfill"))
