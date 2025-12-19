@@ -333,6 +333,8 @@ notification_worker: NotificationWorker | None = None
 wahelp_webhook: WahelpWebhookServer | None = None
 wire_reminder_task: asyncio.Task | None = None
 leads_promo_task: asyncio.Task | None = None
+rewash_followup_task: asyncio.Task | None = None
+rewash_counter_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
 
 # === Ignore group/supergroup/channel updates; work only in private chats ===
@@ -3683,6 +3685,216 @@ async def run_promo_reminders() -> None:
     logger.info("Promo reminders queued: first=%s second=%s", stage_one, stage_two)
 
 
+async def run_rewash_followup_job() -> None:
+    """Проверяет перемывы, которым нужно отправить follow-up сообщение клиенту."""
+    if pool is None:
+        return
+    
+    CLIENT_BOT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
+    if not CLIENT_BOT_TOKEN:
+        logging.warning("CLIENT_BOT_TOKEN not set, skipping rewash follow-up")
+        return
+    
+    client_bot = Bot(token=CLIENT_BOT_TOKEN)
+    
+    async with pool.acquire() as conn:
+        # Находим перемывы, которым нужно отправить follow-up
+        # (rewash_followup_scheduled_at <= NOW() и rewash_result IS NULL)
+        pending_rewashes = await conn.fetch(
+            """
+            SELECT o.id AS order_id,
+                   o.client_id,
+                   o.rewash_cycle,
+                   o.rewash_marked_at,
+                   o.rewash_followup_scheduled_at,
+                   c.bot_tg_user_id,
+                   c.full_name,
+                   c.phone
+            FROM orders o
+            JOIN clients c ON c.id = o.client_id
+            WHERE o.rewash_flag = true
+              AND o.rewash_followup_scheduled_at IS NOT NULL
+              AND o.rewash_followup_scheduled_at <= NOW()
+              AND o.rewash_result IS NULL
+            ORDER BY o.rewash_followup_scheduled_at
+            """
+        )
+        
+        for rewash in pending_rewashes:
+            order_id = rewash["order_id"]
+            client_id = rewash["client_id"]
+            bot_tg_user_id = rewash["bot_tg_user_id"]
+            cycle = rewash["rewash_cycle"] or 1
+            
+            followup_scheduled = rewash["rewash_followup_scheduled_at"]
+            if followup_scheduled.tzinfo is None:
+                followup_scheduled = followup_scheduled.replace(tzinfo=timezone.utc)
+            
+            now_utc = datetime.now(timezone.utc)
+            hours_since_scheduled = (now_utc - followup_scheduled).total_seconds() / 3600
+            
+            # Проверяем, был ли уже отправлен follow-up (если rewash_followup_scheduled_at был обновлен после отправки)
+            # Если прошло больше 24 часов с момента запланированного - значит нужно проверить ответ или отправить повтор
+            if hours_since_scheduled >= 24 and cycle == 1:
+                # Первая попытка: нет ответа через 24 часа - уведомляем админа и планируем повтор через 3 дня
+                await conn.execute(
+                    """
+                    UPDATE orders
+                    SET rewash_followup_scheduled_at = NOW() + INTERVAL '3 days',
+                        rewash_cycle = 2
+                    WHERE id = $1
+                    """,
+                    order_id
+                )
+                
+                # Уведомление админу
+                client_name = rewash["full_name"] or "Клиент"
+                client_phone = rewash["phone"] or "неизвестно"
+                admin_msg = (
+                    f"⚠️ <b>Нет ответа на перемыв</b>\n"
+                    f"Заказ: #{order_id}\n"
+                    f"Клиент: {client_name}\n"
+                    f"Телефон: {client_phone}\n"
+                    f"Перемыв отмечен: {rewash['rewash_marked_at'].astimezone(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}\n"
+                    f"Повторная попытка через 3 дня."
+                )
+                for admin_id in ADMIN_TG_IDS:
+                    try:
+                        await bot.send_message(admin_id, admin_msg, parse_mode=ParseMode.HTML)
+                    except Exception as exc:
+                        logging.warning("Failed to notify admin about rewash no response: %s", exc)
+                
+            elif hours_since_scheduled >= 72 and cycle == 2:
+                # Вторая попытка: нет ответа через 3 дня - уведомляем админа и больше не пытаемся
+                await conn.execute(
+                    """
+                    UPDATE orders
+                    SET rewash_followup_scheduled_at = NULL
+                    WHERE id = $1
+                    """,
+                    order_id
+                )
+                
+                # Уведомление админу
+                client_name = rewash["full_name"] or "Клиент"
+                client_phone = rewash["phone"] or "неизвестно"
+                admin_msg = (
+                    f"❌ <b>Нет ответа на перемыв (вторая попытка)</b>\n"
+                    f"Заказ: #{order_id}\n"
+                    f"Клиент: {client_name}\n"
+                    f"Телефон: {client_phone}\n"
+                    f"Перемыв отмечен: {rewash['rewash_marked_at'].astimezone(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}\n"
+                    f"Дальнейшие попытки не планируются."
+                )
+                for admin_id in ADMIN_TG_IDS:
+                    try:
+                        await bot.send_message(admin_id, admin_msg, parse_mode=ParseMode.HTML)
+                    except Exception as exc:
+                        logging.warning("Failed to notify admin about rewash final no response: %s", exc)
+                
+            elif bot_tg_user_id:
+                # Отправляем follow-up сообщение клиенту (первая отправка или повторная при cycle == 2)
+                followup_text = (
+                    "У вас были работы по устранению недостатков.\n\n"
+                    "Ответьте:\n"
+                    "1 — если недостатки устранены\n"
+                    "2 — если замечания остались"
+                )
+                try:
+                    await client_bot.send_message(bot_tg_user_id, followup_text)
+                    logging.info("Sent rewash follow-up to client %s (order #%s, cycle %s)", client_id, order_id, cycle)
+                    # Обновляем rewash_followup_scheduled_at на NOW() + 24 hours для отслеживания ответа
+                    await conn.execute(
+                        """
+                        UPDATE orders
+                        SET rewash_followup_scheduled_at = NOW() + INTERVAL '24 hours'
+                        WHERE id = $1
+                        """,
+                        order_id
+                    )
+                except Exception as exc:
+                    logging.warning("Failed to send rewash follow-up to client %s: %s", client_id, exc)
+                    # Если не удалось отправить, уведомляем админа
+                    if ORDERS_CONFIRM_CHAT_ID:
+                        try:
+                            error_msg = (
+                                f"⚠️ Не удалось отправить follow-up по перемыву заказа #{order_id}\n"
+                                f"Клиент: {rewash['full_name'] or 'Клиент'}\n"
+                                f"Ошибка: {str(exc)}"
+                            )
+                            await bot.send_message(ORDERS_CONFIRM_CHAT_ID, error_msg)
+                        except Exception:
+                            pass
+    
+    await client_bot.session.close()
+
+
+async def check_rewash_master_counter() -> None:
+    """Проверяет счетчик перемывов мастеров и уведомляет админов при достижении 5 в месяц."""
+    if pool is None:
+        return
+    
+    async with pool.acquire() as conn:
+        # Получаем текущий месяц
+        now_msk = datetime.now(MOSCOW_TZ)
+        month_start = now_msk.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_start_utc = month_start.astimezone(timezone.utc)
+        
+        # Находим мастеров с 5+ перемывами в текущем месяце
+        masters_with_rewashes = await conn.fetch(
+            """
+            SELECT s.id AS master_id,
+                   s.first_name,
+                   s.last_name,
+                   s.phone,
+                   COUNT(o.id) AS rewash_count,
+                   array_agg(o.id ORDER BY o.rewash_marked_at) AS order_ids
+            FROM staff s
+            JOIN orders o ON o.rewash_marked_by_master_id = s.id
+            WHERE o.rewash_flag = true
+              AND o.rewash_marked_at >= $1
+            GROUP BY s.id, s.first_name, s.last_name, s.phone
+            HAVING COUNT(o.id) >= 5
+            """,
+            month_start_utc
+        )
+        
+        for master in masters_with_rewashes:
+            master_id = master["master_id"]
+            master_name = f"{master['first_name'] or ''} {master['last_name'] or ''}".strip() or f"Мастер #{master_id}"
+            master_phone = master["phone"] or "не указан"
+            rewash_count = master["rewash_count"]
+            order_ids = master["order_ids"]
+            
+            # Проверяем, отправляли ли уже уведомление за этот месяц
+            last_notification = await conn.fetchval(
+                """
+                SELECT MAX(rewash_marked_at)
+                FROM orders
+                WHERE rewash_marked_by_master_id = $1
+                  AND rewash_flag = true
+                  AND rewash_marked_at >= $2
+                """,
+                master_id,
+                month_start_utc
+            )
+            
+            # Отправляем уведомление админам
+            admin_msg = (
+                f"⚠️ <b>Мастер достиг 5 перемывов в месяц</b>\n"
+                f"Мастер: {master_name}\n"
+                f"Телефон: {master_phone}\n"
+                f"Перемывов: {rewash_count}\n"
+                f"Заказы: {', '.join(f'#{oid}' for oid in order_ids[:10])}"
+                + (f" (и ещё {len(order_ids) - 10})" if len(order_ids) > 10 else "")
+            )
+            for admin_id in ADMIN_TG_IDS:
+                try:
+                    await bot.send_message(admin_id, admin_msg, parse_mode=ParseMode.HTML)
+                except Exception as exc:
+                    logging.warning("Failed to notify admin about master rewash counter: %s", exc)
+
+
 async def schedule_daily_job(hour_msk: int, minute_msk: int, job_coro, job_name: str) -> None:
     next_run: datetime | None = None
     while True:
@@ -3709,6 +3921,16 @@ async def schedule_daily_job(hour_msk: int, minute_msk: int, job_coro, job_name:
             logging.exception("Daily job %s failed: %s", job_name, exc)
             await asyncio.sleep(60)
         next_run = next_run + timedelta(days=1)
+
+
+async def schedule_periodic_job(interval_seconds: int, job_coro, job_name: str) -> None:
+    """Запускает задачу периодически с заданным интервалом."""
+    while True:
+        try:
+            await job_coro()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Periodic job %s failed: %s", job_name, exc)
+        await asyncio.sleep(interval_seconds)
 
 def withdraw_nav_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -10309,14 +10531,15 @@ async def master_rewash_order(msg: Message, state: FSMContext):
                 reply_markup=cancel_kb
             )
         
-        # Отмечаем перемыв
+        # Отмечаем перемыв и планируем follow-up через 24 часа
         await conn.execute(
             """
             UPDATE orders
             SET rewash_flag = true,
                 rewash_marked_at = NOW(),
                 rewash_marked_by_master_id = $1,
-                rewash_cycle = COALESCE(rewash_cycle, 1)
+                rewash_cycle = COALESCE(rewash_cycle, 1),
+                rewash_followup_scheduled_at = NOW() + INTERVAL '24 hours'
             WHERE id = $2
             """,
             master_id,
@@ -10370,7 +10593,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
@@ -10405,6 +10628,16 @@ async def main():
     if wire_reminder_task is None:
         wire_reminder_task = asyncio.create_task(
             schedule_daily_job(20, 0, wire_pending_reminder_job, "wire_pending_reminder")
+        )
+    if rewash_followup_task is None:
+        # Проверяем перемывы каждые 2 часа
+        rewash_followup_task = asyncio.create_task(
+            schedule_periodic_job(2 * 3600, run_rewash_followup_job, "rewash_followup")
+        )
+    if rewash_counter_task is None:
+        # Проверяем счетчик перемывов раз в день в 10:00
+        rewash_counter_task = asyncio.create_task(
+            schedule_daily_job(10, 0, check_rewash_master_counter, "rewash_counter")
         )
     if notification_rules is not None:
         notification_worker = NotificationWorker(
