@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_CHANNEL: ChannelKind = "clients_tg"
 WHATSAPP_CHANNEL: ChannelKind = "clients_wa"
+MAX_CHANNEL: ChannelKind = "clients_max"
 LEADS_CHANNEL: ChannelKind = "leads"
 
 FOLLOWUP_DELAY_SECONDS = 24 * 60 * 60  # 24h
@@ -46,6 +47,7 @@ class ClientContact:
     recipient_kind: str = "client"
     wa_user_id: int | None = None
     tg_user_id: int | None = None
+    max_user_id: int | None = None
     lead_user_id: int | None = None
     requires_connection: bool = False
     bot_tg_user_id: int | None = None
@@ -201,6 +203,7 @@ async def send_with_rules(
     attempts = _build_channel_sequence(contact)
     last_error: Exception | None = None
     last_channel: ChannelKind | None = None
+    failed_channels: list[ChannelKind] = []
     for attempt in attempts:
         channel = attempt.channel
         last_channel = channel
@@ -219,12 +222,40 @@ async def send_with_rules(
         except WahelpAPIError as exc:
             if _is_messenger_missing_error(exc):
                 await _handle_messenger_missing(conn, contact, channel)
+            failed_channels.append(channel)
             logger.warning("Send via %s failed for %s %s: %s", channel, contact.recipient_kind, contact.client_id, exc)
             last_error = exc
             continue
+    # Все каналы не сработали - логируем в LOGS_CHAT_ID
+    if last_error and logs_chat_id:
+        try:
+            channel_names = {
+                MAX_CHANNEL: "MAX (Wahelp)",
+                TELEGRAM_CHANNEL: "TG (Wahelp)",
+                WHATSAPP_CHANNEL: "WA (Wahelp)",
+            }
+            failed_names = [channel_names.get(ch, ch) for ch in failed_channels]
+            error_msg = (
+                f"❌ Нет доступных каналов связи для клиента\n"
+                f"ID клиента: {contact.client_id}\n"
+                f"Телефон: {contact.phone}\n"
+                f"Имя: {contact.name}\n"
+                f"Неудачные каналы: {', '.join(failed_names) if failed_names else 'все'}\n"
+                f"Последняя ошибка: {str(last_error)[:200]}"
+            )
+            bot = Bot(token=CLIENT_BOT_TOKEN) if CLIENT_BOT_TOKEN else None
+            if bot:
+                try:
+                    await bot.send_message(logs_chat_id, error_msg)
+                except Exception as log_exc:
+                    logger.error("Failed to log missing channels to LOGS_CHAT_ID: %s", log_exc)
+                finally:
+                    await bot.session.close()
+        except Exception as log_exc:
+            logger.error("Failed to prepare missing channels log: %s", log_exc)
     if last_error:
         if isinstance(last_error, WahelpAPIError) and _is_messenger_missing_error(last_error):
-            await _mark_requires_connection(conn, contact, str(last_error), last_channel or WHATSAPP_CHANNEL)
+            await _mark_requires_connection(conn, contact, str(last_error), last_channel or MAX_CHANNEL)
         raise last_error
     raise RuntimeError("All Wahelp channels failed without exception")
 
@@ -233,10 +264,12 @@ def _build_channel_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
     if contact.recipient_kind == "lead":
         return _build_lead_sequence(contact)
     attempts: list[ChannelAttempt] = []
-    if contact.wa_user_id:
-        attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
+    if contact.max_user_id:
+        attempts.append(ChannelAttempt(channel=MAX_CHANNEL, address_kind="user_id", user_id=contact.max_user_id))
     if contact.tg_user_id:
         attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
+    if contact.wa_user_id:
+        attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
     attempts.extend(_build_client_phone_attempts(contact))
     return tuple(_deduplicate_attempts(attempts))
 
@@ -250,14 +283,21 @@ def _build_lead_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
 
 
 def _build_client_phone_attempts(contact: ClientContact) -> list[ChannelAttempt]:
+    """
+    Строит последовательность попыток отправки по телефону.
+    Приоритет: MAX -> TG -> WA
+    """
     order: Sequence[ChannelKind]
     preferred = contact.preferred_channel
-    if preferred == WHATSAPP_CHANNEL:
-        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
+    if preferred == MAX_CHANNEL:
+        order = (MAX_CHANNEL, TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
     elif preferred == TELEGRAM_CHANNEL:
-        order = (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
+        order = (TELEGRAM_CHANNEL, MAX_CHANNEL, WHATSAPP_CHANNEL)
+    elif preferred == WHATSAPP_CHANNEL:
+        order = (WHATSAPP_CHANNEL, MAX_CHANNEL, TELEGRAM_CHANNEL)
     else:
-        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
+        # По умолчанию: MAX -> TG -> WA
+        order = (MAX_CHANNEL, TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
     return [ChannelAttempt(channel=chan, address_kind="phone") for chan in order]
 
 
@@ -347,9 +387,13 @@ async def _handle_messenger_missing(
 ) -> None:
     if contact.recipient_kind != "client":
         return
-    if failed_channel == TELEGRAM_CHANNEL:
+    # Выбираем следующий канал по приоритету: MAX -> TG -> WA
+    if failed_channel == MAX_CHANNEL:
+        fallback = TELEGRAM_CHANNEL
+    elif failed_channel == TELEGRAM_CHANNEL:
         fallback = WHATSAPP_CHANNEL
     elif failed_channel == WHATSAPP_CHANNEL:
+        # Если WA не работает, пробуем TG или MAX
         fallback = TELEGRAM_CHANNEL
     else:
         return
@@ -393,7 +437,16 @@ async def _persist_user_id(
         contact.lead_user_id = user_id
         contact.requires_connection = False
         return
-    column = "wahelp_user_id_wa" if channel == WHATSAPP_CHANNEL else "wahelp_user_id_tg"
+    # Определяем колонку для сохранения user_id
+    if channel == WHATSAPP_CHANNEL:
+        column = "wahelp_user_id_wa"
+    elif channel == TELEGRAM_CHANNEL:
+        column = "wahelp_user_id_tg"
+    elif channel == MAX_CHANNEL:
+        column = "wahelp_user_id_max"
+    else:
+        raise ValueError(f"Unknown channel for clients: {channel}")
+    
     await conn.execute(
         f"""
         UPDATE clients
@@ -407,8 +460,10 @@ async def _persist_user_id(
     )
     if channel == WHATSAPP_CHANNEL:
         contact.wa_user_id = user_id
-    else:
+    elif channel == TELEGRAM_CHANNEL:
         contact.tg_user_id = user_id
+    elif channel == MAX_CHANNEL:
+        contact.max_user_id = user_id
     contact.requires_connection = False
 
 

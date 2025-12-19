@@ -43,6 +43,7 @@ class NotificationOutboxEntry:
     client_preferred_channel: str | None
     client_user_id_wa: int | None
     client_user_id_tg: int | None
+    client_user_id_max: int | None
     client_requires_connection: bool
     notifications_enabled: bool
     bot_tg_user_id: int | None = None
@@ -102,6 +103,8 @@ async def ensure_notification_schema(conn: asyncpg.Connection) -> None:
         ADD COLUMN IF NOT EXISTS wahelp_user_id_tg bigint;
         ALTER TABLE clients
         ADD COLUMN IF NOT EXISTS wahelp_user_id_wa bigint;
+        ALTER TABLE clients
+        ADD COLUMN IF NOT EXISTS wahelp_user_id_max bigint;
         ALTER TABLE clients
         ADD COLUMN IF NOT EXISTS wahelp_requires_connection boolean NOT NULL DEFAULT false;
         """
@@ -264,7 +267,7 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
     if client_ids:
         client_rows = await conn.fetch(
             """
-            SELECT id, full_name, phone, wahelp_preferred_channel, wahelp_user_id_wa, wahelp_user_id_tg, 
+            SELECT id, full_name, phone, wahelp_preferred_channel, wahelp_user_id_wa, wahelp_user_id_tg, wahelp_user_id_max,
                    COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection, 
                    COALESCE(notifications_enabled, true) AS notifications_enabled,
                    bot_tg_user_id, bot_started, preferred_contact
@@ -280,6 +283,7 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 "preferred": crow["wahelp_preferred_channel"],
                 "user_id_wa": crow["wahelp_user_id_wa"],
                 "user_id_tg": crow["wahelp_user_id_tg"],
+                "user_id_max": crow["wahelp_user_id_max"],
                 "requires_connection": bool(crow["wahelp_requires_connection"]),
                 "enabled": bool(crow["notifications_enabled"]),
                 "bot_tg_user_id": crow["bot_tg_user_id"],
@@ -308,6 +312,7 @@ async def pick_ready_batch(conn: asyncpg.Connection, limit: int = 10) -> list[No
                 client_preferred_channel=client_info.get("preferred"),
                 client_user_id_wa=client_info.get("user_id_wa"),
                 client_user_id_tg=client_info.get("user_id_tg"),
+                client_user_id_max=client_info.get("user_id_max"),
                 client_requires_connection=client_info.get("requires_connection", False),
                 notifications_enabled=client_info.get("enabled", True),
                 bot_tg_user_id=client_info.get("bot_tg_user_id"),

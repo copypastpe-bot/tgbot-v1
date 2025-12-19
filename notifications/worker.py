@@ -117,6 +117,7 @@ class NotificationWorker:
             preferred_channel=entry.client_preferred_channel,
             wa_user_id=entry.client_user_id_wa,
             tg_user_id=entry.client_user_id_tg,
+            max_user_id=entry.client_user_id_max,
             requires_connection=entry.client_requires_connection,
             recipient_kind=entry.recipient_kind,
             bot_tg_user_id=entry.bot_tg_user_id,

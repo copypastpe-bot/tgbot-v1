@@ -21,7 +21,7 @@ from .wahelp_client import (
 
 logger = logging.getLogger(__name__)
 
-ChannelKind = Literal["clients_tg", "clients_wa", "leads"]
+ChannelKind = Literal["clients_tg", "clients_wa", "clients_max", "leads"]
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,7 @@ class WahelpChannelConfig:
 CHANNEL_ENV_KEYS: dict[ChannelKind, tuple[str, str]] = {
     "clients_tg": ("WAHELP_CLIENTS_PROJECT_ID", "WAHELP_CLIENTS_CHANNEL_UUID"),
     "clients_wa": ("WAHELP_CLIENTS_WA_PROJECT_ID", "WAHELP_CLIENTS_WA_CHANNEL_UUID"),
+    "clients_max": ("WAHELP_CLIENTS_MAX_PROJECT_ID", "WAHELP_CLIENTS_MAX_CHANNEL_UUID"),
     "leads": ("WAHELP_LEADS_PROJECT_ID", "WAHELP_LEADS_CHANNEL_UUID"),
 }
 

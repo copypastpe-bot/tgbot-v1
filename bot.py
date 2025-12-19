@@ -1327,7 +1327,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
         client = await conn.fetchrow(
             """
             SELECT id, full_name, phone, wahelp_preferred_channel,
-                   wahelp_user_id_wa, wahelp_user_id_tg,
+                   wahelp_user_id_wa, wahelp_user_id_tg, wahelp_user_id_max,
                    COALESCE(wahelp_requires_connection, false) AS wahelp_requires_connection
             FROM clients
             WHERE phone_digits=$1
@@ -1448,6 +1448,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                     preferred_channel=channel_kind or client.get("wahelp_preferred_channel"),
                     wa_user_id=client.get("wahelp_user_id_wa"),
                     tg_user_id=client.get("wahelp_user_id_tg"),
+                    max_user_id=client.get("wahelp_user_id_max"),
                     requires_connection=bool(client.get("wahelp_requires_connection")),
                 )
                 await send_with_rules(conn, contact, text=STOP_AUTO_REPLY)
@@ -1476,6 +1477,7 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
                     preferred_channel=channel_kind or client.get("wahelp_preferred_channel"),
                     wa_user_id=client.get("wahelp_user_id_wa"),
                     tg_user_id=client.get("wahelp_user_id_tg"),
+                    max_user_id=client.get("wahelp_user_id_max"),
                     requires_connection=bool(client.get("wahelp_requires_connection")),
                 )
                 await send_with_rules(conn, contact, text=CLIENT_PROMO_INTEREST_REPLY)
