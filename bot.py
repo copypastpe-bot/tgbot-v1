@@ -2031,6 +2031,12 @@ def period_input_kb() -> ReplyKeyboardMarkup:
 
 
 def _parse_user_date(text: str) -> date | None:
+    """
+    Парсит дату в форматах:
+    - "18.12" → текущий год (18.12.2025)
+    - "23.07.2023" → указанный год
+    - "сегодня", "вчера" → специальные значения
+    """
     raw = (text or "").strip().lower()
     if not raw:
         return None
@@ -2039,11 +2045,14 @@ def _parse_user_date(text: str) -> date | None:
         return today_local
     if raw in {"вчера", "yesterday"}:
         return today_local - timedelta(days=1)
+    # Сначала пробуем форматы с годом (полный формат)
     for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
         try:
             return datetime.strptime(raw, fmt).date()
         except ValueError:
             continue
+    # Если не подошел ни один формат с годом, пробуем формат дд.мм (без года)
+    # Добавляем текущий год
     if re.fullmatch(r"\d{1,2}\.\d{1,2}", raw):
         try:
             return datetime.strptime(f"{raw}.{today_local.year}", "%d.%m.%Y").date()
@@ -3763,7 +3772,7 @@ async def reports_shortcut_cash(msg: Message, state: FSMContext):
     await state.clear()
     await state.update_data(report_kind="Касса")
     await state.set_state(ReportsFSM.waiting_period_start)
-    await msg.answer("Касса: введите дату начала периода (ДД.ММ.ГГГГ).", reply_markup=period_input_kb())
+    await msg.answer("Касса: введите дату начала периода (ДД.ММ или ДД.ММ.ГГГГ).", reply_markup=period_input_kb())
 
 
 @dp.message(StateFilter(None), F.text == "Прибыль")
@@ -3777,7 +3786,7 @@ async def reports_shortcut_profit(msg: Message, state: FSMContext):
     await state.clear()
     await state.update_data(report_kind="Прибыль")
     await state.set_state(ReportsFSM.waiting_period_start)
-    await msg.answer("Прибыль: введите дату начала периода (ДД.ММ.ГГГГ).", reply_markup=period_input_kb())
+    await msg.answer("Прибыль: введите дату начала периода (ДД.ММ или ДД.ММ.ГГГГ).", reply_markup=period_input_kb())
 
 
 @dp.message(StateFilter(None), F.text == "Типы оплат")
@@ -3791,7 +3800,7 @@ async def reports_shortcut_payment_types(msg: Message, state: FSMContext):
     await state.clear()
     await state.update_data(report_kind="Типы оплат")
     await state.set_state(ReportsFSM.waiting_period_start)
-    await msg.answer("Типы оплат: введите дату начала периода (ДД.ММ.ГГГГ).", reply_markup=period_input_kb())
+    await msg.answer("Типы оплат: введите дату начала периода (ДД.ММ или ДД.ММ.ГГГГ).", reply_markup=period_input_kb())
 
 
 @dp.message(ReportsFSM.waiting_pick_period, F.text == "День")
@@ -3832,10 +3841,10 @@ async def reports_period_back(msg: Message, state: FSMContext):
 async def reports_period_start_input(msg: Message, state: FSMContext):
     start_date = _parse_user_date(msg.text)
     if not start_date:
-        return await msg.answer("Введите дату в формате ДД.ММ.ГГГГ (например 01.11.2025).", reply_markup=period_input_kb())
+        return await msg.answer("Введите дату в формате ДД.ММ (текущий год) или ДД.ММ.ГГГГ (например: 18.12 или 23.07.2023).", reply_markup=period_input_kb())
     await state.update_data(report_period_start=start_date.isoformat())
     await state.set_state(ReportsFSM.waiting_period_end)
-    await msg.answer("Введите дату окончания периода (включительно).", reply_markup=period_input_kb())
+    await msg.answer("Введите дату окончания периода (включительно). Формат: ДД.ММ или ДД.ММ.ГГГГ", reply_markup=period_input_kb())
 
 
 @dp.message(ReportsFSM.waiting_period_end, F.text.casefold().in_({"отмена", "выйти"}))
@@ -3848,14 +3857,14 @@ async def reports_period_end_cancel(msg: Message, state: FSMContext):
 @dp.message(ReportsFSM.waiting_period_end, F.text.casefold() == "назад")
 async def reports_period_end_back(msg: Message, state: FSMContext):
     await state.set_state(ReportsFSM.waiting_period_start)
-    await msg.answer("Введите дату начала периода (ДД.ММ.ГГГГ).", reply_markup=period_input_kb())
+    await msg.answer("Введите дату начала периода (ДД.ММ или ДД.ММ.ГГГГ).", reply_markup=period_input_kb())
 
 
 @dp.message(ReportsFSM.waiting_period_end)
 async def reports_period_end_input(msg: Message, state: FSMContext):
     end_date = _parse_user_date(msg.text)
     if not end_date:
-        return await msg.answer("Введите дату окончания в формате ДД.ММ.ГГГГ.", reply_markup=period_input_kb())
+        return await msg.answer("Введите дату окончания в формате ДД.ММ (текущий год) или ДД.ММ.ГГГГ (например: 18.12 или 23.07.2023).", reply_markup=period_input_kb())
     data = await state.get_data()
     start_iso = data.get("report_period_start")
     if not start_iso:
