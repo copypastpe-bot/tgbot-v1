@@ -10177,17 +10177,17 @@ async def commit_order(msg: Message, state: FSMContext):
                 effective_master_id = int(master_shares[0]["id"])
             if effective_master_id is None:
                 raise RuntimeError("Не удалось определить master_id для записи кассы.")
+            # Записываем каждую часть оплаты отдельно
             if non_wire_entries:
-                income_amount = sum(amount for _, amount in non_wire_entries)
-                income_method = non_wire_entries[0][0]
-                await _record_order_income(
-                    conn,
-                    income_method,
-                    income_amount,
-                    order_id,
-                    int(effective_master_id),
-                    notify_label,
-                )
+                for income_method, income_amount in non_wire_entries:
+                    await _record_order_income(
+                        conn,
+                        income_method,
+                        income_amount,
+                        order_id,
+                        int(effective_master_id),
+                        notify_label,
+                    )
             await _enqueue_order_completed_notification(
                 conn,
                 order_id=order_id,
