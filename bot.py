@@ -2266,6 +2266,28 @@ async def build_salary_summary_text(master_id: int, start_date: date, end_date: 
             end_dt,
         )
 
+        # Получаем детализацию по заказам
+        order_details = await conn.fetch(
+            """
+            SELECT
+              o.id AS order_id,
+              o.amount_total,
+              pi.base_pay,
+              pi.fuel_pay,
+              pi.upsell_pay,
+              pi.total_pay
+            FROM payroll_items pi
+            JOIN orders o ON o.id = pi.order_id
+            WHERE pi.master_id = $1
+              AND o.created_at >= $2
+              AND o.created_at <  $3
+            ORDER BY o.created_at DESC
+            """,
+            master_id,
+            start_dt,
+            end_dt,
+        )
+
         cash_on_orders, withdrawn_total = await get_master_wallet(conn, master_id)
 
     orders = int(rec["orders"] or 0) if rec else 0
@@ -2287,7 +2309,23 @@ async def build_salary_summary_text(master_id: int, start_date: date, end_date: 
         f"Бенз: {format_money(fuel_pay)}₽",
         f"Допы: {format_money(upsell_pay)}₽",
         f"Наличных на руках: {format_money(on_hand)}₽",
+        "",
+        "детализация по заказам (за этот период):",
     ]
+    
+    # Добавляем детализацию по каждому заказу
+    for order in order_details:
+        order_id = order["order_id"]
+        amount_total = Decimal(order["amount_total"] or 0)
+        order_base = Decimal(order["base_pay"] or 0)
+        order_fuel = Decimal(order["fuel_pay"] or 0)
+        order_upsell = Decimal(order["upsell_pay"] or 0)
+        order_total_pay = Decimal(order["total_pay"] or 0)
+        
+        # Форматируем: #XXX - сумма чека/ЗП мастера (база/бенз/доп)
+        detail_line = f"#{order_id} - {format_money(amount_total)}/{format_money(order_total_pay)} ({format_money(order_base)}/{format_money(order_fuel)}/{format_money(order_upsell)})"
+        lines.append(detail_line)
+    
     return "\n".join(lines)
 
 
@@ -4057,6 +4095,19 @@ async def reports_period_cancel(msg: Message, state: FSMContext):
 
 @dp.message(ReportsFSM.waiting_period_start, F.text.casefold() == "назад")
 async def reports_period_back(msg: Message, state: FSMContext):
+    """Обработка кнопки 'Назад' при вводе даты начала периода."""
+    data = await state.get_data()
+    report_kind = data.get("report_kind")
+    if report_kind in {
+        "Мастер/Заказы/Оплаты",
+        "master_orders",
+        "Мастер/Зарплата",
+        "master_salary",
+    }:
+        async with pool.acquire() as conn:
+            prompt, kb = await build_report_masters_kb(conn)
+        await state.set_state(ReportsFSM.waiting_pick_master)
+        return await msg.answer(prompt, reply_markup=kb)
     await state.set_state(ReportsFSM.waiting_root)
     await msg.answer("Отчёты: выбери раздел.", reply_markup=reports_root_kb())
 
@@ -6806,28 +6857,14 @@ async def rep_master_pick(msg: Message, state: FSMContext):
         report_master_id=master_row["id"],
         report_master_name=master_name,
     )
-    await state.set_state(ReportsFSM.waiting_pick_period)
+    await state.set_state(ReportsFSM.waiting_period_start)
     await msg.answer(
-        f"Мастер выбран: {master_name} (tg:{tg_id}). Выберите период:",
-        reply_markup=reports_period_kb(),
+        f"Мастер выбран: {master_name} (tg:{tg_id}).\nВведите дату начала периода (ДД.ММ или ДД.ММ.ГГГГ):",
+        reply_markup=period_input_kb(),
     )
 
 
-@dp.message(ReportsFSM.waiting_pick_period, F.text.in_({"день", "неделя", "месяц", "год"}))
-async def rep_master_period(msg: Message, state: FSMContext):
-    period_map = {
-        "день": "day",
-        "неделя": "week",
-        "месяц": "month",
-        "год": "year",
-    }
-    normalized = period_map.get((msg.text or "").strip().lower())
-    if not normalized:
-        return await msg.answer("Выберите один из вариантов: день / неделя / месяц / год")
-
-    data = await state.get_data()
-    text = await _build_report_text(data.get("report_kind"), data, normalized, state)
-    await msg.answer(text, parse_mode=ParseMode.HTML, reply_markup=reports_period_kb())
+# Старый обработчик периода для мастеров удален - теперь используется ввод дат начала и конца
 
 # ===== Leads import (admin) =====
 @dp.message(Command("import_leads_dryrun"))
@@ -10558,8 +10595,13 @@ async def master_rewash_order(msg: Message, state: FSMContext):
     # Уведомление в чат заказов
     if ORDERS_CONFIRM_CHAT_ID:
         try:
-            date_str = date_start.strftime("%d.%m.%Y")
-            time_str = order["created_at"].astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
+            # Используем дату заказа для отображения
+            order_created = order["created_at"]
+            if order_created.tzinfo is None:
+                order_created = order_created.replace(tzinfo=timezone.utc)
+            order_created_local = order_created.astimezone(MOSCOW_TZ)
+            date_str = order_created_local.strftime("%d.%m.%Y")
+            time_str = order_created_local.strftime("%H:%M")
             notification_text = (
                 f"🔄 <b>Перемыв отмечен</b>\n"
                 f"Мастер: {master_name}\n"
