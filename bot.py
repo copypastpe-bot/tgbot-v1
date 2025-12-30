@@ -4423,6 +4423,16 @@ async def _record_jenya_card_entry(
 async def _remove_jenya_card_entry(conn: asyncpg.Connection, cash_entry_id: int | None) -> None:
     if not cash_entry_id:
         return
+    entry = await conn.fetchrow(
+        """
+        SELECT id, kind, amount, cash_entry_id
+        FROM jenya_card_entries
+        WHERE cash_entry_id=$1 AND COALESCE(is_deleted,false)=FALSE
+        """,
+        cash_entry_id,
+    )
+    if not entry:
+        return
     await conn.execute(
         """
         UPDATE jenya_card_entries
@@ -4431,6 +4441,19 @@ async def _remove_jenya_card_entry(conn: asyncpg.Connection, cash_entry_id: int 
         """,
         cash_entry_id,
     )
+    balance = await _get_jenya_card_balance(conn)
+    if JENYA_CARD_CHAT_ID:
+        try:
+            kind_label = "Приход" if entry["kind"] in ("income", "opening_balance") else "Расход"
+            amount = format_money(Decimal(entry["amount"] or 0))
+            lines = [
+                "Транзакция удалена",
+                f"#{entry['cash_entry_id']} — {kind_label} Карта Женя {amount}₽",
+                f"Остаток - {format_money(balance)}₽",
+            ]
+            await bot.send_message(JENYA_CARD_CHAT_ID, "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send Jenya card delete log: %s", exc)
 
 
 # Payment method normalizer (Python side to mirror SQL norm_pay_method)
