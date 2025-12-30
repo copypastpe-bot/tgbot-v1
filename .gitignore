@@ -33,3 +33,6 @@ trace.txt
 .env.local
 .venv
 docs/Sheets.json
+wahelp_*.jsonl
+cash_report_*.txt
+bot.py.bak.*
