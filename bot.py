@@ -7962,6 +7962,8 @@ async def order_remove_confirm(query: CallbackQuery, state: FSMContext):
                         """,
                         target_id,
                     )
+                    for cash_row in cash_rows:
+                        await _remove_jenya_card_entry(conn, cash_row["id"])
                     cash_removed = sum(Decimal(r["amount"] or 0) for r in cash_rows) if cash_rows else Decimal(0)
                     cash_methods = sorted({r["method"] for r in cash_rows if r["method"]})
 
@@ -8536,6 +8538,8 @@ async def tx_delete(msg: Message):
             "WHERE id = $1 AND COALESCE(is_deleted, FALSE) = FALSE RETURNING id",
             tx_id
         )
+        if rec:
+            await _remove_jenya_card_entry(conn, tx_id)
     if not rec:
         return await msg.answer("Транзакция не найдена или уже удалена.")
     await msg.answer(f"🗑️ Транзакция №{tx_id} помечена как удалённая.")
