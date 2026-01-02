@@ -5854,7 +5854,7 @@ async def build_profit_report_text_for_period(start_utc: datetime, end_utc: date
             f"""
             SELECT
               COALESCE(SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END),0)::numeric(12,2) AS income,
-              COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
+              COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_non_profit_expense_filter("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
             FROM cashbook_entries c
             WHERE c.happened_at >= $1
               AND c.happened_at < $2
