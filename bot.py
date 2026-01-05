@@ -90,6 +90,12 @@ class DividendFSM(StatesGroup):
     waiting_comment = State()
     waiting_confirm = State()
 
+class InvestmentFSM(StatesGroup):
+    waiting_amount = State()
+    waiting_owner = State()
+    waiting_comment = State()
+    waiting_confirm = State()
+
 
 class OrderDeleteFSM(StatesGroup):
     waiting_date = State()
@@ -4498,6 +4504,7 @@ async def set_commands():
         BotCommand(command="tx_remove", description="Удалить транзакцию"),
         BotCommand(command="order_remove", description="Удалить заказ"),
         BotCommand(command="dividend", description="Выплата дивидендов"),
+        BotCommand(command="investment", description="Внесение инвестиций"),
         BotCommand(command="jenya_card", description="Баланс Карты Жени"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
@@ -6804,6 +6811,78 @@ async def expense_wizard_amount(msg: Message, state: FSMContext):
     )
 
 
+@dp.message(Command("investment"))
+async def investment_start(msg: Message, state: FSMContext):
+    if not await has_permission(msg.from_user.id, "manage_income"):
+        return await msg.answer("Только для администраторов.")
+    await state.set_state(InvestmentFSM.waiting_amount)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await msg.answer("Введите сумму инвестиций:", reply_markup=kb)
+
+
+@dp.message(InvestmentFSM.waiting_amount, F.text)
+async def investment_amount_input(msg: Message, state: FSMContext):
+    if (msg.text or "").strip().lower() == "отмена":
+        await cancel_any(msg, state)
+        return
+    amount = parse_money(msg.text)
+    if amount is None or amount <= 0:
+        return await msg.answer("Введите положительную сумму в рублях.", reply_markup=cancel_kb)
+    await state.update_data(investment_amount=str(amount))
+    await state.set_state(InvestmentFSM.waiting_owner)
+    await msg.answer(
+        "Куда вносим? Выберите «Дима» (обычная касса) или «Женя» (карта).",
+        reply_markup=expense_owner_kb,
+    )
+
+
+@dp.message(InvestmentFSM.waiting_owner, F.text)
+async def investment_owner_input(msg: Message, state: FSMContext):
+    choice = (msg.text or "").strip().lower()
+    if choice == "отмена":
+        await cancel_any(msg, state)
+        return
+    owner_map = {
+        "дима": "dima",
+        "dima": "dima",
+        "женя": "jenya",
+        "jenya": "jenya",
+    }
+    owner = owner_map.get(choice)
+    if not owner:
+        return await msg.answer("Выберите «Дима» или «Женя» кнопками ниже.", reply_markup=expense_owner_kb)
+    await state.update_data(investment_owner=owner)
+    await state.set_state(InvestmentFSM.waiting_comment)
+    await msg.answer("Комментарий? (или «Без комментария»)", reply_markup=dividend_comment_kb)
+
+
+@dp.message(InvestmentFSM.waiting_comment, F.text)
+async def investment_comment_input(msg: Message, state: FSMContext):
+    if (msg.text or "").strip().lower() == "отмена":
+        await cancel_any(msg, state)
+        return
+    text = (msg.text or "").strip()
+    if text.lower() == "без комментария" or not text:
+        text = "Инвестиции"
+    await state.update_data(investment_comment=text)
+    data = await state.get_data()
+    amount = Decimal(data.get("investment_amount") or "0")
+    owner = (data.get("investment_owner") or "dima").lower()
+    owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
+    lines = [
+        "Подтвердите внесение инвестиций:",
+        f"Сумма: {format_money(amount)}₽",
+        f"Комментарий: {text}",
+        f"Источник: {owner_label}",
+    ]
+    await state.set_state(InvestmentFSM.waiting_confirm)
+    await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("investment_confirm"))
+
+
 @dp.message(ExpenseFSM.waiting_comment)
 async def expense_wizard_comment(msg: Message, state: FSMContext):
     txt = (msg.text or "").strip()
@@ -8338,6 +8417,71 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
     owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
     await query.message.answer(
         f"Расход №{tx['id']}: {format_money(amount)}₽ — {when}\nКомментарий: {comment}\nИсточник: {owner_label}",
+        reply_markup=admin_root_kb(),
+    )
+    await state.clear()
+    await state.set_state(AdminMenuFSM.root)
+
+
+@dp.callback_query(InvestmentFSM.waiting_confirm)
+async def investment_confirm_handler(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+    if data not in {"investment_confirm:yes", "investment_confirm:cancel"}:
+        await query.answer()
+        return
+
+    await query.answer()
+    await query.message.edit_reply_markup(None)
+
+    if data.endswith("cancel"):
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Внесение инвестиций отменено.", reply_markup=admin_root_kb())
+        return
+
+    payload = await state.get_data()
+    try:
+        amount = Decimal(payload.get("investment_amount") or "0")
+        comment = payload.get("investment_comment") or "Инвестиции"
+        owner = (payload.get("investment_owner") or "dima").lower()
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("investment confirm payload error: %s", exc)
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Не удалось прочитать данные инвестиций. Попробуйте снова.", reply_markup=admin_root_kb())
+        return
+
+    async with pool.acquire() as conn:
+        try:
+            tx = await _record_income(conn, "Наличные", amount, comment, created_by=query.from_user.id)
+            if owner == "jenya":
+                try:
+                    await _record_jenya_card_entry(
+                        conn,
+                        kind="income",
+                        amount=amount,
+                        comment=comment,
+                        created_by=query.from_user.id,
+                        happened_at=tx["happened_at"],
+                        cash_entry_id=tx["id"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to mirror Jenya card investment for tx #%s: %s", tx["id"], exc)
+            balance = await get_cash_balance_excluding_withdrawals(conn)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("investment confirm failed: %s", exc)
+            await state.clear()
+            await state.set_state(AdminMenuFSM.root)
+            await query.message.answer(f"Ошибка при внесении инвестиций: {exc}", reply_markup=admin_root_kb())
+            return
+
+    when = tx["happened_at"].astimezone(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
+    await query.message.answer(
+        f"Инвестиция №{tx['id']} внесена: {format_money(amount)}₽ ({when})\n"
+        f"Комментарий: {comment}\n"
+        f"Источник: {owner_label}\n"
+        f"Остаток кассы: {format_money(balance)}₽",
         reply_markup=admin_root_kb(),
     )
     await state.clear()
