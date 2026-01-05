@@ -23,6 +23,7 @@ import/
 
 # OS/editor junk
 .DS_Store
+._*
 .vscode/
 .idea/
 Сохраняем файл на всякий/
