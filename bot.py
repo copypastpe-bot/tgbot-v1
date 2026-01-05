@@ -86,6 +86,7 @@ class TxDeleteFSM(StatesGroup):
 
 class DividendFSM(StatesGroup):
     waiting_amount = State()
+    waiting_owner = State()
     waiting_comment = State()
     waiting_confirm = State()
 
@@ -8603,6 +8604,29 @@ async def dividend_amount_input(msg: Message, state: FSMContext):
             reply_markup=cancel_kb,
         )
     await state.update_data(dividend_amount=str(amount))
+    await state.set_state(DividendFSM.waiting_owner)
+    await msg.answer(
+        "Кто оплачивает дивиденды? Выберите «Дима» (обычная касса) или «Женя» (карта).",
+        reply_markup=expense_owner_kb,
+    )
+
+
+@dp.message(DividendFSM.waiting_owner, F.text)
+async def dividend_owner_input(msg: Message, state: FSMContext):
+    choice = (msg.text or "").strip().lower()
+    if choice == "отмена":
+        await cancel_any(msg, state)
+        return
+    owner_map = {
+        "дима": "dima",
+        "dima": "dima",
+        "женя": "jenya",
+        "jenya": "jenya",
+    }
+    owner = owner_map.get(choice)
+    if not owner:
+        return await msg.answer("Выберите «Дима» или «Женя» кнопками ниже.", reply_markup=expense_owner_kb)
+    await state.update_data(dividend_owner=owner)
     await state.set_state(DividendFSM.waiting_comment)
     await msg.answer("Комментарий к выплате? (или «Без комментария»)", reply_markup=dividend_comment_kb)
 
@@ -8618,10 +8642,13 @@ async def dividend_comment_input(msg: Message, state: FSMContext):
     await state.update_data(dividend_comment=text or "Дивиденды")
     data = await state.get_data()
     amount = Decimal(data.get("dividend_amount") or "0")
+    owner = (data.get("dividend_owner") or "dima").lower()
+    owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
     lines = [
         "Подтвердите выплату дивидендов:",
         f"Сумма: {format_money(amount)}₽",
         f"Комментарий: {text or 'Дивиденды'}",
+        f"Источник: {owner_label}",
     ]
     await state.set_state(DividendFSM.waiting_confirm)
     await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("dividend_confirm"))
@@ -8647,6 +8674,7 @@ async def dividend_confirm_handler(query: CallbackQuery, state: FSMContext):
     try:
         amount = Decimal(payload.get("dividend_amount") or "0")
         comment = payload.get("dividend_comment") or "Дивиденды"
+        owner = (payload.get("dividend_owner") or "dima").lower()
     except Exception as exc:  # noqa: BLE001
         logging.exception("dividend confirm payload error: %s", exc)
         await state.clear()
@@ -8667,6 +8695,19 @@ async def dividend_confirm_handler(query: CallbackQuery, state: FSMContext):
         formatted_comment = _format_dividend_comment(comment)
         try:
             tx = await _record_expense(conn, amount, formatted_comment, method=DIVIDEND_METHOD)
+            if owner == "jenya":
+                try:
+                    await _record_jenya_card_entry(
+                        conn,
+                        kind="expense",
+                        amount=amount,
+                        comment=formatted_comment,
+                        created_by=query.from_user.id,
+                        happened_at=tx["happened_at"],
+                        cash_entry_id=tx["id"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to mirror Jenya card dividend for tx #%s: %s", tx["id"], exc)
             new_balance = await get_cash_balance_excluding_withdrawals(conn)
         except Exception as exc:  # noqa: BLE001
             logging.exception("dividend confirm failed: %s", exc)
@@ -8676,8 +8717,12 @@ async def dividend_confirm_handler(query: CallbackQuery, state: FSMContext):
             return
 
     when = tx["happened_at"].astimezone(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+    owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
     await query.message.answer(
-        f"Дивиденды #{tx['id']} проведены: {format_money(amount)}₽ ({when})\nКомментарий: {formatted_comment}\nОстаток кассы: {format_money(new_balance)}₽",
+        f"Дивиденды #{tx['id']} проведены: {format_money(amount)}₽ ({when})\n"
+        f"Комментарий: {formatted_comment}\n"
+        f"Источник: {owner_label}\n"
+        f"Остаток кассы: {format_money(new_balance)}₽",
         reply_markup=admin_root_kb(),
     )
     await state.clear()
