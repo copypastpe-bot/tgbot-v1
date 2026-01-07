@@ -300,34 +300,7 @@ def get_birthday_texts() -> list[str]:
 
 
 async def _log_missing_messenger(contact: ClientContact, channel: ChannelKind, reason: str) -> None:
-    if LOGS_CHAT_ID == 0:
-        return
-    phone = contact.phone or "номер не указан"
-    name = contact.name or "Без имени"
-    client_lines: list[str] = []
-    lead_lines: list[str] = []
-    if contact.recipient_kind == "lead":
-        lead_lines.append(phone)
-    else:
-        client_lines.append(f"{phone} / {name}")
-
-    def _append_section(title: str, entries: list[str]) -> list[str]:
-        block = [title]
-        block.extend(entries or ["—"])
-        return block
-
-    lines: list[str] = []
-    lines.extend(_append_section("У клиентов нет месенджера:", client_lines))
-    lines.append("")
-    lines.extend(_append_section("У лидов нет месенджера:", lead_lines))
-    if reason:
-        lines.append("")
-        lines.append(f"Причина: {reason}")
-    lines.append(f"Канал: {channel}")
-    try:
-        await bot.send_message(LOGS_CHAT_ID, "\n".join(lines))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to send Wahelp delivery log: %s", exc)
+    return
 
 
 set_missing_messenger_logger(_log_missing_messenger)
@@ -3539,6 +3512,46 @@ async def send_daily_reports() -> None:
     else:
         logger.warning("ORDERS_CONFIRM_CHAT_ID is not set; skipping orders daily report")
 
+    if LOGS_CHAT_ID:
+        try:
+            start_local = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+            end_local = start_local + timedelta(days=1)
+            start_utc = start_local.astimezone(timezone.utc)
+            end_utc = end_local.astimezone(timezone.utc)
+            async with pool.acquire() as conn:
+                promo_sent = await conn.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM notification_messages
+                    WHERE event_key = ANY($1::text[])
+                      AND status = 'sent'
+                      AND sent_at >= $2
+                      AND sent_at < $3
+                    """,
+                    ["promo_reengage_first", "promo_reengage_second"],
+                    start_utc,
+                    end_utc,
+                ) or 0
+                missing_clients = await conn.fetchval(
+                    """
+                    SELECT COUNT(DISTINCT entity_id)
+                    FROM wahelp_delivery_issues
+                    WHERE entity_kind = 'client'
+                      AND created_at >= $1
+                      AND created_at < $2
+                    """,
+                    start_utc,
+                    end_utc,
+                ) or 0
+            lines = [
+                "📌 Итоги доставок за сегодня:",
+                f"Успешных отправок промо: {promo_sent}",
+                f"Клиентов без каналов связи: {missing_clients}",
+            ]
+            await bot.send_message(LOGS_CHAT_ID, "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send daily logs summary: %s", exc)
+
     async with pool.acquire() as conn:
         await _mark_daily_job_run(conn, "daily_reports", now_utc)
 
@@ -3709,9 +3722,9 @@ async def run_birthday_jobs() -> None:
     async with pool.acquire() as conn:
         await _mark_daily_job_run(conn, "birthday_jobs", now_utc)
 
-    if MONEY_FLOW_CHAT_ID:
+    if LOGS_CHAT_ID:
         try:
-            await bot.send_message(MONEY_FLOW_CHAT_ID, "\n".join(lines))
+            await bot.send_message(LOGS_CHAT_ID, "\n".join(lines))
         except Exception as exc:  # noqa: BLE001
             logging.exception("Failed to send birthday bonus summary: %s", exc)
 

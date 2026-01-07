@@ -167,37 +167,7 @@ async def send_with_rules(
     if contact.requires_connection:
         raise WahelpAPIError(0, "Contact requires Wahelp connection", None)
     
-    # Пробуем отправить через наш клиентский бот, если клиент подписан
-    if (contact.recipient_kind == "client" and 
-        contact.bot_tg_user_id and 
-        contact.bot_started):
-        success, error_msg = await send_to_client_bot(
-            contact.bot_tg_user_id,
-            text,
-            logs_chat_id=logs_chat_id,
-        )
-        if success:
-            # Успешно отправили через бот - обновляем preferred_contact
-            await conn.execute(
-                """
-                UPDATE clients
-                SET preferred_contact = 'bot',
-                    last_updated = NOW()
-                WHERE id = $1
-                """,
-                contact.client_id,
-            )
-            logger.info("Message sent via client bot to client %s", contact.client_id)
-            # Возвращаем специальный канал для логирования
-            return SendResult(channel="client_bot", response={"success": True})
-        else:
-            # Не удалось отправить через бот - логируем и продолжаем с Wahelp
-            logger.warning(
-                "Failed to send via client bot to client %s: %s. Falling back to Wahelp.",
-                contact.client_id,
-                error_msg,
-            )
-            # Не меняем preferred_contact, продолжаем со старой схемой через Wahelp
+    # Клиентский бот временно отключён для исходящих сервисных сообщений.
     
     # Продолжаем со старой логикой через Wahelp
     attempts = _build_channel_sequence(contact)

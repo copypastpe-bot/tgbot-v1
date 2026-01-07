@@ -37,3 +37,15 @@ docs/Sheets.json
 wahelp_*.jsonl
 cash_report_*.txt
 bot.py.bak.*
+docs/amocrm_api_research.md
+docs/amocrm_project_plan.md
+docs/bots_technical_overview.md
+docs/code_review_2024.md
+docs/plan_day3.md
+scripts/download_onlinepbx_calls.py
+scripts/export_wahelp_chats.py
+scripts/export_wahelp_contacts.py
+scripts/fetch_lead_user_ids.py
+scripts/get_wahelp_user_id.py
+scripts/send_test_message_to_client_bot.py
+scripts/sync_wahelp_contacts.py
