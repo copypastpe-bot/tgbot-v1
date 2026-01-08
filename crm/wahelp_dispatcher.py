@@ -196,33 +196,7 @@ async def send_with_rules(
             logger.warning("Send via %s failed for %s %s: %s", channel, contact.recipient_kind, contact.client_id, exc)
             last_error = exc
             continue
-    # Все каналы не сработали - логируем в LOGS_CHAT_ID
-    if last_error and logs_chat_id:
-        try:
-            channel_names = {
-                MAX_CHANNEL: "MAX (Wahelp)",
-                TELEGRAM_CHANNEL: "TG (Wahelp)",
-                WHATSAPP_CHANNEL: "WA (Wahelp)",
-            }
-            failed_names = [channel_names.get(ch, ch) for ch in failed_channels]
-            error_msg = (
-                f"❌ Нет доступных каналов связи для клиента\n"
-                f"ID клиента: {contact.client_id}\n"
-                f"Телефон: {contact.phone}\n"
-                f"Имя: {contact.name}\n"
-                f"Неудачные каналы: {', '.join(failed_names) if failed_names else 'все'}\n"
-                f"Последняя ошибка: {str(last_error)[:200]}"
-            )
-            bot = Bot(token=CLIENT_BOT_TOKEN) if CLIENT_BOT_TOKEN else None
-            if bot:
-                try:
-                    await bot.send_message(logs_chat_id, error_msg)
-                except Exception as log_exc:
-                    logger.error("Failed to log missing channels to LOGS_CHAT_ID: %s", log_exc)
-                finally:
-                    await bot.session.close()
-        except Exception as log_exc:
-            logger.error("Failed to prepare missing channels log: %s", log_exc)
+    # Детальный лог отключён — достаточно сводок и флага requires_connection.
     if last_error:
         if isinstance(last_error, WahelpAPIError) and _is_messenger_missing_error(last_error):
             await _mark_requires_connection(conn, contact, str(last_error), last_channel or MAX_CHANNEL)
