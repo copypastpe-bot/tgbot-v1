@@ -3698,18 +3698,18 @@ async def run_birthday_jobs() -> None:
         f"Начислено именинникам: {accrued}",
         f"Списано по сроку: {total_expired}",
     ]
-        lines.extend(
-            [
-                "",
-                "📨 Промо-рассылки за вчера:",
-                f"Отправлено: {promo_total}",
-                f"Доставлено/прочитано: {promo_delivered + promo_read}",
-                f"Ожидают статуса: {promo_pending}",
-                f"Без каналов связи: {missing_clients}",
-                f"STOP: {promo_stops}",
-                f"Ответ 1: {promo_interests}",
-            ]
-        )
+    lines.extend(
+        [
+            "",
+            "📨 Промо-рассылки за вчера:",
+            f"Отправлено: {promo_total}",
+            f"Доставлено/прочитано: {promo_delivered + promo_read}",
+            f"Ожидают статуса: {promo_pending}",
+            f"Без каналов связи: {missing_clients}",
+            f"STOP: {promo_stops}",
+            f"Ответ 1: {promo_interests}",
+        ]
+    )
     if tg_pending_count:
         lines.extend(
             [
