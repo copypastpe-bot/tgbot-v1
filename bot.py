@@ -3512,46 +3512,6 @@ async def send_daily_reports() -> None:
     else:
         logger.warning("ORDERS_CONFIRM_CHAT_ID is not set; skipping orders daily report")
 
-    if LOGS_CHAT_ID:
-        try:
-            start_local = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-            end_local = start_local + timedelta(days=1)
-            start_utc = start_local.astimezone(timezone.utc)
-            end_utc = end_local.astimezone(timezone.utc)
-            async with pool.acquire() as conn:
-                promo_sent = await conn.fetchval(
-                    """
-                    SELECT COUNT(*)
-                    FROM notification_messages
-                    WHERE event_key = ANY($1::text[])
-                      AND status = 'sent'
-                      AND sent_at >= $2
-                      AND sent_at < $3
-                    """,
-                    ["promo_reengage_first", "promo_reengage_second"],
-                    start_utc,
-                    end_utc,
-                ) or 0
-                missing_clients = await conn.fetchval(
-                    """
-                    SELECT COUNT(DISTINCT entity_id)
-                    FROM wahelp_delivery_issues
-                    WHERE entity_kind = 'client'
-                      AND created_at >= $1
-                      AND created_at < $2
-                    """,
-                    start_utc,
-                    end_utc,
-                ) or 0
-            lines = [
-                "📌 Итоги доставок за сегодня:",
-                f"Успешных отправок промо: {promo_sent}",
-                f"Клиентов без каналов связи: {missing_clients}",
-            ]
-            await bot.send_message(LOGS_CHAT_ID, "\n".join(lines))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to send daily logs summary: %s", exc)
-
     async with pool.acquire() as conn:
         await _mark_daily_job_run(conn, "daily_reports", now_utc)
 
@@ -3642,6 +3602,30 @@ async def run_birthday_jobs() -> None:
             start_utc,
             end_utc,
         ) or 0
+        promo_delivered = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM notification_messages
+            WHERE event_key = ANY($1::text[])
+              AND status = 'delivered'
+              AND sent_at >= $2
+              AND sent_at < $3
+            """,
+            ["promo_reengage_first", "promo_reengage_second"],
+            start_utc,
+            end_utc,
+        ) or 0
+        missing_clients = await conn.fetchval(
+            """
+            SELECT COUNT(DISTINCT entity_id)
+            FROM wahelp_delivery_issues
+            WHERE entity_kind = 'client'
+              AND created_at >= $1
+              AND created_at < $2
+            """,
+            start_utc,
+            end_utc,
+        ) or 0
         promo_stops = await conn.fetchval(
             """
             SELECT COUNT(*)
@@ -3688,15 +3672,17 @@ async def run_birthday_jobs() -> None:
         f"Начислено именинникам: {accrued}",
         f"Списано по сроку: {total_expired}",
     ]
-    lines.extend(
-        [
-            "",
-            "📨 Промо-рассылки за вчера:",
-            f"Отправлено: {promo_sent}",
-            f"STOP: {promo_stops}",
-            f"Ответ 1: {promo_interests}",
-        ]
-    )
+        lines.extend(
+            [
+                "",
+                "📨 Промо-рассылки за вчера:",
+                f"Отправлено: {promo_sent}",
+                f"Доставлено: {promo_delivered}",
+                f"Без каналов связи: {missing_clients}",
+                f"STOP: {promo_stops}",
+                f"Ответ 1: {promo_interests}",
+            ]
+        )
     if tg_pending_count:
         lines.extend(
             [
