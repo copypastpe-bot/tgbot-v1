@@ -3590,7 +3590,7 @@ async def run_birthday_jobs() -> None:
         end_local = start_local + timedelta(days=1)
         start_utc = start_local.astimezone(timezone.utc)
         end_utc = end_local.astimezone(timezone.utc)
-        promo_sent = await conn.fetchval(
+        promo_total = await conn.fetchval(
             """
             SELECT COUNT(*)
             FROM notification_messages
@@ -3608,6 +3608,32 @@ async def run_birthday_jobs() -> None:
             FROM notification_messages
             WHERE event_key = ANY($1::text[])
               AND status = 'delivered'
+              AND sent_at >= $2
+              AND sent_at < $3
+            """,
+            ["promo_reengage_first", "promo_reengage_second"],
+            start_utc,
+            end_utc,
+        ) or 0
+        promo_read = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM notification_messages
+            WHERE event_key = ANY($1::text[])
+              AND status = 'read'
+              AND sent_at >= $2
+              AND sent_at < $3
+            """,
+            ["promo_reengage_first", "promo_reengage_second"],
+            start_utc,
+            end_utc,
+        ) or 0
+        promo_pending = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM notification_messages
+            WHERE event_key = ANY($1::text[])
+              AND status = 'sent'
               AND sent_at >= $2
               AND sent_at < $3
             """,
@@ -3676,8 +3702,9 @@ async def run_birthday_jobs() -> None:
             [
                 "",
                 "📨 Промо-рассылки за вчера:",
-                f"Отправлено: {promo_sent}",
-                f"Доставлено: {promo_delivered}",
+                f"Отправлено: {promo_total}",
+                f"Доставлено/прочитано: {promo_delivered + promo_read}",
+                f"Ожидают статуса: {promo_pending}",
                 f"Без каналов связи: {missing_clients}",
                 f"STOP: {promo_stops}",
                 f"Ответ 1: {promo_interests}",
