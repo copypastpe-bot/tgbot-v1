@@ -1,12 +1,11 @@
 """
 Message routing rules for Wahelp channels.
 
-New priority:
+Current priority (MAX is disabled):
 - If we already know Wahelp user_id for the channel, send directly via that user.
 - For clients, WhatsApp (clients_wa) has priority; Telegram (clients_tg) is fallback.
 - For leads, only the Telegram leads channel is available.
-- If neither channel returns a user_id (messenger not connected), mark the contact as requiring bot connection
-  and log the issue for admins. Future notifications will be skipped automatically.
+- If neither channel returns a user_id (messenger not connected), mark the contact as requiring bot connection.
 """
 
 from __future__ import annotations
@@ -36,6 +35,8 @@ WA_FOLLOWUP_DISABLED = os.getenv("WA_FOLLOWUP_DISABLED", "").lower() in {"1", "t
 _followup_tasks: dict[int, asyncio.Task] = {}
 
 CLIENT_BOT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
+WA_TG_FALLBACK_TEXT = (os.getenv("WA_TG_FALLBACK_TEXT") or "").strip()
+TG_LINK = (os.getenv("TEXTS_TG_LINK") or "").strip()
 
 
 @dataclass
@@ -168,7 +169,7 @@ async def send_with_rules(
         raise WahelpAPIError(0, "Contact requires Wahelp connection", None)
     
     # Клиентский бот временно отключён для исходящих сервисных сообщений.
-    
+
     # Продолжаем со старой логикой через Wahelp
     attempts = _build_channel_sequence(contact)
     last_error: Exception | None = None
@@ -178,12 +179,20 @@ async def send_with_rules(
         channel = attempt.channel
         last_channel = channel
         try:
+            send_text = text
+            if channel == WHATSAPP_CHANNEL:
+                if WA_TG_FALLBACK_TEXT:
+                    send_text = f"{text}\n\n{WA_TG_FALLBACK_TEXT}"
+                elif TG_LINK:
+                    send_text = f"{text}\n\nПроблемы с whatsapp, подпишитесь на наш телеграм {TG_LINK}"
+                else:
+                    send_text = f"{text}\n\nПроблемы с whatsapp, подпишитесь на наш телеграм"
             if attempt.address_kind == "user_id" and attempt.user_id is not None:
-                response = await send_text_message(channel, user_id=attempt.user_id, text=text)
+                response = await send_text_message(channel, user_id=attempt.user_id, text=send_text)
             else:
                 user_id = await _ensure_user_id(conn, contact, channel)
                 await _persist_user_id(conn, contact, channel, user_id)
-                response = await send_text_message(channel, user_id=user_id, text=text)
+                response = await send_text_message(channel, user_id=user_id, text=send_text)
             if contact.recipient_kind == "client":
                 await _set_preferred_channel(conn, contact.client_id, channel)
                 _cancel_followup(contact.client_id)
@@ -208,12 +217,15 @@ def _build_channel_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
     if contact.recipient_kind == "lead":
         return _build_lead_sequence(contact)
     attempts: list[ChannelAttempt] = []
-    if contact.max_user_id:
-        attempts.append(ChannelAttempt(channel=MAX_CHANNEL, address_kind="user_id", user_id=contact.max_user_id))
-    if contact.tg_user_id:
+    preferred = contact.preferred_channel
+    if preferred == TELEGRAM_CHANNEL and contact.tg_user_id:
         attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
-    if contact.wa_user_id:
+    if preferred == WHATSAPP_CHANNEL and contact.wa_user_id:
         attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
+    if contact.wa_user_id and (preferred != WHATSAPP_CHANNEL):
+        attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
+    if contact.tg_user_id and (preferred != TELEGRAM_CHANNEL):
+        attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
     attempts.extend(_build_client_phone_attempts(contact))
     return tuple(_deduplicate_attempts(attempts))
 
@@ -229,19 +241,17 @@ def _build_lead_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
 def _build_client_phone_attempts(contact: ClientContact) -> list[ChannelAttempt]:
     """
     Строит последовательность попыток отправки по телефону.
-    Приоритет: MAX -> TG -> WA
+    Приоритет: WA -> TG (MAX отключён)
     """
     order: Sequence[ChannelKind]
     preferred = contact.preferred_channel
-    if preferred == MAX_CHANNEL:
-        order = (MAX_CHANNEL, TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
-    elif preferred == TELEGRAM_CHANNEL:
-        order = (TELEGRAM_CHANNEL, MAX_CHANNEL, WHATSAPP_CHANNEL)
+    if preferred == TELEGRAM_CHANNEL:
+        order = (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
     elif preferred == WHATSAPP_CHANNEL:
-        order = (WHATSAPP_CHANNEL, MAX_CHANNEL, TELEGRAM_CHANNEL)
+        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
     else:
-        # По умолчанию: MAX -> TG -> WA
-        order = (MAX_CHANNEL, TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
+        # По умолчанию: WA -> TG
+        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
     return [ChannelAttempt(channel=chan, address_kind="phone") for chan in order]
 
 
