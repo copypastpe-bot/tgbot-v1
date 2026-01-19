@@ -25,6 +25,7 @@ from .wahelp_dispatcher import (
     cancel_followup_for_client,
     schedule_followup_for_client,
     set_missing_messenger_logger,
+    send_via_channel,
     send_with_rules,
 )
 
@@ -42,6 +43,7 @@ __all__ = [
     "send_text_to_phone",
     "ClientContact",
     "SendResult",
+    "send_via_channel",
     "send_with_rules",
     "cancel_followup_for_client",
     "schedule_followup_for_client",

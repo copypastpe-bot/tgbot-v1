@@ -174,6 +174,12 @@ async def ensure_notification_schema(conn: asyncpg.Connection) -> None:
     )
     await conn.execute(
         """
+        ALTER TABLE notification_messages
+        ADD COLUMN IF NOT EXISTS retry_attempted boolean NOT NULL DEFAULT false;
+        """
+    )
+    await conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_notification_outbox_status
         ON notification_outbox(status, scheduled_at);
         """

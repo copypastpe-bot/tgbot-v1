@@ -122,6 +122,7 @@ from notifications import (
     NotificationRules,
     NotificationWorker,
     WahelpWebhookServer,
+    extract_provider_message_id,
     ensure_notification_schema,
     enqueue_notification,
     load_notification_rules,
@@ -131,6 +132,7 @@ from crm import (
     ChannelKind,
     ClientContact,
     WahelpAPIError,
+    send_via_channel,
     send_with_rules,
     set_missing_messenger_logger,
 )
@@ -336,6 +338,7 @@ pool: asyncpg.Pool | None = None
 daily_reports_task: asyncio.Task | None = None
 birthday_task: asyncio.Task | None = None
 promo_task: asyncio.Task | None = None
+sent_retry_task: asyncio.Task | None = None
 
 
 async def _try_enqueue_notification(
@@ -3516,6 +3519,95 @@ async def send_daily_reports() -> None:
         await _mark_daily_job_run(conn, "daily_reports", now_utc)
 
 
+async def retry_pending_sent_messages() -> None:
+    if pool is None:
+        return
+    retry_delay = timedelta(minutes=10)
+    poll_interval = 60
+    while True:
+        try:
+            cutoff = datetime.now(timezone.utc) - retry_delay
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, client_id, channel, message_text, event_key
+                    FROM notification_messages
+                    WHERE status = 'sent'
+                      AND retry_attempted = false
+                      AND sent_at < $1
+                      AND channel IN ('clients_wa','clients_tg')
+                    ORDER BY sent_at
+                    LIMIT 50
+                    """,
+                    cutoff,
+                )
+            if not rows:
+                await asyncio.sleep(poll_interval)
+                continue
+            for row in rows:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE notification_messages SET retry_attempted = true, updated_at = NOW() WHERE id = $1",
+                        row["id"],
+                    )
+                    client = await conn.fetchrow(
+                        """
+                        SELECT id, full_name, phone, wahelp_user_id_wa, wahelp_user_id_tg,
+                               wahelp_preferred_channel, wahelp_requires_connection
+                        FROM clients
+                        WHERE id = $1
+                        """,
+                        row["client_id"],
+                    )
+                if not client or not client["phone"] or client["wahelp_requires_connection"]:
+                    continue
+                channel = row["channel"]
+                target_channel = "clients_tg" if channel == "clients_wa" else "clients_wa"
+                contact = ClientContact(
+                    client_id=client["id"],
+                    phone=client["phone"],
+                    name=(client["full_name"] or "Клиент"),
+                    preferred_channel=client["wahelp_preferred_channel"],
+                    wa_user_id=client["wahelp_user_id_wa"],
+                    tg_user_id=client["wahelp_user_id_tg"],
+                    recipient_kind="client",
+                    requires_connection=bool(client["wahelp_requires_connection"]),
+                )
+                async with pool.acquire() as conn:
+                    try:
+                        result = await send_via_channel(
+                            conn,
+                            contact,
+                            target_channel,
+                            text=row["message_text"],
+                            event_key=row["event_key"],
+                        )
+                        provider_payload = (
+                            result.response if isinstance(result.response, Mapping) else None
+                        )
+                        provider_message_id = extract_provider_message_id(provider_payload)
+                        await conn.execute(
+                            """
+                            INSERT INTO notification_messages (
+                                client_id, event_key, channel, message_text, wahelp_message_id, status, sent_at, created_at, updated_at
+                            )
+                            VALUES ($1,$2,$3,$4,$5,'sent',NOW(),NOW(),NOW())
+                            """,
+                            row["client_id"],
+                            row["event_key"],
+                            target_channel,
+                            row["message_text"],
+                            provider_message_id,
+                        )
+                    except WahelpAPIError as exc:
+                        logging.warning("Retry send failed for client %s via %s: %s", row["client_id"], target_channel, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        logging.warning("Retry send unexpected error for client %s: %s", row["client_id"], exc)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("retry_pending_sent_messages failed: %s", exc)
+        await asyncio.sleep(poll_interval)
+
+
 async def wire_pending_reminder_job() -> None:
     if pool is None:
         return
@@ -3592,9 +3684,10 @@ async def run_birthday_jobs() -> None:
         end_utc = end_local.astimezone(timezone.utc)
         promo_total = await conn.fetchval(
             """
-            SELECT COUNT(*)
-            FROM notification_messages
+            SELECT COUNT(DISTINCT client_id)
+            FROM notification_outbox
             WHERE event_key = ANY($1::text[])
+              AND status = 'sent'
               AND sent_at >= $2
               AND sent_at < $3
             """,
@@ -3604,23 +3697,10 @@ async def run_birthday_jobs() -> None:
         ) or 0
         promo_delivered = await conn.fetchval(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(DISTINCT client_id)
             FROM notification_messages
             WHERE event_key = ANY($1::text[])
-              AND status = 'delivered'
-              AND sent_at >= $2
-              AND sent_at < $3
-            """,
-            ["promo_reengage_first", "promo_reengage_second"],
-            start_utc,
-            end_utc,
-        ) or 0
-        promo_read = await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM notification_messages
-            WHERE event_key = ANY($1::text[])
-              AND status = 'read'
+              AND status IN ('delivered','read')
               AND sent_at >= $2
               AND sent_at < $3
             """,
@@ -3630,12 +3710,20 @@ async def run_birthday_jobs() -> None:
         ) or 0
         promo_pending = await conn.fetchval(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(DISTINCT client_id)
             FROM notification_messages
             WHERE event_key = ANY($1::text[])
               AND status = 'sent'
               AND sent_at >= $2
               AND sent_at < $3
+              AND client_id NOT IN (
+                  SELECT client_id
+                  FROM notification_messages
+                  WHERE event_key = ANY($1::text[])
+                    AND status IN ('delivered','read')
+                    AND sent_at >= $2
+                    AND sent_at < $3
+              )
             """,
             ["promo_reengage_first", "promo_reengage_second"],
             start_utc,
@@ -3703,7 +3791,7 @@ async def run_birthday_jobs() -> None:
             "",
             "📨 Промо-рассылки за вчера:",
             f"Отправлено: {promo_total}",
-            f"Доставлено/прочитано: {promo_delivered + promo_read}",
+            f"Доставлено/прочитано: {promo_delivered}",
             f"Ожидают статуса: {promo_pending}",
             f"Без каналов связи: {missing_clients}",
             f"STOP: {promo_stops}",
@@ -10874,7 +10962,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
@@ -10909,6 +10997,10 @@ async def main():
     if wire_reminder_task is None:
         wire_reminder_task = asyncio.create_task(
             schedule_daily_job(20, 0, wire_pending_reminder_job, "wire_pending_reminder")
+        )
+    if sent_retry_task is None:
+        sent_retry_task = asyncio.create_task(
+            retry_pending_sent_messages()
         )
     if rewash_followup_task is None:
         # Проверяем перемывы каждые 2 часа

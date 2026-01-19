@@ -37,6 +37,13 @@ _followup_tasks: dict[int, asyncio.Task] = {}
 CLIENT_BOT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 WA_TG_FALLBACK_TEXT = (os.getenv("WA_TG_FALLBACK_TEXT") or "").strip()
 TG_LINK = (os.getenv("TEXTS_TG_LINK") or "").strip()
+SERVICE_WA_FOOTER_KEYS = {
+    "order_completed_summary",
+    "order_rating_reminder",
+    "order_rating_response_high_client",
+    "order_rating_response_mid_client",
+    "order_rating_response_low_client",
+}
 
 
 @dataclass
@@ -163,6 +170,7 @@ async def send_with_rules(
     contact: ClientContact,
     *,
     text: str,
+    event_key: str | None = None,
     logs_chat_id: int | None = None,
 ) -> SendResult:
     if contact.requires_connection:
@@ -171,7 +179,8 @@ async def send_with_rules(
     # Клиентский бот временно отключён для исходящих сервисных сообщений.
 
     # Продолжаем со старой логикой через Wahelp
-    attempts = _build_channel_sequence(contact)
+    dead_channels = await _get_dead_channels(conn, contact)
+    attempts = _build_channel_sequence(contact, dead_channels)
     last_error: Exception | None = None
     last_channel: ChannelKind | None = None
     failed_channels: list[ChannelKind] = []
@@ -179,14 +188,7 @@ async def send_with_rules(
         channel = attempt.channel
         last_channel = channel
         try:
-            send_text = text
-            if channel == WHATSAPP_CHANNEL:
-                if WA_TG_FALLBACK_TEXT:
-                    send_text = f"{text}\n\n{WA_TG_FALLBACK_TEXT}"
-                elif TG_LINK:
-                    send_text = f"{text}\n\nПроблемы с whatsapp, подпишитесь на наш телеграм {TG_LINK}"
-                else:
-                    send_text = f"{text}\n\nПроблемы с whatsapp, подпишитесь на наш телеграм"
+            send_text = _with_wa_fallback(text, channel, event_key)
             if attempt.address_kind == "user_id" and attempt.user_id is not None:
                 response = await send_text_message(channel, user_id=attempt.user_id, text=send_text)
             else:
@@ -196,37 +198,83 @@ async def send_with_rules(
             if contact.recipient_kind == "client":
                 await _set_preferred_channel(conn, contact.client_id, channel)
                 _cancel_followup(contact.client_id)
+                await _resolve_dead_channel(conn, contact.client_id, channel)
             logger.info("Message sent via %s to client %s", channel, contact.client_id)
             return SendResult(channel=channel, response=response if isinstance(response, Mapping) else None)
         except WahelpAPIError as exc:
-            if _is_messenger_missing_error(exc):
+            if _is_not_connected_error(exc):
                 await _handle_messenger_missing(conn, contact, channel)
+                await _mark_channel_dead(conn, contact, channel, str(exc))
+            elif _is_rate_limit_error(exc):
+                logger.warning("Rate limit for %s %s: %s", contact.recipient_kind, contact.client_id, exc)
             failed_channels.append(channel)
             logger.warning("Send via %s failed for %s %s: %s", channel, contact.recipient_kind, contact.client_id, exc)
             last_error = exc
             continue
     # Детальный лог отключён — достаточно сводок и флага requires_connection.
     if last_error:
-        if isinstance(last_error, WahelpAPIError) and _is_messenger_missing_error(last_error):
+        if isinstance(last_error, WahelpAPIError) and _is_not_connected_error(last_error):
             await _mark_requires_connection(conn, contact, str(last_error), last_channel or MAX_CHANNEL)
         raise last_error
     raise RuntimeError("All Wahelp channels failed without exception")
 
 
-def _build_channel_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
+async def send_via_channel(
+    conn: asyncpg.Connection,
+    contact: ClientContact,
+    channel: ChannelKind,
+    *,
+    text: str,
+    event_key: str | None = None,
+) -> SendResult:
+    if contact.requires_connection:
+        raise WahelpAPIError(0, "Contact requires Wahelp connection", None)
+    dead_channels = await _get_dead_channels(conn, contact)
+    if channel in dead_channels:
+        raise WahelpAPIError(0, f"Channel {channel} is marked as dead", None)
+    send_text = _with_wa_fallback(text, channel, event_key)
+    try:
+        user_id = None
+        if channel == WHATSAPP_CHANNEL:
+            user_id = contact.wa_user_id
+        elif channel == TELEGRAM_CHANNEL:
+            user_id = contact.tg_user_id
+        elif channel == MAX_CHANNEL:
+            user_id = contact.max_user_id
+        if user_id:
+            response = await send_text_message(channel, user_id=user_id, text=send_text)
+        else:
+            user_id = await _ensure_user_id(conn, contact, channel)
+            await _persist_user_id(conn, contact, channel, user_id)
+            response = await send_text_message(channel, user_id=user_id, text=send_text)
+        if contact.recipient_kind == "client":
+            await _set_preferred_channel(conn, contact.client_id, channel)
+            _cancel_followup(contact.client_id)
+            await _resolve_dead_channel(conn, contact.client_id, channel)
+        return SendResult(channel=channel, response=response if isinstance(response, Mapping) else None)
+    except WahelpAPIError as exc:
+        if _is_not_connected_error(exc):
+            await _handle_messenger_missing(conn, contact, channel)
+            await _mark_channel_dead(conn, contact, channel, str(exc))
+        elif _is_rate_limit_error(exc):
+            logger.warning("Rate limit for %s %s: %s", contact.recipient_kind, contact.client_id, exc)
+        raise
+
+
+def _build_channel_sequence(contact: ClientContact, dead_channels: set[ChannelKind]) -> Sequence[ChannelAttempt]:
     if contact.recipient_kind == "lead":
         return _build_lead_sequence(contact)
     attempts: list[ChannelAttempt] = []
     preferred = contact.preferred_channel
-    if preferred == TELEGRAM_CHANNEL and contact.tg_user_id:
+    if preferred == TELEGRAM_CHANNEL and contact.tg_user_id and TELEGRAM_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
-    if preferred == WHATSAPP_CHANNEL and contact.wa_user_id:
+    if preferred == WHATSAPP_CHANNEL and contact.wa_user_id and WHATSAPP_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
-    if contact.wa_user_id and (preferred != WHATSAPP_CHANNEL):
+    if contact.wa_user_id and (preferred != WHATSAPP_CHANNEL) and WHATSAPP_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
-    if contact.tg_user_id and (preferred != TELEGRAM_CHANNEL):
+    if contact.tg_user_id and (preferred != TELEGRAM_CHANNEL) and TELEGRAM_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
-    attempts.extend(_build_client_phone_attempts(contact))
+    attempts.extend(_build_client_phone_attempts(contact, dead_channels))
     return tuple(_deduplicate_attempts(attempts))
 
 
@@ -238,7 +286,7 @@ def _build_lead_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
     return tuple(_deduplicate_attempts(attempts))
 
 
-def _build_client_phone_attempts(contact: ClientContact) -> list[ChannelAttempt]:
+def _build_client_phone_attempts(contact: ClientContact, dead_channels: set[ChannelKind]) -> list[ChannelAttempt]:
     """
     Строит последовательность попыток отправки по телефону.
     Приоритет: WA -> TG (MAX отключён)
@@ -252,7 +300,11 @@ def _build_client_phone_attempts(contact: ClientContact) -> list[ChannelAttempt]
     else:
         # По умолчанию: WA -> TG
         order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
-    return [ChannelAttempt(channel=chan, address_kind="phone") for chan in order]
+    return [
+        ChannelAttempt(channel=chan, address_kind="phone")
+        for chan in order
+        if chan not in dead_channels
+    ]
 
 
 def _deduplicate_attempts(attempts: Sequence[ChannelAttempt]) -> list[ChannelAttempt]:
@@ -323,14 +375,84 @@ async def schedule_followup_for_client(
     _followup_tasks[client_id] = loop.create_task(_task())
 
 
-def _is_messenger_missing_error(error: WahelpAPIError) -> bool:
+def _is_not_connected_error(error: WahelpAPIError) -> bool:
     text = str(error)
     lowered = text.lower()
     return (
         "мессенджер не подключен" in text
         or ("messenger" in lowered and "not connected" in lowered)
-        or "слишком много попыток" in lowered
-        or "too many requests" in lowered
+    )
+
+
+def _is_rate_limit_error(error: WahelpAPIError) -> bool:
+    lowered = str(error).lower()
+    return "слишком много попыток" in lowered or "too many requests" in lowered
+
+
+def _with_wa_fallback(text: str, channel: ChannelKind, event_key: str | None) -> str:
+    if channel != WHATSAPP_CHANNEL:
+        return text
+    if event_key not in SERVICE_WA_FOOTER_KEYS:
+        return text
+    if WA_TG_FALLBACK_TEXT:
+        return f"{text}\n\n{WA_TG_FALLBACK_TEXT}"
+    if TG_LINK:
+        return f"{text}\n\nПроблемы с whatsapp? Подпишитесь на наш телеграм {TG_LINK}"
+    return f"{text}\n\nПроблемы с whatsapp? Подпишитесь на наш телеграм"
+
+
+async def _get_dead_channels(conn: asyncpg.Connection, contact: ClientContact) -> set[ChannelKind]:
+    if contact.recipient_kind != "client":
+        return set()
+    rows = await conn.fetch(
+        """
+        SELECT channel
+        FROM wahelp_delivery_issues
+        WHERE entity_kind = 'client'
+          AND entity_id = $1
+          AND resolved_at IS NULL
+          AND reason ILIKE '%Мессенджер не подключен%'
+        """,
+        contact.client_id,
+    )
+    return {row["channel"] for row in rows if row.get("channel")}
+
+
+async def _mark_channel_dead(
+    conn: asyncpg.Connection,
+    contact: ClientContact,
+    channel: ChannelKind,
+    reason: str,
+) -> None:
+    if contact.recipient_kind != "client":
+        return
+    await conn.execute(
+        """
+        INSERT INTO wahelp_delivery_issues(entity_kind, entity_id, channel, phone, reason)
+        VALUES ($1,$2,$3,$4,$5)
+        ON CONFLICT (entity_kind, entity_id, COALESCE(channel,''))
+        DO UPDATE SET reason=EXCLUDED.reason, phone=EXCLUDED.phone, created_at=NOW(), resolved_at=NULL
+        """,
+        contact.recipient_kind,
+        contact.client_id,
+        channel,
+        contact.phone,
+        reason[:200],
+    )
+
+
+async def _resolve_dead_channel(conn: asyncpg.Connection, client_id: int, channel: ChannelKind) -> None:
+    await conn.execute(
+        """
+        UPDATE wahelp_delivery_issues
+        SET resolved_at = NOW()
+        WHERE entity_kind='client'
+          AND entity_id=$1
+          AND channel=$2
+          AND resolved_at IS NULL
+        """,
+        client_id,
+        channel,
     )
 
 
@@ -341,14 +463,11 @@ async def _handle_messenger_missing(
 ) -> None:
     if contact.recipient_kind != "client":
         return
-    # Выбираем следующий канал по приоритету: MAX -> TG -> WA
-    if failed_channel == MAX_CHANNEL:
+    # Выбираем следующий канал по приоритету: WA -> TG
+    if failed_channel == WHATSAPP_CHANNEL:
         fallback = TELEGRAM_CHANNEL
     elif failed_channel == TELEGRAM_CHANNEL:
         fallback = WHATSAPP_CHANNEL
-    elif failed_channel == WHATSAPP_CHANNEL:
-        # Если WA не работает, пробуем TG или MAX
-        fallback = TELEGRAM_CHANNEL
     else:
         return
     await _set_preferred_channel(conn, contact.client_id, fallback)

@@ -132,6 +132,7 @@ class NotificationWorker:
                     conn, 
                     contact, 
                     text=message_text,
+                    event_key=entry.event_key,
                     logs_chat_id=self.logs_chat_id,
                 )
             except Exception as exc:  # noqa: BLE001
