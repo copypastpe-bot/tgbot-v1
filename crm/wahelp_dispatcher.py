@@ -11,10 +11,13 @@ Current priority (MAX is disabled):
 from __future__ import annotations
 
 import os
+import re
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
 from typing import Awaitable, Callable, Literal, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from aiogram import Bot
@@ -35,8 +38,17 @@ WA_FOLLOWUP_DISABLED = os.getenv("WA_FOLLOWUP_DISABLED", "").lower() in {"1", "t
 _followup_tasks: dict[int, asyncio.Task] = {}
 
 CLIENT_BOT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 WA_TG_FALLBACK_TEXT = (os.getenv("WA_TG_FALLBACK_TEXT") or "").strip()
 TG_LINK = (os.getenv("TEXTS_TG_LINK") or "").strip()
+DAILY_SEND_LIMIT = int(os.getenv("DAILY_SEND_LIMIT", "60") or "60")
+DAILY_SEND_LIMIT_ALERT_JOB = "send_daily_limit_alert"
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+ADMIN_TG_IDS: set[int] = set()
+_admin_ids_env = os.getenv("ADMIN_TG_IDS", "") or os.getenv("ADMIN_IDS", "")
+for part in re.split(r"[ ,;]+", _admin_ids_env.strip()):
+    if part.isdigit():
+        ADMIN_TG_IDS.add(int(part))
 SERVICE_WA_FOOTER_KEYS = {
     "order_completed_summary",
     "order_rating_reminder",
@@ -69,6 +81,13 @@ class SendResult:
     response: Mapping[str, object] | None = None
 
 
+class DailySendLimitReached(RuntimeError):
+    def __init__(self, limit: int, total: int) -> None:
+        super().__init__(f"Daily send limit reached: {total}/{limit}")
+        self.limit = limit
+        self.total = total
+
+
 @dataclass(slots=True)
 class ChannelAttempt:
     channel: ChannelKind
@@ -84,6 +103,95 @@ def set_missing_messenger_logger(callback: MissingMessengerLogger | None) -> Non
     """Register optional logger that reports contacts without messengers."""
     global _missing_logger
     _missing_logger = callback
+
+
+def _today_window_utc() -> tuple[datetime, datetime]:
+    now_local = datetime.now(MOSCOW_TZ)
+    start_local = datetime.combine(now_local.date(), time.min, tzinfo=MOSCOW_TZ)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+async def _count_daily_sends(conn: asyncpg.Connection) -> int:
+    start_utc, end_utc = _today_window_utc()
+    client_total = await conn.fetchval(
+        """
+        SELECT COUNT(*)
+        FROM notification_messages
+        WHERE sent_at >= $1
+          AND sent_at < $2
+        """,
+        start_utc,
+        end_utc,
+    ) or 0
+    lead_total = await conn.fetchval(
+        """
+        SELECT COUNT(*)
+        FROM lead_logs
+        WHERE sent_at >= $1
+          AND sent_at < $2
+        """,
+        start_utc,
+        end_utc,
+    ) or 0
+    return int(client_total) + int(lead_total)
+
+
+async def _should_send_limit_alert(conn: asyncpg.Connection, now_utc: datetime) -> bool:
+    row = await conn.fetchrow(
+        "SELECT last_run FROM daily_job_runs WHERE job_name=$1",
+        DAILY_SEND_LIMIT_ALERT_JOB,
+    )
+    if row and row["last_run"]:
+        last_local = row["last_run"].astimezone(MOSCOW_TZ)
+        if last_local.date() >= now_utc.astimezone(MOSCOW_TZ).date():
+            return False
+    return True
+
+
+async def _mark_limit_alert(conn: asyncpg.Connection, now_utc: datetime) -> None:
+    await conn.execute(
+        """
+        INSERT INTO daily_job_runs (job_name, last_run)
+        VALUES ($1, $2)
+        ON CONFLICT (job_name)
+        DO UPDATE SET last_run = EXCLUDED.last_run
+        """,
+        DAILY_SEND_LIMIT_ALERT_JOB,
+        now_utc,
+    )
+
+
+async def _send_limit_alert(conn: asyncpg.Connection, total: int) -> None:
+    if not BOT_TOKEN or not ADMIN_TG_IDS:
+        return
+    now_utc = datetime.now(timezone.utc)
+    if not await _should_send_limit_alert(conn, now_utc):
+        return
+    text = (
+        "🚫 Достигнут дневной лимит отправок.\n"
+        f"Всего: {total} из {DAILY_SEND_LIMIT}\n"
+        "Отправка остановлена до завтра."
+    )
+    bot = Bot(token=BOT_TOKEN)
+    try:
+        for admin_id in ADMIN_TG_IDS:
+            try:
+                await bot.send_message(admin_id, text)
+            except Exception:
+                logger.exception("Failed to send daily limit alert to admin %s", admin_id)
+    finally:
+        await bot.session.close()
+    await _mark_limit_alert(conn, now_utc)
+
+
+async def _enforce_daily_limit(conn: asyncpg.Connection) -> None:
+    if DAILY_SEND_LIMIT <= 0:
+        return
+    total = await _count_daily_sends(conn)
+    if total >= DAILY_SEND_LIMIT:
+        await _send_limit_alert(conn, total)
+        raise DailySendLimitReached(DAILY_SEND_LIMIT, total)
 
 
 async def send_to_client_bot(
@@ -175,6 +283,7 @@ async def send_with_rules(
 ) -> SendResult:
     if contact.requires_connection:
         raise WahelpAPIError(0, "Contact requires Wahelp connection", None)
+    await _enforce_daily_limit(conn)
     
     # Клиентский бот временно отключён для исходящих сервисных сообщений.
 
@@ -229,6 +338,7 @@ async def send_via_channel(
 ) -> SendResult:
     if contact.requires_connection:
         raise WahelpAPIError(0, "Contact requires Wahelp connection", None)
+    await _enforce_daily_limit(conn)
     dead_channels = await _get_dead_channels(conn, contact)
     if channel in dead_channels:
         raise WahelpAPIError(0, f"Channel {channel} is marked as dead", None)

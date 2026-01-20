@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
 import asyncpg
 
-from crm import ClientContact, send_with_rules
+from crm import ClientContact, DailySendLimitReached, send_with_rules
 from .outbox import (
     NotificationOutboxEntry,
     cancel_outbox_entry,
@@ -129,12 +130,33 @@ class NotificationWorker:
         async with self.pool.acquire() as conn:
             try:
                 result = await send_with_rules(
-                    conn, 
-                    contact, 
+                    conn,
+                    contact,
                     text=message_text,
                     event_key=entry.event_key,
                     logs_chat_id=self.logs_chat_id,
                 )
+            except DailySendLimitReached as exc:
+                next_attempt = datetime.now(timezone.utc) + timedelta(days=1)
+                await conn.execute(
+                    """
+                    UPDATE notification_outbox
+                    SET status='pending',
+                        scheduled_at=$2,
+                        last_error=$3,
+                        updated_at=NOW()
+                    WHERE id=$1
+                    """,
+                    entry.id,
+                    next_attempt,
+                    str(exc)[:500],
+                )
+                logger.warning(
+                    "Daily limit reached; rescheduled notification %s to %s",
+                    entry.id,
+                    next_attempt.isoformat(),
+                )
+                return
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Notification send failed (id=%s, client=%s): %s",

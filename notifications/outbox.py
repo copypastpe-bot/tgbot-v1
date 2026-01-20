@@ -679,7 +679,7 @@ async def apply_provider_status_update(
             msg_text = row.get("message_text")
             if msg_text:
                 client_row = await conn.fetchrow(
-                    "SELECT phone, COALESCE(full_name, name, 'Клиент') AS name FROM clients WHERE id=$1",
+                    "SELECT phone, COALESCE(full_name, 'Клиент') AS name FROM clients WHERE id=$1",
                     row["client_id"],
                 )
                 if client_row and client_row["phone"]:

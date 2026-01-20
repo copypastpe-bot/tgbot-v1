@@ -21,6 +21,7 @@ from .wahelp_service import (
 )
 from .wahelp_dispatcher import (
     ClientContact,
+    DailySendLimitReached,
     SendResult,
     cancel_followup_for_client,
     schedule_followup_for_client,
@@ -42,6 +43,7 @@ __all__ = [
     "send_text_message",
     "send_text_to_phone",
     "ClientContact",
+    "DailySendLimitReached",
     "SendResult",
     "send_via_channel",
     "send_with_rules",

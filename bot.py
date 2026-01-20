@@ -131,6 +131,7 @@ from notifications import (
 from crm import (
     ChannelKind,
     ClientContact,
+    DailySendLimitReached,
     WahelpAPIError,
     send_via_channel,
     send_with_rules,
@@ -725,6 +726,9 @@ async def _send_lead_auto_reply(
         result = await send_with_rules(conn, contact, text=text)
         payload = result.response if isinstance(result.response, Mapping) else None
         wahelp_message_id = _extract_wahelp_message_id(payload)
+    except DailySendLimitReached as exc:
+        status = "failed"
+        logger.warning("Daily limit reached for lead auto-reply %s: %s", lead_row["id"], exc)
     except Exception as exc:  # noqa: BLE001
         status = "failed"
         logger.warning("Failed to send %s auto-reply to lead %s: %s", response_kind, lead_row["id"], exc)
@@ -852,6 +856,9 @@ async def _send_leads_campaign_batch() -> None:
                     current_campaign,
                     variant,
                 )
+            except DailySendLimitReached as exc:
+                logger.warning("Daily limit reached during leads promo: %s", exc)
+                break
             except WahelpAPIError as exc:
                 error_text = str(exc)
                 if "Too Many Requests" in error_text or "Слишком много попыток" in error_text:
@@ -3537,6 +3544,7 @@ async def retry_pending_sent_messages() -> None:
                     FROM notification_messages
                     WHERE status = 'sent'
                       AND retry_attempted = false
+                      AND outbox_id IS NOT NULL
                       AND sent_at >= $1
                       AND sent_at < $2
                       AND channel IN ('clients_wa','clients_tg')
@@ -3594,9 +3602,18 @@ async def retry_pending_sent_messages() -> None:
                         await conn.execute(
                             """
                             INSERT INTO notification_messages (
-                                client_id, event_key, channel, message_text, wahelp_message_id, status, sent_at, created_at, updated_at
+                                client_id,
+                                event_key,
+                                channel,
+                                message_text,
+                                wahelp_message_id,
+                                status,
+                                sent_at,
+                                created_at,
+                                updated_at,
+                                retry_attempted
                             )
-                            VALUES ($1,$2,$3,$4,$5,'sent',NOW(),NOW(),NOW())
+                            VALUES ($1,$2,$3,$4,$5,'sent',NOW(),NOW(),NOW(),true)
                             """,
                             row["client_id"],
                             row["event_key"],
@@ -3604,11 +3621,14 @@ async def retry_pending_sent_messages() -> None:
                             row["message_text"],
                             provider_message_id,
                         )
+                    except DailySendLimitReached as exc:
+                        logging.warning("Daily limit reached during retry: %s", exc)
+                        break
                     except WahelpAPIError as exc:
                         logging.warning("Retry send failed for client %s via %s: %s", row["client_id"], target_channel, exc)
                     except Exception as exc:  # noqa: BLE001
                         logging.warning("Retry send unexpected error for client %s: %s", row["client_id"], exc)
-                await asyncio.sleep(random.uniform(5, 15))
+                await asyncio.sleep(random.uniform(60, 3600))
         except Exception as exc:  # noqa: BLE001
             logging.exception("retry_pending_sent_messages failed: %s", exc)
         await asyncio.sleep(poll_interval)
