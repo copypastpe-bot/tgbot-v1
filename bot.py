@@ -3527,6 +3527,9 @@ async def retry_pending_sent_messages() -> None:
     while True:
         try:
             cutoff = datetime.now(timezone.utc) - retry_delay
+            today_local = datetime.now(MOSCOW_TZ).date()
+            today_start_local = datetime.combine(today_local, time.min, tzinfo=MOSCOW_TZ)
+            today_start_utc = today_start_local.astimezone(timezone.utc)
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
@@ -3534,11 +3537,13 @@ async def retry_pending_sent_messages() -> None:
                     FROM notification_messages
                     WHERE status = 'sent'
                       AND retry_attempted = false
-                      AND sent_at < $1
+                      AND sent_at >= $1
+                      AND sent_at < $2
                       AND channel IN ('clients_wa','clients_tg')
                     ORDER BY sent_at
-                    LIMIT 50
+                    LIMIT 20
                     """,
+                    today_start_utc,
                     cutoff,
                 )
             if not rows:
@@ -3603,6 +3608,7 @@ async def retry_pending_sent_messages() -> None:
                         logging.warning("Retry send failed for client %s via %s: %s", row["client_id"], target_channel, exc)
                     except Exception as exc:  # noqa: BLE001
                         logging.warning("Retry send unexpected error for client %s: %s", row["client_id"], exc)
+                await asyncio.sleep(random.uniform(5, 15))
         except Exception as exc:  # noqa: BLE001
             logging.exception("retry_pending_sent_messages failed: %s", exc)
         await asyncio.sleep(poll_interval)
