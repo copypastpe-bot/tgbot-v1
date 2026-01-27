@@ -124,10 +124,21 @@ class WahelpAuthManager:
             return token
 
     def _extract_token(self, data: Any, *, default_expires: int) -> str:
-        access = data.get("data", {}).get("access_token") if isinstance(data, Mapping) else None
+        if not isinstance(data, Mapping):
+            raise WahelpAPIError(0, "missing access_token", data)
+        data_section = data.get("data") or {}
+        token_container = data_section.get("token") if isinstance(data_section, Mapping) else None
+        access = None
+        expires_in = default_expires
+        if isinstance(token_container, Mapping):
+            access = token_container.get("token")
+            expires_in = token_container.get("expires_in", default_expires)
+        if not access:
+            access = data_section.get("access_token") if isinstance(data_section, Mapping) else None
         if not access:
             raise WahelpAPIError(0, "missing access_token", data)
-        expires_in = data.get("data", {}).get("expires_in", default_expires) if isinstance(data, Mapping) else default_expires
+        if isinstance(data_section, Mapping) and "expires_in" in data_section:
+            expires_in = data_section.get("expires_in", expires_in)
         now = asyncio.get_running_loop().time()
         self._token = access
         self._expires_at = now + max(self._safety_margin, expires_in)
