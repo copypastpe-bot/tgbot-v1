@@ -318,6 +318,7 @@ wire_reminder_task: asyncio.Task | None = None
 leads_promo_task: asyncio.Task | None = None
 rewash_followup_task: asyncio.Task | None = None
 rewash_counter_task: asyncio.Task | None = None
+dead_channels_cleanup_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
 
 # === Ignore group/supergroup/channel updates; work only in private chats ===
@@ -4137,6 +4138,21 @@ async def schedule_periodic_job(interval_seconds: int, job_coro, job_name: str) 
         except Exception as exc:  # noqa: BLE001
             logging.exception("Periodic job %s failed: %s", job_name, exc)
         await asyncio.sleep(interval_seconds)
+
+
+async def clear_dead_channels_weekly() -> None:
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE wahelp_delivery_issues
+            SET resolved_at = NOW()
+            WHERE entity_kind = 'client'
+              AND resolved_at IS NULL
+              AND reason ILIKE '%Мессенджер не подключен%'
+            """
+        )
 
 def withdraw_nav_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -11009,7 +11025,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
@@ -11058,6 +11074,10 @@ async def main():
         # Проверяем счетчик перемывов раз в день в 10:00
         rewash_counter_task = asyncio.create_task(
             schedule_daily_job(10, 0, check_rewash_master_counter, "rewash_counter")
+        )
+    if dead_channels_cleanup_task is None:
+        dead_channels_cleanup_task = asyncio.create_task(
+            schedule_periodic_job(7 * 24 * 3600, clear_dead_channels_weekly, "dead_channels_cleanup")
         )
     if notification_rules is not None:
         notification_worker = NotificationWorker(
