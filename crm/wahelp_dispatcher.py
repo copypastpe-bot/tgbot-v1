@@ -380,10 +380,13 @@ def _build_channel_sequence(contact: ClientContact, dead_channels: set[ChannelKi
         attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
     if preferred == WHATSAPP_CHANNEL and contact.wa_user_id and WHATSAPP_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
+    # MAX is always last in priority order, so we skip preferred MAX here.
     if contact.wa_user_id and (preferred != WHATSAPP_CHANNEL) and WHATSAPP_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
     if contact.tg_user_id and (preferred != TELEGRAM_CHANNEL) and TELEGRAM_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
+    if contact.max_user_id and MAX_CHANNEL not in dead_channels:
+        attempts.append(ChannelAttempt(channel=MAX_CHANNEL, address_kind="user_id", user_id=contact.max_user_id))
     attempts.extend(_build_client_phone_attempts(contact, dead_channels))
     return tuple(_deduplicate_attempts(attempts))
 
@@ -399,17 +402,17 @@ def _build_lead_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
 def _build_client_phone_attempts(contact: ClientContact, dead_channels: set[ChannelKind]) -> list[ChannelAttempt]:
     """
     Строит последовательность попыток отправки по телефону.
-    Приоритет: WA -> TG (MAX отключён)
+    Приоритет: WA -> TG -> MAX
     """
     order: Sequence[ChannelKind]
     preferred = contact.preferred_channel
     if preferred == TELEGRAM_CHANNEL:
-        order = (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL)
+        order = (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL, MAX_CHANNEL)
     elif preferred == WHATSAPP_CHANNEL:
-        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
+        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL, MAX_CHANNEL)
     else:
-        # По умолчанию: WA -> TG
-        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL)
+        # По умолчанию: WA -> TG -> MAX
+        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL, MAX_CHANNEL)
     return [
         ChannelAttempt(channel=chan, address_kind="phone")
         for chan in order
@@ -573,10 +576,12 @@ async def _handle_messenger_missing(
 ) -> None:
     if contact.recipient_kind != "client":
         return
-    # Выбираем следующий канал по приоритету: WA -> TG
+    # Выбираем следующий канал по приоритету: WA -> TG -> MAX
     if failed_channel == WHATSAPP_CHANNEL:
         fallback = TELEGRAM_CHANNEL
     elif failed_channel == TELEGRAM_CHANNEL:
+        fallback = MAX_CHANNEL
+    elif failed_channel == MAX_CHANNEL:
         fallback = WHATSAPP_CHANNEL
     else:
         return

@@ -3540,14 +3540,20 @@ async def retry_pending_sent_messages() -> None:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT id, client_id, channel, message_text, event_key
+                    SELECT id, outbox_id, client_id, channel, message_text, event_key, sent_at
                     FROM notification_messages
                     WHERE status = 'sent'
                       AND retry_attempted = false
                       AND outbox_id IS NOT NULL
                       AND sent_at >= $1
                       AND sent_at < $2
-                      AND channel IN ('clients_wa','clients_tg')
+                      AND channel IN ('clients_wa','clients_tg','clients_max')
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM notification_messages nm2
+                          WHERE nm2.outbox_id = notification_messages.outbox_id
+                            AND nm2.status IN ('delivered','read')
+                      )
                     ORDER BY sent_at
                     LIMIT 20
                     """,
@@ -3574,8 +3580,20 @@ async def retry_pending_sent_messages() -> None:
                     )
                 if not client or not client["phone"] or client["wahelp_requires_connection"]:
                     continue
-                channel = row["channel"]
-                target_channel = "clients_tg" if channel == "clients_wa" else "clients_wa"
+                channel_order = ["clients_wa", "clients_tg", "clients_max"]
+                async with pool.acquire() as conn:
+                    attempted_rows = await conn.fetch(
+                        """
+                        SELECT DISTINCT channel
+                        FROM notification_messages
+                        WHERE outbox_id = $1
+                        """,
+                        row["outbox_id"],
+                    )
+                attempted = {r["channel"] for r in attempted_rows if r.get("channel")}
+                target_channel = next((ch for ch in channel_order if ch not in attempted), None)
+                if not target_channel:
+                    continue
                 contact = ClientContact(
                     client_id=client["id"],
                     phone=client["phone"],
@@ -3583,6 +3601,7 @@ async def retry_pending_sent_messages() -> None:
                     preferred_channel=client["wahelp_preferred_channel"],
                     wa_user_id=client["wahelp_user_id_wa"],
                     tg_user_id=client["wahelp_user_id_tg"],
+                    max_user_id=client["wahelp_user_id_max"],
                     recipient_kind="client",
                     requires_connection=bool(client["wahelp_requires_connection"]),
                 )
@@ -3602,6 +3621,7 @@ async def retry_pending_sent_messages() -> None:
                         await conn.execute(
                             """
                             INSERT INTO notification_messages (
+                                outbox_id,
                                 client_id,
                                 event_key,
                                 channel,
@@ -3613,8 +3633,9 @@ async def retry_pending_sent_messages() -> None:
                                 updated_at,
                                 retry_attempted
                             )
-                            VALUES ($1,$2,$3,$4,$5,'sent',NOW(),NOW(),NOW(),true)
+                            VALUES ($1,$2,$3,$4,$5,$6,'sent',NOW(),NOW(),NOW(),false)
                             """,
+                            row["outbox_id"],
                             row["client_id"],
                             row["event_key"],
                             target_channel,
