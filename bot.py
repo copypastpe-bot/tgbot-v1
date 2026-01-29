@@ -5971,46 +5971,61 @@ async def build_cash_report_text_for_period(start_utc: datetime, end_utc: dateti
             start_utc,
             end_utc,
         )
-        detail_rows = await conn.fetch(
+        pay_rows = await conn.fetch(
             f"""
-            SELECT (c.happened_at AT TIME ZONE 'Europe/Moscow')::date AS day,
-                   COALESCE(SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END),0)::numeric(12,2) AS income,
-                   COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_withdrawal_filter_sql("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
+            SELECT COALESCE(c.method,'прочее') AS method,
+                   COALESCE(SUM(c.amount),0)::numeric(12,2) AS total
             FROM cashbook_entries c
             WHERE c.happened_at >= $1
               AND c.happened_at < $2
+              AND c.kind = 'income'
               AND {_cashbook_active_filter("c")}
-            GROUP BY day
-            ORDER BY day
-            LIMIT 120
-            """,
-            start_utc,
-            end_utc,
-        )
-        pay_rows = await conn.fetch(
-            """
-            SELECT COALESCE(op.method,'прочее') AS method,
-                   COALESCE(SUM(op.amount),0)::numeric(12,2) AS total
-            FROM order_payments op
-            JOIN orders o ON o.id = op.order_id
-            WHERE o.created_at >= $1
-              AND o.created_at < $2
             GROUP BY method
             ORDER BY total DESC
             """,
             start_utc,
             end_utc,
         )
-        pending_wire = await conn.fetchval(
+        pending_wire_entries = await conn.fetch(
             """
-            SELECT COALESCE(SUM(amount),0)
+            SELECT id,
+                   amount,
+                   method,
+                   comment,
+                   happened_at
             FROM cashbook_entries
-            WHERE kind='income'
-              AND awaiting_order
+            WHERE happened_at >= $1
+              AND happened_at < $2
+              AND kind = 'income'
+              AND method = 'р/с'
               AND order_id IS NULL
+              AND awaiting_order
               AND NOT COALESCE(is_deleted,false)
+            ORDER BY happened_at
+            """,
+            start_utc,
+            end_utc,
+        )
+        pending_orders = await conn.fetch(
             """
-        ) or Decimal(0)
+            SELECT o.id,
+                   o.client_id,
+                   o.amount_total,
+                   o.created_at,
+                   o.awaiting_wire_payment,
+                   COALESCE(c.full_name,'') AS client_name,
+                   COALESCE(c.phone,'') AS phone,
+                   COALESCE(c.address,'') AS address
+            FROM orders o
+            LEFT JOIN clients c ON c.id = o.client_id
+            WHERE o.awaiting_wire_payment
+              AND o.created_at >= $1
+              AND o.created_at < $2
+            ORDER BY o.created_at
+            """,
+            start_utc,
+            end_utc,
+        )
         balance = await get_cash_balance_excluding_withdrawals(conn)
 
     income = Decimal(totals["income"] or 0)
@@ -6024,26 +6039,30 @@ async def build_cash_report_text_for_period(start_utc: datetime, end_utc: dateti
         f"= Дельта: {_bold_html(f'{format_money(delta)}₽')}",
         f"💰 Остаток: {_bold_html(f'{format_money(balance)}₽')}",
     ]
-    if pending_wire:
-        lines.insert(2, f"💤 Не привязано к заказам: {_bold_html(f'{format_money(Decimal(pending_wire))}₽')}")
     if pay_rows:
         method_totals = {row["method"] or "прочее": Decimal(row["total"] or 0) for row in pay_rows}
         lines.append("")
         lines.append("💳 Типы оплат:")
         lines.append(_format_payment_summary(method_totals, multiline=True, html_mode=True))
-    if detail_rows:
-        lines.append("")
-        lines.append("📅 Детализация по дням:")
-        for row in detail_rows:
-            day = row["day"]
-            try:
-                label_day = day.strftime("%d.%m.%Y")
-            except Exception:
-                label_day = str(day)
-            inc = format_money(Decimal(row["income"] or 0))
-            exp = format_money(Decimal(row["expense"] or 0))
-            dlt = format_money(Decimal((row["income"] or 0) - (row["expense"] or 0)))
-            lines.append(f"{label_day}: +{inc} / -{exp} = {dlt}₽")
+    lines.append("")
+    lines.append("Оплаты ожидающие заказа:")
+    if pending_wire_entries:
+        for row in pending_wire_entries:
+            when_local = row["happened_at"].astimezone(MOSCOW_TZ)
+            amount = format_money(Decimal(row["amount"] or 0))
+            method = row["method"] or "прочее"
+            comment = (row["comment"] or "").strip()
+            comment_part = f" — {comment}" if comment else ""
+            lines.append(f"#{row['id']}: {amount}₽ — {method} — {when_local:%d.%m %H:%M}{comment_part}")
+    else:
+        lines.append("—")
+    lines.append("")
+    lines.append("Заказы ожидающие оплаты:")
+    if pending_orders:
+        for row in pending_orders:
+            lines.append(_format_wire_order_line(row))
+    else:
+        lines.append("—")
     return "\n".join(lines)
 
 
@@ -6062,22 +6081,6 @@ async def build_profit_report_text_for_period(start_utc: datetime, end_utc: date
             start_utc,
             end_utc,
         )
-        rows = await conn.fetch(
-            f"""
-            SELECT (c.happened_at AT TIME ZONE 'Europe/Moscow')::date AS day,
-                   COALESCE(SUM(CASE WHEN c.kind='income' THEN c.amount ELSE 0 END),0)::numeric(12,2) AS income,
-                   COALESCE(SUM(CASE WHEN c.kind='expense' AND NOT ({_non_profit_expense_filter("c")}) THEN c.amount ELSE 0 END),0)::numeric(12,2) AS expense
-            FROM cashbook_entries c
-            WHERE c.happened_at >= $1
-              AND c.happened_at < $2
-              AND {_cashbook_active_filter("c")}
-            GROUP BY day
-            ORDER BY day
-            LIMIT 120
-            """,
-            start_utc,
-            end_utc,
-        )
     income = Decimal(totals["income"] or 0)
     expense = Decimal(totals["expense"] or 0)
     profit = income - expense
@@ -6088,19 +6091,6 @@ async def build_profit_report_text_for_period(start_utc: datetime, end_utc: date
         f"Расходы: {_bold_html(f'{format_money(expense)}₽')}",
         f"Прибыль: {_bold_html(f'{_format_money_signed(profit)}₽')}",
     ]
-    if rows:
-        lines.append("")
-        lines.append("Детализация по дням:")
-        for row in rows:
-            day = row["day"]
-            try:
-                label_day = day.strftime("%d.%m.%Y")
-            except Exception:
-                label_day = str(day)
-            inc = format_money(Decimal(row["income"] or 0))
-            exp = format_money(Decimal(row["expense"] or 0))
-            delta = _format_money_signed(Decimal(row["income"] or 0) - Decimal(row["expense"] or 0))
-            lines.append(f"{label_day}: +{inc} / -{exp} = {delta}₽")
     return "\n".join(lines)
 
 
