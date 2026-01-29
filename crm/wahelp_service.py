@@ -43,11 +43,14 @@ _base_url = os.getenv("WAHELP_API_BASE", DEFAULT_BASE_URL)
 _login = os.getenv("WAHELP_LOGIN")
 _password = os.getenv("WAHELP_PASSWORD")
 _static_token = os.getenv("WAHELP_ACCESS_TOKEN")
+_auth_mode = "static" if _static_token else "login"
 if not _static_token:
     if _login and _password:
         _static_token = None
     else:
         _static_token = os.getenv("WAHELP_CLIENTS_TOKEN")
+    if _static_token:
+        _auth_mode = "static"
 elif _login and _password:
     logger.info("Using WAHELP_ACCESS_TOKEN explicitly despite login/password")
 
@@ -72,6 +75,7 @@ def get_wahelp_client() -> WahelpClient:
             # preload token if provided explicitly (bypasses login/refresh until expiry)
             _auth_manager._token = _static_token  # type: ignore[attr-defined]
             _auth_manager._expires_at = 10**12  # distant future
+        logger.info("Wahelp auth mode: %s", _auth_mode)
         _client = WahelpClient(auth_manager=_auth_manager)
     return _client
 

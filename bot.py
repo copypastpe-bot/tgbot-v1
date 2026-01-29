@@ -3615,6 +3615,12 @@ async def retry_pending_sent_messages() -> None:
                             text=row["message_text"],
                             event_key=row["event_key"],
                         )
+                        logging.info(
+                            "Retry send OK client=%s outbox=%s via=%s",
+                            row["client_id"],
+                            row["outbox_id"],
+                            target_channel,
+                        )
                         provider_payload = (
                             result.response if isinstance(result.response, Mapping) else None
                         )
@@ -3647,9 +3653,20 @@ async def retry_pending_sent_messages() -> None:
                         logging.warning("Daily limit reached during retry: %s", exc)
                         break
                     except WahelpAPIError as exc:
-                        logging.warning("Retry send failed for client %s via %s: %s", row["client_id"], target_channel, exc)
+                        logging.warning(
+                            "Retry send failed client=%s outbox=%s via=%s: %s",
+                            row["client_id"],
+                            row["outbox_id"],
+                            target_channel,
+                            exc,
+                        )
                     except Exception as exc:  # noqa: BLE001
-                        logging.warning("Retry send unexpected error for client %s: %s", row["client_id"], exc)
+                        logging.warning(
+                            "Retry send unexpected error client=%s outbox=%s: %s",
+                            row["client_id"],
+                            row["outbox_id"],
+                            exc,
+                        )
                 await asyncio.sleep(random.uniform(60, 3600))
         except Exception as exc:  # noqa: BLE001
             logging.exception("retry_pending_sent_messages failed: %s", exc)
