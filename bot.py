@@ -548,6 +548,74 @@ async def ensure_jenya_card_schema(conn: asyncpg.Connection) -> None:
             JENYA_CARD_INITIAL_BALANCE,
         )
 
+
+async def ensure_client_channels_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_channels (
+            id bigserial PRIMARY KEY,
+            client_id integer NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+            phone text,
+            channel text NOT NULL,
+            wahelp_user_id bigint,
+            status text NOT NULL DEFAULT 'empty',
+            priority_set_at timestamptz,
+            dead_set_at timestamptz,
+            unavailable_set_at timestamptz,
+            last_attempt_at timestamptz,
+            last_success_at timestamptz,
+            last_error_at timestamptz,
+            last_error_code text,
+            created_at timestamptz NOT NULL DEFAULT NOW(),
+            updated_at timestamptz NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_client_channels_client_channel
+        ON client_channels(client_id, channel);
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_client_channels_status
+        ON client_channels(status);
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_client_channels_channel
+        ON client_channels(channel);
+        """
+    )
+
+    # Backfill rows for existing clients (wa, tg, max)
+    await conn.execute(
+        """
+        INSERT INTO client_channels (client_id, phone, channel, wahelp_user_id, status)
+        SELECT c.id, c.phone, 'wa', c.wahelp_user_id_wa, 'empty'
+        FROM clients c
+        ON CONFLICT (client_id, channel) DO NOTHING;
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO client_channels (client_id, phone, channel, wahelp_user_id, status)
+        SELECT c.id, c.phone, 'tg', c.wahelp_user_id_tg, 'empty'
+        FROM clients c
+        ON CONFLICT (client_id, channel) DO NOTHING;
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO client_channels (client_id, phone, channel, wahelp_user_id, status)
+        SELECT c.id, c.phone, 'max', c.wahelp_user_id_max, 'empty'
+        FROM clients c
+        ON CONFLICT (client_id, channel) DO NOTHING;
+        """
+    )
+
 LEADS_PROMO_CAMPAIGNS: dict[str, list[str]] = {
     "week1": [
         "🚀 Ракета Клин\nДарим вам 300 бонусов на следующие 30 дней. Можно использовать на уборку или химчистку мебели и матрасов.\n🌐 raketaclean.ru  📞 +7 904 043 75 23\nОтветьте 1 и мы вам перезвоним. Для отписки — STOP",
@@ -3568,6 +3636,28 @@ async def retry_pending_sent_messages() -> None:
                 continue
             for row in rows:
                 async with pool.acquire() as conn:
+                    # mark current channel as unavailable after long sent
+                    channel_key = None
+                    if row["channel"] == "clients_wa":
+                        channel_key = "wa"
+                    elif row["channel"] == "clients_tg":
+                        channel_key = "tg"
+                    elif row["channel"] == "clients_max":
+                        channel_key = "max"
+                    if channel_key:
+                        await conn.execute(
+                            """
+                            UPDATE client_channels
+                            SET status = 'unavailable',
+                                unavailable_set_at = NOW(),
+                                last_error_at = NOW(),
+                                last_error_code = 'sent_timeout',
+                                updated_at = NOW()
+                            WHERE client_id = $1 AND channel = $2
+                            """,
+                            row["client_id"],
+                            channel_key,
+                        )
                     await conn.execute(
                         "UPDATE notification_messages SET retry_attempted = true, updated_at = NOW() WHERE id = $1",
                         row["id"],
@@ -3583,20 +3673,6 @@ async def retry_pending_sent_messages() -> None:
                     )
                 if not client or not client["phone"] or client["wahelp_requires_connection"]:
                     continue
-                channel_order = ["clients_wa", "clients_tg", "clients_max"]
-                async with pool.acquire() as conn:
-                    attempted_rows = await conn.fetch(
-                        """
-                        SELECT DISTINCT channel
-                        FROM notification_messages
-                        WHERE outbox_id = $1
-                        """,
-                        row["outbox_id"],
-                    )
-                attempted = {r["channel"] for r in attempted_rows if r.get("channel")}
-                target_channel = next((ch for ch in channel_order if ch not in attempted), None)
-                if not target_channel:
-                    continue
                 contact = ClientContact(
                     client_id=client["id"],
                     phone=client["phone"],
@@ -3610,10 +3686,9 @@ async def retry_pending_sent_messages() -> None:
                 )
                 async with pool.acquire() as conn:
                     try:
-                        result = await send_via_channel(
+                        result = await send_with_rules(
                             conn,
                             contact,
-                            target_channel,
                             text=row["message_text"],
                             event_key=row["event_key"],
                         )
@@ -3621,7 +3696,7 @@ async def retry_pending_sent_messages() -> None:
                             "Retry send OK client=%s outbox=%s via=%s",
                             row["client_id"],
                             row["outbox_id"],
-                            target_channel,
+                            result.channel,
                         )
                         provider_payload = (
                             result.response if isinstance(result.response, Mapping) else None
@@ -3647,7 +3722,7 @@ async def retry_pending_sent_messages() -> None:
                             row["outbox_id"],
                             row["client_id"],
                             row["event_key"],
-                            target_channel,
+                            result.channel,
                             row["message_text"],
                             provider_message_id,
                         )
@@ -4165,11 +4240,24 @@ async def clear_dead_channels_weekly() -> None:
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            UPDATE wahelp_delivery_issues
-            SET resolved_at = NOW()
-            WHERE entity_kind = 'client'
-              AND resolved_at IS NULL
-              AND reason ILIKE '%Мессенджер не подключен%'
+            UPDATE client_channels
+            SET status = 'empty',
+                dead_set_at = NULL,
+                updated_at = NOW()
+            WHERE status = 'dead'
+              AND dead_set_at IS NOT NULL
+              AND dead_set_at < NOW() - INTERVAL '30 days'
+            """
+        )
+        await conn.execute(
+            """
+            UPDATE client_channels
+            SET status = 'empty',
+                unavailable_set_at = NULL,
+                updated_at = NOW()
+            WHERE status = 'unavailable'
+              AND unavailable_set_at IS NOT NULL
+              AND unavailable_set_at < NOW() - INTERVAL '7 days'
             """
         )
 
@@ -11461,6 +11549,7 @@ async def main():
         await ensure_orders_rating_schema(_conn)
         await ensure_order_payments_schema(_conn)
         await ensure_jenya_card_schema(_conn)
+        await ensure_client_channels_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(

@@ -529,6 +529,16 @@ def _status_priority(value: str | None) -> int:
     return STATUS_PRIORITY.get(value, 0)
 
 
+def _map_channel_to_key(channel: str | None) -> str | None:
+    if channel == "clients_wa":
+        return "wa"
+    if channel == "clients_tg":
+        return "tg"
+    if channel == "clients_max":
+        return "max"
+    return None
+
+
 async def apply_provider_status_update(
     pool: asyncpg.Pool,
     payload: Mapping[str, Any] | Sequence[Mapping[str, Any]],
@@ -672,6 +682,45 @@ async def apply_provider_status_update(
         params.append(row["id"])
         sql = "UPDATE notification_messages SET " + ", ".join(updates) + " WHERE id = ${}".format(param_idx)
         await conn.execute(sql, *params)
+
+        if normalized_status in {"delivered", "read"} and row["client_id"]:
+            channel_key = _map_channel_to_key(row["channel"])
+            if channel_key:
+                existing_priority = await conn.fetchval(
+                    """
+                    SELECT channel
+                    FROM client_channels
+                    WHERE client_id = $1 AND status = 'priority'
+                    LIMIT 1
+                    """,
+                    row["client_id"],
+                )
+                if not existing_priority or existing_priority == channel_key:
+                    await conn.execute(
+                        """
+                        UPDATE client_channels
+                        SET status = 'priority',
+                            priority_set_at = NOW(),
+                            last_success_at = NOW(),
+                            unavailable_set_at = NULL,
+                            updated_at = NOW()
+                        WHERE client_id = $1 AND channel = $2
+                        """,
+                        row["client_id"],
+                        channel_key,
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        UPDATE client_channels
+                        SET status = CASE WHEN status = 'dead' THEN status ELSE 'empty' END,
+                            last_success_at = NOW(),
+                            updated_at = NOW()
+                        WHERE client_id = $1 AND channel = $2
+                        """,
+                        row["client_id"],
+                        channel_key,
+                    )
 
         if normalized_status == "read" and row["channel"] == "clients_tg" and cancel_followup:
             cancel_followup(row["client_id"])

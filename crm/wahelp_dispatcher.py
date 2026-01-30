@@ -16,7 +16,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
-from typing import Awaitable, Callable, Literal, Mapping, Sequence
+from typing import Awaitable, Callable, Literal, Mapping, Sequence, Any
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -32,6 +32,12 @@ TELEGRAM_CHANNEL: ChannelKind = "clients_tg"
 WHATSAPP_CHANNEL: ChannelKind = "clients_wa"
 MAX_CHANNEL: ChannelKind = "clients_max"
 LEADS_CHANNEL: ChannelKind = "leads"
+CHANNEL_ORDER: list[ChannelKind] = [WHATSAPP_CHANNEL, TELEGRAM_CHANNEL, MAX_CHANNEL]
+CHANNEL_TO_KEY: dict[ChannelKind, str] = {
+    WHATSAPP_CHANNEL: "wa",
+    TELEGRAM_CHANNEL: "tg",
+    MAX_CHANNEL: "max",
+}
 
 FOLLOWUP_DELAY_SECONDS = 24 * 60 * 60  # 24h
 WA_FOLLOWUP_DISABLED = os.getenv("WA_FOLLOWUP_DISABLED", "").lower() in {"1", "true", "yes", "on"}
@@ -287,9 +293,12 @@ async def send_with_rules(
     
     # Клиентский бот временно отключён для исходящих сервисных сообщений.
 
-    # Продолжаем со старой логикой через Wahelp
-    dead_channels = await _get_dead_channels(conn, contact)
-    attempts = _build_channel_sequence(contact, dead_channels)
+    # Новая логика через client_channels
+    if contact.recipient_kind == "client":
+        attempts = await _build_channel_sequence_v2(conn, contact)
+    else:
+        dead_channels = await _get_dead_channels(conn, contact)
+        attempts = _build_channel_sequence(contact, dead_channels)
     last_error: Exception | None = None
     last_channel: ChannelKind | None = None
     failed_channels: list[ChannelKind] = []
@@ -297,6 +306,8 @@ async def send_with_rules(
         channel = attempt.channel
         last_channel = channel
         try:
+            if contact.recipient_kind == "client":
+                await _touch_channel_attempt(conn, contact.client_id, channel)
             send_text = _with_wa_fallback(text, channel, event_key)
             if attempt.address_kind == "user_id" and attempt.user_id is not None:
                 response = await send_text_message(channel, user_id=attempt.user_id, text=send_text)
@@ -305,7 +316,6 @@ async def send_with_rules(
                 await _persist_user_id(conn, contact, channel, user_id)
                 response = await send_text_message(channel, user_id=user_id, text=send_text)
             if contact.recipient_kind == "client":
-                await _set_preferred_channel(conn, contact.client_id, channel)
                 _cancel_followup(contact.client_id)
                 await _resolve_dead_channel(conn, contact.client_id, channel)
             logger.info("Message sent via %s to client %s", channel, contact.client_id)
@@ -316,6 +326,10 @@ async def send_with_rules(
                 await _mark_channel_dead(conn, contact, channel, str(exc))
             elif _is_rate_limit_error(exc):
                 logger.warning("Rate limit for %s %s: %s", contact.recipient_kind, contact.client_id, exc)
+                if contact.recipient_kind == "client":
+                    await _touch_channel_error(conn, contact.client_id, channel, str(exc))
+            elif contact.recipient_kind == "client":
+                await _touch_channel_error(conn, contact.client_id, channel, str(exc))
             failed_channels.append(channel)
             logger.warning("Send via %s failed for %s %s: %s", channel, contact.recipient_kind, contact.client_id, exc)
             last_error = exc
@@ -339,9 +353,14 @@ async def send_via_channel(
     if contact.requires_connection:
         raise WahelpAPIError(0, "Contact requires Wahelp connection", None)
     await _enforce_daily_limit(conn)
-    dead_channels = await _get_dead_channels(conn, contact)
-    if channel in dead_channels:
-        raise WahelpAPIError(0, f"Channel {channel} is marked as dead", None)
+    if contact.recipient_kind == "client":
+        if await _is_channel_dead(conn, contact.client_id, channel):
+            raise WahelpAPIError(0, f"Channel {channel} is marked as dead", None)
+        await _touch_channel_attempt(conn, contact.client_id, channel)
+    else:
+        dead_channels = await _get_dead_channels(conn, contact)
+        if channel in dead_channels:
+            raise WahelpAPIError(0, f"Channel {channel} is marked as dead", None)
     send_text = _with_wa_fallback(text, channel, event_key)
     try:
         user_id = None
@@ -358,7 +377,6 @@ async def send_via_channel(
             await _persist_user_id(conn, contact, channel, user_id)
             response = await send_text_message(channel, user_id=user_id, text=send_text)
         if contact.recipient_kind == "client":
-            await _set_preferred_channel(conn, contact.client_id, channel)
             _cancel_followup(contact.client_id)
             await _resolve_dead_channel(conn, contact.client_id, channel)
         return SendResult(channel=channel, response=response if isinstance(response, Mapping) else None)
@@ -368,6 +386,10 @@ async def send_via_channel(
             await _mark_channel_dead(conn, contact, channel, str(exc))
         elif _is_rate_limit_error(exc):
             logger.warning("Rate limit for %s %s: %s", contact.recipient_kind, contact.client_id, exc)
+            if contact.recipient_kind == "client":
+                await _touch_channel_error(conn, contact.client_id, channel, str(exc))
+        elif contact.recipient_kind == "client":
+            await _touch_channel_error(conn, contact.client_id, channel, str(exc))
         raise
 
 
@@ -493,6 +515,8 @@ def _is_not_connected_error(error: WahelpAPIError) -> bool:
     lowered = text.lower()
     return (
         "мессенджер не подключен" in text
+        or "номер не подключен" in lowered
+        or "номер не зарегистрирован" in lowered
         or ("messenger" in lowered and "not connected" in lowered)
     )
 
@@ -514,21 +538,288 @@ def _with_wa_fallback(text: str, channel: ChannelKind, event_key: str | None) ->
     return f"{text}\n\nПроблемы с whatsapp? Подпишитесь на наш телеграм"
 
 
+async def _fetch_client_channel_rows(
+    conn: asyncpg.Connection,
+    client_id: int,
+    phone: str,
+) -> dict[ChannelKind, Mapping[str, Any]]:
+    rows = await conn.fetch(
+        """
+        SELECT channel, wahelp_user_id, status, priority_set_at, dead_set_at, unavailable_set_at
+        FROM client_channels
+        WHERE client_id = $1
+        """,
+        client_id,
+    )
+    result: dict[ChannelKind, Mapping[str, Any]] = {}
+    for row in rows:
+        channel_key = row["channel"]
+        if channel_key == "wa":
+            result[WHATSAPP_CHANNEL] = row
+        elif channel_key == "tg":
+            result[TELEGRAM_CHANNEL] = row
+        elif channel_key == "max":
+            result[MAX_CHANNEL] = row
+    # Ensure missing channels exist
+    missing: list[tuple[str, ChannelKind]] = []
+    for channel_kind, key in CHANNEL_TO_KEY.items():
+        if channel_kind not in result:
+            missing.append((key, channel_kind))
+    for key, channel_kind in missing:
+        await conn.execute(
+            """
+            INSERT INTO client_channels (client_id, phone, channel, status)
+            VALUES ($1, $2, $3, 'empty')
+            ON CONFLICT (client_id, channel) DO NOTHING
+            """,
+            client_id,
+            phone,
+            key,
+        )
+    if missing:
+        rows = await conn.fetch(
+            """
+            SELECT channel, wahelp_user_id, status, priority_set_at, dead_set_at, unavailable_set_at
+            FROM client_channels
+            WHERE client_id = $1
+            """,
+            client_id,
+        )
+        result.clear()
+        for row in rows:
+            channel_key = row["channel"]
+            if channel_key == "wa":
+                result[WHATSAPP_CHANNEL] = row
+            elif channel_key == "tg":
+                result[TELEGRAM_CHANNEL] = row
+            elif channel_key == "max":
+                result[MAX_CHANNEL] = row
+    return result
+
+
+def _pick_priority_channel(rows: dict[ChannelKind, Mapping[str, Any]]) -> ChannelKind | None:
+    candidates: list[tuple[datetime | None, ChannelKind]] = []
+    for channel, row in rows.items():
+        if (row.get("status") or "empty") == "priority":
+            candidates.append((row.get("priority_set_at"), channel))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return candidates[0][1]
+
+
+def _available_empty_channels(rows: dict[ChannelKind, Mapping[str, Any]]) -> list[ChannelKind]:
+    available: list[ChannelKind] = []
+    for channel in CHANNEL_ORDER:
+        row = rows.get(channel)
+        if not row:
+            available.append(channel)
+            continue
+        status = (row.get("status") or "empty").lower()
+        if status == "empty":
+            available.append(channel)
+    return available
+
+
+async def _build_channel_sequence_v2(
+    conn: asyncpg.Connection,
+    contact: ClientContact,
+) -> Sequence[ChannelAttempt]:
+    rows = await _fetch_client_channel_rows(conn, contact.client_id, contact.phone)
+    attempts: list[ChannelAttempt] = []
+    priority_channel = _pick_priority_channel(rows)
+    if priority_channel:
+        row = rows.get(priority_channel)
+        user_id = row.get("wahelp_user_id") if row else None
+        if user_id:
+            attempts.append(ChannelAttempt(channel=priority_channel, address_kind="user_id", user_id=user_id))
+        else:
+            attempts.append(ChannelAttempt(channel=priority_channel, address_kind="phone"))
+    empties = _available_empty_channels(rows)
+    for channel in empties:
+        if channel == priority_channel:
+            continue
+        row = rows.get(channel)
+        user_id = row.get("wahelp_user_id") if row else None
+        if user_id:
+            attempts.append(ChannelAttempt(channel=channel, address_kind="user_id", user_id=user_id))
+        else:
+            attempts.append(ChannelAttempt(channel=channel, address_kind="phone"))
+    return _deduplicate_attempts(attempts)
+
+
+async def _touch_channel_attempt(conn: asyncpg.Connection, client_id: int, channel: ChannelKind) -> None:
+    key = CHANNEL_TO_KEY.get(channel)
+    if not key:
+        return
+    await conn.execute(
+        """
+        UPDATE client_channels
+        SET last_attempt_at = NOW(),
+            updated_at = NOW()
+        WHERE client_id = $1 AND channel = $2
+        """,
+        client_id,
+        key,
+    )
+
+
+async def _touch_channel_error(conn: asyncpg.Connection, client_id: int, channel: ChannelKind, error_code: str) -> None:
+    key = CHANNEL_TO_KEY.get(channel)
+    if not key:
+        return
+    await conn.execute(
+        """
+        UPDATE client_channels
+        SET last_error_at = NOW(),
+            last_error_code = $3,
+            updated_at = NOW()
+        WHERE client_id = $1 AND channel = $2
+        """,
+        client_id,
+        key,
+        error_code[:120],
+    )
+
+
+async def _set_channel_status(
+    conn: asyncpg.Connection,
+    client_id: int,
+    channel: ChannelKind,
+    status: str,
+    *,
+    error_code: str | None = None,
+) -> None:
+    key = CHANNEL_TO_KEY.get(channel)
+    if not key:
+        return
+    now = datetime.now(timezone.utc)
+    if status == "priority":
+        row = await conn.fetchrow(
+            """
+            SELECT channel FROM client_channels
+            WHERE client_id = $1 AND status = 'priority'
+            LIMIT 1
+            """,
+            client_id,
+        )
+        if row and row["channel"] != key:
+            # keep existing priority, reset this to empty if not dead
+            await conn.execute(
+                """
+                UPDATE client_channels
+                SET status = CASE WHEN status = 'dead' THEN status ELSE 'empty' END,
+                    last_success_at = $3,
+                    updated_at = NOW()
+                WHERE client_id = $1 AND channel = $2
+                """,
+                client_id,
+                key,
+                now,
+            )
+            return
+        await conn.execute(
+            """
+            UPDATE client_channels
+            SET status = 'priority',
+                priority_set_at = $3,
+                last_success_at = $3,
+                unavailable_set_at = NULL,
+                updated_at = NOW()
+            WHERE client_id = $1 AND channel = $2
+            """,
+            client_id,
+            key,
+            now,
+        )
+        await _set_preferred_channel(conn, client_id, channel)
+        return
+
+    if status == "dead":
+        await conn.execute(
+            """
+            UPDATE client_channels
+            SET status = 'dead',
+                dead_set_at = $3,
+                last_error_at = $3,
+                last_error_code = COALESCE($4, last_error_code),
+                updated_at = NOW()
+            WHERE client_id = $1 AND channel = $2
+            """,
+            client_id,
+            key,
+            now,
+            error_code[:120] if error_code else None,
+        )
+        return
+
+    if status == "unavailable":
+        await conn.execute(
+            """
+            UPDATE client_channels
+            SET status = 'unavailable',
+                unavailable_set_at = $3,
+                last_error_at = $3,
+                last_error_code = COALESCE($4, last_error_code),
+                updated_at = NOW()
+            WHERE client_id = $1 AND channel = $2
+            """,
+            client_id,
+            key,
+            now,
+            error_code[:120] if error_code else None,
+        )
+        return
+
+    if status == "empty":
+        await conn.execute(
+            """
+            UPDATE client_channels
+            SET status = 'empty',
+                updated_at = NOW()
+            WHERE client_id = $1 AND channel = $2
+            """,
+            client_id,
+            key,
+        )
+
+
+async def _is_channel_dead(conn: asyncpg.Connection, client_id: int, channel: ChannelKind) -> bool:
+    key = CHANNEL_TO_KEY.get(channel)
+    if not key:
+        return False
+    status = await conn.fetchval(
+        """
+        SELECT status
+        FROM client_channels
+        WHERE client_id = $1 AND channel = $2
+        """,
+        client_id,
+        key,
+    )
+    return (status or "").lower() == "dead"
+
 async def _get_dead_channels(conn: asyncpg.Connection, contact: ClientContact) -> set[ChannelKind]:
     if contact.recipient_kind != "client":
         return set()
     rows = await conn.fetch(
         """
         SELECT channel
-        FROM wahelp_delivery_issues
-        WHERE entity_kind = 'client'
-          AND entity_id = $1
-          AND resolved_at IS NULL
-          AND reason ILIKE '%Мессенджер не подключен%'
+        FROM client_channels
+        WHERE client_id = $1
+          AND status = 'dead'
         """,
         contact.client_id,
     )
-    return {row["channel"] for row in rows if row.get("channel")}
+    result: set[ChannelKind] = set()
+    for row in rows:
+        if row["channel"] == "wa":
+            result.add(WHATSAPP_CHANNEL)
+        elif row["channel"] == "tg":
+            result.add(TELEGRAM_CHANNEL)
+        elif row["channel"] == "max":
+            result.add(MAX_CHANNEL)
+    return result
 
 
 async def _mark_channel_dead(
@@ -539,34 +830,11 @@ async def _mark_channel_dead(
 ) -> None:
     if contact.recipient_kind != "client":
         return
-    await conn.execute(
-        """
-        INSERT INTO wahelp_delivery_issues(entity_kind, entity_id, channel, phone, reason)
-        VALUES ($1,$2,$3,$4,$5)
-        ON CONFLICT (entity_kind, entity_id, COALESCE(channel,''))
-        DO UPDATE SET reason=EXCLUDED.reason, phone=EXCLUDED.phone, created_at=NOW(), resolved_at=NULL
-        """,
-        contact.recipient_kind,
-        contact.client_id,
-        channel,
-        contact.phone,
-        reason[:200],
-    )
+    await _set_channel_status(conn, contact.client_id, channel, "dead", error_code=reason)
 
 
 async def _resolve_dead_channel(conn: asyncpg.Connection, client_id: int, channel: ChannelKind) -> None:
-    await conn.execute(
-        """
-        UPDATE wahelp_delivery_issues
-        SET resolved_at = NOW()
-        WHERE entity_kind='client'
-          AND entity_id=$1
-          AND channel=$2
-          AND resolved_at IS NULL
-        """,
-        client_id,
-        channel,
-    )
+    await _set_channel_status(conn, client_id, channel, "empty")
 
 
 async def _handle_messenger_missing(
@@ -576,17 +844,8 @@ async def _handle_messenger_missing(
 ) -> None:
     if contact.recipient_kind != "client":
         return
-    # Выбираем следующий канал по приоритету: WA -> TG -> MAX
-    if failed_channel == WHATSAPP_CHANNEL:
-        fallback = TELEGRAM_CHANNEL
-    elif failed_channel == TELEGRAM_CHANNEL:
-        fallback = MAX_CHANNEL
-    elif failed_channel == MAX_CHANNEL:
-        fallback = WHATSAPP_CHANNEL
-    else:
-        return
-    await _set_preferred_channel(conn, contact.client_id, fallback)
-    contact.preferred_channel = fallback
+    # next channel is resolved in router; just mark status
+    await _set_channel_status(conn, contact.client_id, failed_channel, "dead")
 
 
 async def _ensure_user_id(
@@ -646,6 +905,19 @@ async def _persist_user_id(
         user_id,
         contact.client_id,
     )
+    channel_key = CHANNEL_TO_KEY.get(channel)
+    if channel_key:
+        await conn.execute(
+            """
+            UPDATE client_channels
+            SET wahelp_user_id = $1,
+                updated_at = NOW()
+            WHERE client_id = $2 AND channel = $3
+            """,
+            user_id,
+            contact.client_id,
+            channel_key,
+        )
     if channel == WHATSAPP_CHANNEL:
         contact.wa_user_id = user_id
     elif channel == TELEGRAM_CHANNEL:
