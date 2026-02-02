@@ -3752,6 +3752,7 @@ async def retry_pending_sent_messages() -> None:
 
 
 async def wire_pending_reminder_job() -> None:
+    return
     if pool is None:
         return
     now_utc = datetime.now(timezone.utc)
