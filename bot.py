@@ -6099,17 +6099,13 @@ async def build_cash_report_text_for_period(start_utc: datetime, end_utc: dateti
                    comment,
                    happened_at
             FROM cashbook_entries
-            WHERE happened_at >= $1
-              AND happened_at < $2
-              AND kind = 'income'
+            WHERE kind = 'income'
               AND method = 'р/с'
               AND order_id IS NULL
               AND awaiting_order
               AND NOT COALESCE(is_deleted,false)
             ORDER BY happened_at
-            """,
-            start_utc,
-            end_utc,
+            """
         )
         pending_orders = await conn.fetch(
             """
@@ -6124,12 +6120,8 @@ async def build_cash_report_text_for_period(start_utc: datetime, end_utc: dateti
             FROM orders o
             LEFT JOIN clients c ON c.id = o.client_id
             WHERE o.awaiting_wire_payment
-              AND o.created_at >= $1
-              AND o.created_at < $2
             ORDER BY o.created_at
-            """,
-            start_utc,
-            end_utc,
+            """
         )
         balance = await get_cash_balance_excluding_withdrawals(conn)
 
