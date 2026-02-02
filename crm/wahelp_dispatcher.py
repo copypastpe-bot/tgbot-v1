@@ -761,6 +761,7 @@ async def _set_channel_status(
                 unavailable_set_at = $3,
                 last_error_at = $3,
                 last_error_code = COALESCE($4, last_error_code),
+                priority_set_at = NULL,
                 updated_at = NOW()
             WHERE client_id = $1 AND channel = $2
             """,

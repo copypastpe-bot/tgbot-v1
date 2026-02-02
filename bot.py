@@ -3652,6 +3652,7 @@ async def retry_pending_sent_messages() -> None:
                                 unavailable_set_at = NOW(),
                                 last_error_at = NOW(),
                                 last_error_code = 'sent_timeout',
+                                priority_set_at = NULL,
                                 updated_at = NOW()
                             WHERE client_id = $1 AND channel = $2
                             """,
