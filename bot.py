@@ -3825,61 +3825,85 @@ async def run_birthday_jobs() -> None:
         end_local = start_local + timedelta(days=1)
         start_utc = start_local.astimezone(timezone.utc)
         end_utc = end_local.astimezone(timezone.utc)
-        promo_total = await conn.fetchval(
+        event_keys = list(BDAY_TEMPLATE_KEYS) + [
+            "promo_reengage_first",
+            "promo_reengage_second",
+        ]
+        selected_clients = await conn.fetchval(
             """
-            SELECT COUNT(DISTINCT client_id)
-            FROM notification_outbox
-            WHERE event_key = ANY($1::text[])
-              AND status = 'sent'
-              AND sent_at >= $2
-              AND sent_at < $3
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT client_id
+                FROM notification_outbox
+                WHERE event_key = ANY($1::text[])
+                  AND status = 'sent'
+                  AND sent_at >= $2
+                  AND sent_at < $3
+            ) t
             """,
-            ["promo_reengage_first", "promo_reengage_second"],
+            event_keys,
             start_utc,
             end_utc,
         ) or 0
-        promo_delivered = await conn.fetchval(
+        attempts_total = await conn.fetchval(
             """
-            SELECT COUNT(DISTINCT client_id)
+            SELECT COUNT(*)
+            FROM notification_messages
+            WHERE event_key = ANY($1::text[])
+              AND sent_at >= $2
+              AND sent_at < $3
+            """,
+            event_keys,
+            start_utc,
+            end_utc,
+        ) or 0
+        delivered_read = await conn.fetchval(
+            """
+            SELECT COUNT(*)
             FROM notification_messages
             WHERE event_key = ANY($1::text[])
               AND status IN ('delivered','read')
               AND sent_at >= $2
               AND sent_at < $3
             """,
-            ["promo_reengage_first", "promo_reengage_second"],
+            event_keys,
             start_utc,
             end_utc,
         ) or 0
-        promo_pending = await conn.fetchval(
+        unavailable_count = await conn.fetchval(
             """
-            SELECT COUNT(DISTINCT client_id)
-            FROM notification_messages
-            WHERE event_key = ANY($1::text[])
-              AND status = 'sent'
-              AND sent_at >= $2
-              AND sent_at < $3
-              AND client_id NOT IN (
-                  SELECT client_id
-                  FROM notification_messages
-                  WHERE event_key = ANY($1::text[])
-                    AND status IN ('delivered','read')
-                    AND sent_at >= $2
-                    AND sent_at < $3
-              )
+            SELECT COUNT(*)
+            FROM client_channels
+            WHERE client_id IN (
+                SELECT DISTINCT client_id
+                FROM notification_outbox
+                WHERE event_key = ANY($1::text[])
+                  AND status = 'sent'
+                  AND sent_at >= $2
+                  AND sent_at < $3
+            )
+              AND unavailable_set_at >= $2
+              AND unavailable_set_at < $3
             """,
-            ["promo_reengage_first", "promo_reengage_second"],
+            event_keys,
             start_utc,
             end_utc,
         ) or 0
-        missing_clients = await conn.fetchval(
+        dead_count = await conn.fetchval(
             """
-            SELECT COUNT(DISTINCT entity_id)
-            FROM wahelp_delivery_issues
-            WHERE entity_kind = 'client'
-              AND created_at >= $1
-              AND created_at < $2
+            SELECT COUNT(*)
+            FROM client_channels
+            WHERE client_id IN (
+                SELECT DISTINCT client_id
+                FROM notification_outbox
+                WHERE event_key = ANY($1::text[])
+                  AND status = 'sent'
+                  AND sent_at >= $2
+                  AND sent_at < $3
+            )
+              AND dead_set_at >= $2
+              AND dead_set_at < $3
             """,
+            event_keys,
             start_utc,
             end_utc,
         ) or 0
@@ -3905,23 +3929,25 @@ async def run_birthday_jobs() -> None:
             start_utc,
             end_utc,
         ) or 0
-        tg_pending_rows = await conn.fetch(
+        priority_updated = await conn.fetchval(
             """
-            SELECT nm.client_id,
-                   nm.sent_at,
-                   c.phone
-            FROM notification_messages nm
-            JOIN clients c ON c.id = nm.client_id
-            WHERE nm.channel = 'clients_tg'
-              AND nm.status = 'sent'
-              AND nm.sent_at >= $1
-              AND nm.sent_at < $2
-            ORDER BY nm.sent_at
+            SELECT COUNT(*)
+            FROM client_channels
+            WHERE client_id IN (
+                SELECT DISTINCT client_id
+                FROM notification_outbox
+                WHERE event_key = ANY($1::text[])
+                  AND status = 'sent'
+                  AND sent_at >= $2
+                  AND sent_at < $3
+            )
+              AND priority_set_at >= $2
+              AND priority_set_at < $3
             """,
+            event_keys,
             start_utc,
             end_utc,
-        )
-        tg_pending_count = len(tg_pending_rows)
+        ) or 0
     total_expired = expired + refresh_expired
 
     lines = [
@@ -3932,29 +3958,17 @@ async def run_birthday_jobs() -> None:
     lines.extend(
         [
             "",
-            "📨 Промо-рассылки за вчера:",
-            f"Отправлено: {promo_total}",
-            f"Доставлено/прочитано: {promo_delivered}",
-            f"Ожидают статуса: {promo_pending}",
-            f"Без каналов связи: {missing_clients}",
+            "📨 Отправки за вчера (ДР + промо):",
+            f"Клиентов в выборке: {selected_clients}",
+            f"Попыток отправок: {attempts_total}",
+            f"Delivered/Read: {delivered_read}",
+            f"Unavailable: {unavailable_count}",
+            f"Dead: {dead_count}",
+            f"Priority обновлён: {priority_updated}",
             f"STOP: {promo_stops}",
             f"Ответ 1: {promo_interests}",
         ]
     )
-    if tg_pending_count:
-        lines.extend(
-            [
-                "",
-                "⚠️ TG сообщения без delivered/read:",
-                f"Всего: {tg_pending_count}",
-            ]
-        )
-        for row in tg_pending_rows[:5]:
-            sent_local = row["sent_at"].astimezone(MOSCOW_TZ)
-            phone = row["phone"] or f"id {row['client_id']}"
-            lines.append(f"- {phone}: {sent_local:%d.%m %H:%M}")
-        if tg_pending_count > 5:
-            lines.append(f"… ещё {tg_pending_count - 5}")
     errors = (accrual_errors + expire_errors)
     if errors:
         lines.append("\nОшибки:")
