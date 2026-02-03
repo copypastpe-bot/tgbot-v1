@@ -3686,64 +3686,96 @@ async def retry_pending_sent_messages() -> None:
                     requires_connection=bool(client["wahelp_requires_connection"]),
                 )
                 async with pool.acquire() as conn:
-                    try:
-                        result = await send_with_rules(
-                            conn,
-                            contact,
-                            text=row["message_text"],
-                            event_key=row["event_key"],
-                        )
-                        logging.info(
-                            "Retry send OK client=%s outbox=%s via=%s",
-                            row["client_id"],
-                            row["outbox_id"],
-                            result.channel,
-                        )
-                        provider_payload = (
-                            result.response if isinstance(result.response, Mapping) else None
-                        )
-                        provider_message_id = extract_provider_message_id(provider_payload)
-                        await conn.execute(
-                            """
-                            INSERT INTO notification_messages (
-                                outbox_id,
-                                client_id,
-                                event_key,
-                                channel,
-                                message_text,
-                                wahelp_message_id,
-                                status,
-                                sent_at,
-                                created_at,
-                                updated_at,
-                                retry_attempted
+                    # build ordered empty channels (wa -> tg -> max)
+                    ch_rows = await conn.fetch(
+                        """
+                        SELECT channel, status, wahelp_user_id
+                        FROM client_channels
+                        WHERE client_id = $1
+                        """,
+                        row["client_id"],
+                    )
+                    status_map = {r["channel"]: (r["status"], r["wahelp_user_id"]) for r in ch_rows}
+                    channel_order = [("wa", "clients_wa"), ("tg", "clients_tg"), ("max", "clients_max")]
+                    candidate_channels = []
+                    for key, ch in channel_order:
+                        status = (status_map.get(key, ("empty", None))[0] or "empty").lower()
+                        if status == "empty":
+                            candidate_channels.append(ch)
+                    if not candidate_channels:
+                        continue
+                    sent_ok = False
+                    for ch in candidate_channels:
+                        try:
+                            result = await send_via_channel(
+                                conn,
+                                contact,
+                                ch,
+                                text=row["message_text"],
+                                event_key=row["event_key"],
                             )
-                            VALUES ($1,$2,$3,$4,$5,$6,'sent',NOW(),NOW(),NOW(),false)
-                            """,
-                            row["outbox_id"],
+                            logging.info(
+                                "Retry send OK client=%s outbox=%s via=%s",
+                                row["client_id"],
+                                row["outbox_id"],
+                                result.channel,
+                            )
+                            provider_payload = (
+                                result.response if isinstance(result.response, Mapping) else None
+                            )
+                            provider_message_id = extract_provider_message_id(provider_payload)
+                            await conn.execute(
+                                """
+                                INSERT INTO notification_messages (
+                                    outbox_id,
+                                    client_id,
+                                    event_key,
+                                    channel,
+                                    message_text,
+                                    wahelp_message_id,
+                                    status,
+                                    sent_at,
+                                    created_at,
+                                    updated_at,
+                                    retry_attempted
+                                )
+                                VALUES ($1,$2,$3,$4,$5,$6,'sent',NOW(),NOW(),NOW(),false)
+                                """,
+                                row["outbox_id"],
+                                row["client_id"],
+                                row["event_key"],
+                                result.channel,
+                                row["message_text"],
+                                provider_message_id,
+                            )
+                            sent_ok = True
+                            break
+                        except DailySendLimitReached as exc:
+                            logging.warning("Daily limit reached during retry: %s", exc)
+                            sent_ok = True
+                            break
+                        except WahelpAPIError as exc:
+                            logging.warning(
+                                "Retry send failed client=%s outbox=%s via=%s: %s",
+                                row["client_id"],
+                                row["outbox_id"],
+                                ch,
+                                exc,
+                            )
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            logging.warning(
+                                "Retry send unexpected error client=%s outbox=%s: %s",
+                                row["client_id"],
+                                row["outbox_id"],
+                                exc,
+                            )
+                            continue
+                    if not sent_ok:
+                        logging.info(
+                            "Retry cascade exhausted for client=%s outbox=%s",
                             row["client_id"],
-                            row["event_key"],
-                            result.channel,
-                            row["message_text"],
-                            provider_message_id,
-                        )
-                    except DailySendLimitReached as exc:
-                        logging.warning("Daily limit reached during retry: %s", exc)
-                        break
-                    except WahelpAPIError as exc:
-                        logging.warning(
-                            "Retry send failed client=%s outbox=%s via=%s: %s",
-                            row["client_id"],
                             row["outbox_id"],
-                            target_channel,
-                            exc,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logging.warning(
-                            "Retry send unexpected error client=%s outbox=%s: %s",
-                            row["client_id"],
-                            row["outbox_id"],
-                            exc,
                         )
                 await asyncio.sleep(random.uniform(60, 3600))
         except Exception as exc:  # noqa: BLE001
