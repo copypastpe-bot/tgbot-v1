@@ -3665,7 +3665,7 @@ async def retry_pending_sent_messages() -> None:
                     )
                     client = await conn.fetchrow(
                         """
-                        SELECT id, full_name, phone, wahelp_user_id_wa, wahelp_user_id_tg,
+                        SELECT id, full_name, phone, wahelp_user_id_wa, wahelp_user_id_tg, wahelp_user_id_max,
                                wahelp_preferred_channel, wahelp_requires_connection
                         FROM clients
                         WHERE id = $1
@@ -3702,10 +3702,22 @@ async def retry_pending_sent_messages() -> None:
                         status = (status_map.get(key, ("empty", None))[0] or "empty").lower()
                         if status == "empty":
                             candidate_channels.append(ch)
+                    logging.info(
+                        "Retry candidate channels client=%s outbox=%s channels=%s",
+                        row["client_id"],
+                        row["outbox_id"],
+                        ",".join(candidate_channels) if candidate_channels else "-",
+                    )
                     if not candidate_channels:
                         continue
                     sent_ok = False
                     for ch in candidate_channels:
+                        logging.info(
+                            "Retry attempting client=%s outbox=%s via=%s",
+                            row["client_id"],
+                            row["outbox_id"],
+                            ch,
+                        )
                         try:
                             result = await send_via_channel(
                                 conn,
