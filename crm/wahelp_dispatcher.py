@@ -514,7 +514,7 @@ def _is_not_connected_error(error: WahelpAPIError) -> bool:
     text = str(error)
     lowered = text.lower()
     return (
-        "мессенджер не подключен" in text
+        "мессенджер не подключен" in lowered
         or "номер не подключен" in lowered
         or "номер не зарегистрирован" in lowered
         or ("messenger" in lowered and "not connected" in lowered)
