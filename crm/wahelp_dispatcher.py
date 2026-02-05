@@ -38,6 +38,7 @@ CHANNEL_TO_KEY: dict[ChannelKind, str] = {
     TELEGRAM_CHANNEL: "tg",
     MAX_CHANNEL: "max",
 }
+RATE_LIMIT_UNAVAILABLE_TTL = timedelta(minutes=10)
 
 FOLLOWUP_DELAY_SECONDS = 24 * 60 * 60  # 24h
 WA_FOLLOWUP_DISABLED = os.getenv("WA_FOLLOWUP_DISABLED", "").lower() in {"1", "true", "yes", "on"}
@@ -327,7 +328,7 @@ async def send_with_rules(
             elif _is_rate_limit_error(exc):
                 logger.warning("Rate limit for %s %s: %s", contact.recipient_kind, contact.client_id, exc)
                 if contact.recipient_kind == "client":
-                    await _touch_channel_error(conn, contact.client_id, channel, str(exc))
+                    await _set_channel_status(conn, contact.client_id, channel, "unavailable", error_code=str(exc))
             elif contact.recipient_kind == "client":
                 await _touch_channel_error(conn, contact.client_id, channel, str(exc))
             failed_channels.append(channel)
@@ -387,7 +388,7 @@ async def send_via_channel(
         elif _is_rate_limit_error(exc):
             logger.warning("Rate limit for %s %s: %s", contact.recipient_kind, contact.client_id, exc)
             if contact.recipient_kind == "client":
-                await _touch_channel_error(conn, contact.client_id, channel, str(exc))
+                await _set_channel_status(conn, contact.client_id, channel, "unavailable", error_code=str(exc))
         elif contact.recipient_kind == "client":
             await _touch_channel_error(conn, contact.client_id, channel, str(exc))
         raise
@@ -545,12 +546,50 @@ async def _fetch_client_channel_rows(
 ) -> dict[ChannelKind, Mapping[str, Any]]:
     rows = await conn.fetch(
         """
-        SELECT channel, wahelp_user_id, status, priority_set_at, dead_set_at, unavailable_set_at
+        SELECT channel, wahelp_user_id, status, priority_set_at, dead_set_at, unavailable_set_at, last_error_code
         FROM client_channels
         WHERE client_id = $1
         """,
         client_id,
     )
+    if rows:
+        now = datetime.now(timezone.utc)
+        expire_keys: list[str] = []
+        for row in rows:
+            if (row.get("status") or "").lower() != "unavailable":
+                continue
+            unavailable_at = row.get("unavailable_set_at")
+            if not unavailable_at:
+                continue
+            error_code = (row.get("last_error_code") or "").lower()
+            if (
+                "слишком много попыток" in error_code
+                or "too many requests" in error_code
+                or "rate_limit" in error_code
+            ):
+                if unavailable_at < (now - RATE_LIMIT_UNAVAILABLE_TTL):
+                    expire_keys.append(row["channel"])
+        if expire_keys:
+            await conn.execute(
+                """
+                UPDATE client_channels
+                SET status = 'empty',
+                    unavailable_set_at = NULL,
+                    updated_at = NOW()
+                WHERE client_id = $1
+                  AND channel = ANY($2::text[])
+                """,
+                client_id,
+                expire_keys,
+            )
+            rows = await conn.fetch(
+                """
+                SELECT channel, wahelp_user_id, status, priority_set_at, dead_set_at, unavailable_set_at, last_error_code
+                FROM client_channels
+                WHERE client_id = $1
+                """,
+                client_id,
+            )
     result: dict[ChannelKind, Mapping[str, Any]] = {}
     for row in rows:
         channel_key = row["channel"]
@@ -579,7 +618,7 @@ async def _fetch_client_channel_rows(
     if missing:
         rows = await conn.fetch(
             """
-            SELECT channel, wahelp_user_id, status, priority_set_at, dead_set_at, unavailable_set_at
+            SELECT channel, wahelp_user_id, status, priority_set_at, dead_set_at, unavailable_set_at, last_error_code
             FROM client_channels
             WHERE client_id = $1
             """,
