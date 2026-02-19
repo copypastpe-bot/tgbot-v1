@@ -32,7 +32,15 @@ TELEGRAM_CHANNEL: ChannelKind = "clients_tg"
 WHATSAPP_CHANNEL: ChannelKind = "clients_wa"
 MAX_CHANNEL: ChannelKind = "clients_max"
 LEADS_CHANNEL: ChannelKind = "leads"
-CHANNEL_ORDER: list[ChannelKind] = [WHATSAPP_CHANNEL, TELEGRAM_CHANNEL, MAX_CHANNEL]
+MAX_CHANNEL_ENABLED = (os.getenv("WAHELP_CLIENTS_MAX_ENABLED", "1") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+CHANNEL_ORDER: list[ChannelKind] = [WHATSAPP_CHANNEL, TELEGRAM_CHANNEL]
+if MAX_CHANNEL_ENABLED:
+    CHANNEL_ORDER.append(MAX_CHANNEL)
 CHANNEL_TO_KEY: dict[ChannelKind, str] = {
     WHATSAPP_CHANNEL: "wa",
     TELEGRAM_CHANNEL: "tg",
@@ -408,7 +416,7 @@ def _build_channel_sequence(contact: ClientContact, dead_channels: set[ChannelKi
         attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
     if contact.tg_user_id and (preferred != TELEGRAM_CHANNEL) and TELEGRAM_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
-    if contact.max_user_id and MAX_CHANNEL not in dead_channels:
+    if MAX_CHANNEL_ENABLED and contact.max_user_id and MAX_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=MAX_CHANNEL, address_kind="user_id", user_id=contact.max_user_id))
     attempts.extend(_build_client_phone_attempts(contact, dead_channels))
     return tuple(_deduplicate_attempts(attempts))
@@ -429,13 +437,14 @@ def _build_client_phone_attempts(contact: ClientContact, dead_channels: set[Chan
     """
     order: Sequence[ChannelKind]
     preferred = contact.preferred_channel
+    max_tail: tuple[ChannelKind, ...] = (MAX_CHANNEL,) if MAX_CHANNEL_ENABLED else ()
     if preferred == TELEGRAM_CHANNEL:
-        order = (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL, MAX_CHANNEL)
+        order = (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL, *max_tail)
     elif preferred == WHATSAPP_CHANNEL:
-        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL, MAX_CHANNEL)
+        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL, *max_tail)
     else:
         # По умолчанию: WA -> TG -> MAX
-        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL, MAX_CHANNEL)
+        order = (WHATSAPP_CHANNEL, TELEGRAM_CHANNEL, *max_tail)
     return [
         ChannelAttempt(channel=chan, address_kind="phone")
         for chan in order

@@ -190,6 +190,12 @@ PROMO_REMINDER_SECOND_GAP_MONTHS = 2
 PROMO_RANDOM_DELAY_RANGE = (60, 3600)
 PROMO_BONUS_TTL_DAYS = 365
 PROMO_DAILY_LIMIT = int(os.getenv("PROMO_DAILY_LIMIT", "30"))
+WAHELP_CLIENTS_MAX_ENABLED = (os.getenv("WAHELP_CLIENTS_MAX_ENABLED", "1") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 LEADS_PROMO_CAMPAIGN = os.getenv("LEADS_PROMO_CAMPAIGN", "week1")
 LEADS_MAX_PER_DAY = int(os.getenv("LEADS_MAX_PER_DAY", "20"))
 LEADS_RATE_LIMIT_INTERVAL = int(os.getenv("LEADS_RATE_LIMIT_INTERVAL", 60))  # legacy env; random interval is used instead
@@ -3608,6 +3614,9 @@ async def retry_pending_sent_messages() -> None:
             today_local = datetime.now(MOSCOW_TZ).date()
             today_start_local = datetime.combine(today_local, time.min, tzinfo=MOSCOW_TZ)
             today_start_utc = today_start_local.astimezone(timezone.utc)
+            retry_channels = ["clients_wa", "clients_tg"]
+            if WAHELP_CLIENTS_MAX_ENABLED:
+                retry_channels.append("clients_max")
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
@@ -3618,7 +3627,7 @@ async def retry_pending_sent_messages() -> None:
                       AND outbox_id IS NOT NULL
                       AND sent_at >= $1
                       AND sent_at < $2
-                      AND channel IN ('clients_wa','clients_tg','clients_max')
+                      AND channel = ANY($3::text[])
                       AND NOT EXISTS (
                           SELECT 1
                           FROM notification_messages nm2
@@ -3630,6 +3639,7 @@ async def retry_pending_sent_messages() -> None:
                     """,
                     today_start_utc,
                     cutoff,
+                    retry_channels,
                 )
             if not rows:
                 await asyncio.sleep(poll_interval)
@@ -3696,7 +3706,9 @@ async def retry_pending_sent_messages() -> None:
                         row["client_id"],
                     )
                     status_map = {r["channel"]: (r["status"], r["wahelp_user_id"]) for r in ch_rows}
-                    channel_order = [("wa", "clients_wa"), ("tg", "clients_tg"), ("max", "clients_max")]
+                    channel_order = [("wa", "clients_wa"), ("tg", "clients_tg")]
+                    if WAHELP_CLIENTS_MAX_ENABLED:
+                        channel_order.append(("max", "clients_max"))
                     candidate_channels = []
                     for key, ch in channel_order:
                         status = (status_map.get(key, ("empty", None))[0] or "empty").lower()
