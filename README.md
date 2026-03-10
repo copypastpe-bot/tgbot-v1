@@ -33,6 +33,7 @@ cat > README.md <<'MD'
 - `WAHELP_WEBHOOK_PORT` — порт вебхука. Если `0`, сервер не запускается.
 - `WAHELP_WEBHOOK_TOKEN` — необязательный секрет. Передавайте его в заголовке `X-Wahelp-Token` или как `?token=...` при настройке вебхука в Wahelp.
 - `ONLINEPBX_WEBHOOK_TOKEN` — необязательный секрет для вебхука OnlinePBX (`X-Onlinepbx-Token` или `?token=...`).
+- `ONLINEPBX_ALLOWED_IPS` — список разрешённых IP для вебхука OnlinePBX (через запятую/пробел), например `85.119.145.174,92.53.102.165`.
 - `SMSRU_API_ID` — API-ключ sms.ru для отправки SMS из подтверждения администратора.
 - `SMSRU_FROM` — (опционально) имя отправителя в sms.ru.
 - `SMSRU_LOW_BALANCE_ALERT_THRESHOLD` — порог баланса sms.ru для тревоги админам (по умолчанию `100`).

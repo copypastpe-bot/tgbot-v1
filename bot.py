@@ -169,6 +169,11 @@ WAHELP_WEBHOOK_HOST = os.getenv("WAHELP_WEBHOOK_HOST", "0.0.0.0")
 WAHELP_WEBHOOK_PORT = int(os.getenv("WAHELP_WEBHOOK_PORT", "0") or "0")
 WAHELP_WEBHOOK_TOKEN = os.getenv("WAHELP_WEBHOOK_TOKEN")
 ONLINEPBX_WEBHOOK_TOKEN = os.getenv("ONLINEPBX_WEBHOOK_TOKEN")
+ONLINEPBX_ALLOWED_IPS = {
+    ip.strip()
+    for ip in re.split(r"[ ,;]+", os.getenv("ONLINEPBX_ALLOWED_IPS", "").strip())
+    if ip.strip()
+}
 SMSRU_API_ID = (os.getenv("SMSRU_API_ID") or "").strip()
 SMSRU_FROM = (os.getenv("SMSRU_FROM") or "").strip()
 ONLINEPBX_SMS_TEXT = (
@@ -12125,6 +12130,7 @@ async def main():
                 token=WAHELP_WEBHOOK_TOKEN,
                 inbound_handler=handle_wahelp_inbound,
                 onlinepbx_token=ONLINEPBX_WEBHOOK_TOKEN,
+                onlinepbx_allowed_ips=ONLINEPBX_ALLOWED_IPS,
                 onlinepbx_handler=handle_onlinepbx_inbound,
             )
         except Exception as exc:  # noqa: BLE001

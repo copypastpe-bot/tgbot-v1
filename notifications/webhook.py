@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Mapping
+import ipaddress
+from typing import Any, Awaitable, Callable, Mapping, Iterable
 
 import asyncpg
 from aiohttp import web
@@ -22,12 +23,18 @@ class WahelpWebhookServer:
         token: str | None = None,
         inbound_handler: Callable[[Mapping[str, Any]], Awaitable[bool]] | None = None,
         onlinepbx_token: str | None = None,
+        onlinepbx_allowed_ips: Iterable[str] | None = None,
         onlinepbx_handler: Callable[[Mapping[str, Any]], Awaitable[bool]] | None = None,
     ) -> None:
         self.pool = pool
         self.token = token
         self.inbound_handler = inbound_handler
         self.onlinepbx_token = onlinepbx_token
+        self.onlinepbx_allowed_ips = {
+            normalized
+            for ip in (onlinepbx_allowed_ips or [])
+            if (normalized := _normalize_ip(ip))
+        }
         self.onlinepbx_handler = onlinepbx_handler
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -90,6 +97,16 @@ class WahelpWebhookServer:
         return web.json_response({"ok": True, "handled": handled or custom_handled})
 
     async def _handle_onlinepbx(self, request: web.Request) -> web.Response:
+        if self.onlinepbx_allowed_ips:
+            remote_ip = _normalize_ip(request.remote)
+            if remote_ip not in self.onlinepbx_allowed_ips:
+                logger.warning(
+                    "OnlinePBX webhook denied from IP %s (allowed: %s)",
+                    request.remote,
+                    ",".join(sorted(self.onlinepbx_allowed_ips)),
+                )
+                return web.json_response({"ok": False, "error": "forbidden_ip"}, status=403)
+
         if self.onlinepbx_token:
             provided = request.headers.get("X-Onlinepbx-Token") or request.rel_url.query.get("token")
             if provided != self.onlinepbx_token:
@@ -127,6 +144,7 @@ async def start_wahelp_webhook(
     token: str | None = None,
     inbound_handler: Callable[[Mapping[str, Any]], Awaitable[bool]] | None = None,
     onlinepbx_token: str | None = None,
+    onlinepbx_allowed_ips: Iterable[str] | None = None,
     onlinepbx_handler: Callable[[Mapping[str, Any]], Awaitable[bool]] | None = None,
 ) -> WahelpWebhookServer:
     server = WahelpWebhookServer(
@@ -134,6 +152,7 @@ async def start_wahelp_webhook(
         token=token,
         inbound_handler=inbound_handler,
         onlinepbx_token=onlinepbx_token,
+        onlinepbx_allowed_ips=onlinepbx_allowed_ips,
         onlinepbx_handler=onlinepbx_handler,
     )
     await server.start(host, port)
@@ -153,6 +172,18 @@ def _normalize_payload(payload: Mapping[str, Any] | Any) -> Mapping[str, Any] | 
             normalized["event"] = payload.get("action")
         return normalized
     return payload
+
+
+def _normalize_ip(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if cleaned.startswith("::ffff:"):
+        cleaned = cleaned[7:]
+    try:
+        return str(ipaddress.ip_address(cleaned))
+    except ValueError:
+        return None
 
 
 __all__ = ["WahelpWebhookServer", "start_wahelp_webhook"]
