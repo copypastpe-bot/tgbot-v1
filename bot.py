@@ -1,4 +1,4 @@
-import asyncio, os, re, logging, html, random
+import asyncio, os, re, logging, html, random, json
 import csv, io, calendar
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone, timedelta, time
@@ -168,6 +168,14 @@ JENYA_CARD_INITIAL_BALANCE = Decimal(os.getenv("JENYA_CARD_INITIAL_BALANCE", "0"
 WAHELP_WEBHOOK_HOST = os.getenv("WAHELP_WEBHOOK_HOST", "0.0.0.0")
 WAHELP_WEBHOOK_PORT = int(os.getenv("WAHELP_WEBHOOK_PORT", "0") or "0")
 WAHELP_WEBHOOK_TOKEN = os.getenv("WAHELP_WEBHOOK_TOKEN")
+ONLINEPBX_WEBHOOK_TOKEN = os.getenv("ONLINEPBX_WEBHOOK_TOKEN")
+SMSRU_API_ID = (os.getenv("SMSRU_API_ID") or "").strip()
+SMSRU_FROM = (os.getenv("SMSRU_FROM") or "").strip()
+ONLINEPBX_SMS_TEXT = (
+    os.getenv("ONLINEPBX_SMS_TEXT")
+    or "Здравствуйте! Вы недавно звонили в «Ракета Клин». Ответьте на это SMS, и мы свяжемся с вами."
+).strip()
+ONLINEPBX_MIN_DIALOG_SEC = 21
 SHEETS_CREDENTIALS_PATH = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "docs/Sheets.json")
 TEXTS_SHEET_ID = os.getenv("TEXTS_SHEET_ID")
 TEXTS_PROMO_RANGE = os.getenv("TEXTS_PROMO_RANGE", "promo!A:C")
@@ -621,6 +629,264 @@ async def ensure_client_channels_schema(conn: asyncpg.Connection) -> None:
         ON CONFLICT (client_id, channel) DO NOTHING;
         """
     )
+
+
+async def ensure_onlinepbx_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS onlinepbx_sms_requests (
+            id bigserial PRIMARY KEY,
+            call_uuid text NOT NULL UNIQUE,
+            pbx_domain text,
+            event text NOT NULL,
+            direction text,
+            caller text,
+            callee text,
+            client_phone text,
+            dialog_duration integer NOT NULL DEFAULT 0,
+            call_duration integer,
+            call_date timestamptz,
+            payload jsonb NOT NULL,
+            status text NOT NULL DEFAULT 'pending',
+            decision_note text,
+            notified_at timestamptz,
+            decided_at timestamptz,
+            decided_by bigint,
+            sms_text text,
+            sms_provider_message_id text,
+            sms_response jsonb,
+            sms_sent_at timestamptz,
+            created_at timestamptz NOT NULL DEFAULT NOW(),
+            updated_at timestamptz NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_onlinepbx_sms_requests_status_created
+        ON onlinepbx_sms_requests(status, created_at);
+        """
+    )
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def _normalize_onlinepbx_phone(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = normalize_phone_for_db(value)
+    digits = only_digits(normalized)
+    if len(digits) == 10 and digits.startswith("9"):
+        return "+7" + digits
+    if len(digits) == 11 and digits.startswith("8"):
+        return "+7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return "+" + digits
+    return None
+
+
+def _extract_onlinepbx_client_phone(payload: Mapping[str, Any], direction: str) -> str | None:
+    caller = str(payload.get("caller") or "").strip()
+    callee = str(payload.get("callee") or "").strip()
+    if direction == "inbound":
+        candidates = [caller, callee]
+    elif direction == "outbound":
+        candidates = [callee, caller]
+    else:
+        candidates = [caller, callee]
+    for candidate in candidates:
+        phone = _normalize_onlinepbx_phone(candidate)
+        if phone:
+            return phone
+    return None
+
+
+def _serialize_onlinepbx_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): ("" if val is None else str(val)) for key, val in payload.items()}
+
+
+async def _notify_admins_onlinepbx_sms_request(
+    *,
+    request_id: int,
+    phone: str,
+    dialog_duration: int,
+    call_uuid: str,
+) -> None:
+    if not ADMIN_TG_IDS:
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да", callback_data=f"pbx_sms:{request_id}:yes"),
+                InlineKeyboardButton(text="Нет", callback_data=f"pbx_sms:{request_id}:no"),
+            ]
+        ]
+    )
+    text = (
+        "📞 Входящий звонок от клиента\n"
+        f"Номер: {phone}\n"
+        f"Разговор: {dialog_duration} сек\n"
+        f"UUID: {call_uuid}\n\n"
+        "Отправить SMS?"
+    )
+    for admin_id in ADMIN_TG_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to notify admin %s about OnlinePBX call: %s", admin_id, exc)
+
+
+def _smsru_send_sync(phone: str, text: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "api_id": SMSRU_API_ID,
+        "to": only_digits(normalize_phone_for_db(phone)),
+        "msg": text,
+        "json": 1,
+    }
+    if SMSRU_FROM:
+        payload["from"] = SMSRU_FROM
+    resp = requests.post("https://sms.ru/sms/send", data=payload, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, Mapping):
+        return dict(data)
+    return {"status": "ERROR", "status_text": "unexpected response format"}
+
+
+async def _send_sms_via_smsru(phone: str, text: str) -> tuple[bool, str | None, Mapping[str, Any] | None, str | None]:
+    if not SMSRU_API_ID:
+        return False, None, None, "SMSRU_API_ID is not configured"
+    try:
+        data = await asyncio.to_thread(_smsru_send_sync, phone, text)
+    except Exception as exc:  # noqa: BLE001
+        return False, None, None, str(exc)
+
+    status = str(data.get("status") or "").upper()
+    status_code = str(data.get("status_code") or "")
+    sms_id: str | None = None
+    sms = data.get("sms")
+    if isinstance(sms, Mapping) and sms:
+        first_val = next(iter(sms.values()))
+        if isinstance(first_val, Mapping):
+            sms_id_raw = first_val.get("sms_id")
+            if sms_id_raw is not None:
+                sms_id = str(sms_id_raw)
+            line_status = str(first_val.get("status") or "").upper()
+            line_code = str(first_val.get("status_code") or "")
+            if line_status == "OK" or line_code == "100":
+                return True, sms_id, data, None
+            err = str(first_val.get("status_text") or first_val.get("status") or "sms send failed")
+            return False, sms_id, data, err
+    if status == "OK" and (status_code == "" or status_code == "100"):
+        return True, sms_id, data, None
+    err = str(data.get("status_text") or data.get("status") or "sms send failed")
+    return False, sms_id, data, err
+
+
+async def handle_onlinepbx_inbound(payload: Mapping[str, Any]) -> bool:
+    if pool is None:
+        return False
+    event = str(payload.get("event") or "").strip().lower()
+    direction = str(payload.get("direction") or "").strip().lower()
+    if event != "call_end" or direction != "inbound":
+        return False
+
+    call_uuid = str(payload.get("uuid") or "").strip()
+    if not call_uuid:
+        return False
+
+    dialog_duration = _to_int(payload.get("dialog_duration"), 0)
+    call_duration = _to_int(payload.get("call_duration"), 0)
+    client_phone = _extract_onlinepbx_client_phone(payload, direction)
+    pbx_domain = str(payload.get("domain") or "").strip()
+    caller = str(payload.get("caller") or "").strip()
+    callee = str(payload.get("callee") or "").strip()
+    date_unix = _to_int(payload.get("date"), 0)
+    call_date = datetime.fromtimestamp(date_unix, tz=timezone.utc) if date_unix > 0 else None
+    payload_json = json.dumps(_serialize_onlinepbx_payload(payload), ensure_ascii=False)
+
+    if dialog_duration <= (ONLINEPBX_MIN_DIALOG_SEC - 1):
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO onlinepbx_sms_requests (
+                    call_uuid, pbx_domain, event, direction, caller, callee, client_phone,
+                    dialog_duration, call_duration, call_date, payload, status, decision_note
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,'ignored','dialog_duration <= 20')
+                ON CONFLICT (call_uuid) DO NOTHING
+                """,
+                call_uuid,
+                pbx_domain,
+                event,
+                direction,
+                caller,
+                callee,
+                client_phone,
+                dialog_duration,
+                call_duration,
+                call_date,
+                payload_json,
+            )
+        return True
+
+    status = "pending" if client_phone else "error"
+    note = None if client_phone else "failed to resolve client phone"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO onlinepbx_sms_requests (
+                call_uuid, pbx_domain, event, direction, caller, callee, client_phone,
+                dialog_duration, call_duration, call_date, payload, status, decision_note
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13)
+            ON CONFLICT (call_uuid) DO NOTHING
+            RETURNING id
+            """,
+            call_uuid,
+            pbx_domain,
+            event,
+            direction,
+            caller,
+            callee,
+            client_phone,
+            dialog_duration,
+            call_duration,
+            call_date,
+            payload_json,
+            status,
+            note,
+        )
+    if not row:
+        return True
+    if not client_phone:
+        return True
+
+    request_id = int(row["id"])
+    await _notify_admins_onlinepbx_sms_request(
+        request_id=request_id,
+        phone=client_phone,
+        dialog_duration=dialog_duration,
+        call_uuid=call_uuid,
+    )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE onlinepbx_sms_requests
+            SET notified_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            """,
+            request_id,
+        )
+    return True
 
 LEADS_PROMO_CAMPAIGNS: dict[str, list[str]] = {
     "week1": [
@@ -9271,6 +9537,144 @@ async def wire_nudge_later_cb(query: CallbackQuery):
     except Exception:
         pass
 
+
+@dp.callback_query(F.data.startswith("pbx_sms:"))
+async def onlinepbx_sms_decision_cb(query: CallbackQuery):
+    raw = (query.data or "").strip()
+    match = re.match(r"^pbx_sms:(\d+):(yes|no)$", raw)
+    if not match:
+        await query.answer()
+        return
+    request_id = int(match.group(1))
+    decision = match.group(2)
+
+    allowed = query.from_user.id in ADMIN_TG_IDS or await has_permission(query.from_user.id, "view_orders_reports")
+    if not allowed:
+        await query.answer("Недостаточно прав.", show_alert=True)
+        return
+    if pool is None:
+        await query.answer("Сервис недоступен.", show_alert=True)
+        return
+
+    if decision == "no":
+        async with pool.acquire() as conn:
+            done = await conn.fetchrow(
+                """
+                UPDATE onlinepbx_sms_requests
+                SET status='declined',
+                    decided_at=NOW(),
+                    decided_by=$2,
+                    decision_note='declined by admin',
+                    updated_at=NOW()
+                WHERE id=$1 AND status='pending'
+                RETURNING id
+                """,
+                request_id,
+                query.from_user.id,
+            )
+            if not done:
+                status = await conn.fetchval(
+                    "SELECT status FROM onlinepbx_sms_requests WHERE id=$1",
+                    request_id,
+                )
+                if status is None:
+                    await query.answer("Запрос не найден.", show_alert=True)
+                else:
+                    await query.answer(f"Уже обработано: {status}", show_alert=True)
+                return
+        await query.answer("SMS не отправляем.")
+        try:
+            await query.message.edit_reply_markup(None)
+        except Exception:
+            pass
+        return
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE onlinepbx_sms_requests
+            SET status='sending',
+                decided_at=NOW(),
+                decided_by=$2,
+                updated_at=NOW()
+            WHERE id=$1 AND status='pending'
+            RETURNING client_phone, call_uuid
+            """,
+            request_id,
+            query.from_user.id,
+        )
+        if not row:
+            status = await conn.fetchval(
+                "SELECT status FROM onlinepbx_sms_requests WHERE id=$1",
+                request_id,
+            )
+            if status is None:
+                await query.answer("Запрос не найден.", show_alert=True)
+            else:
+                await query.answer(f"Уже обработано: {status}", show_alert=True)
+            return
+
+    phone = row["client_phone"]
+    if not phone:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE onlinepbx_sms_requests
+                SET status='error',
+                    decision_note='missing client phone',
+                    updated_at=NOW()
+                WHERE id=$1 AND status='sending'
+                """,
+                request_id,
+            )
+        await query.answer("Не найден номер клиента.", show_alert=True)
+        return
+    sms_text = ONLINEPBX_SMS_TEXT
+    ok, sms_id, sms_response, err = await _send_sms_via_smsru(phone, sms_text)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE onlinepbx_sms_requests
+            SET status=$2,
+                decided_at=NOW(),
+                decided_by=$3,
+                decision_note=$4,
+                sms_text=$5,
+                sms_provider_message_id=$6,
+                sms_response=$7::jsonb,
+                sms_sent_at=CASE WHEN $2='sent' THEN NOW() ELSE NULL END,
+                updated_at=NOW()
+            WHERE id=$1 AND status='sending'
+            """,
+            request_id,
+            "sent" if ok else "error",
+            query.from_user.id,
+            None if ok else (err or "sms send failed"),
+            sms_text,
+            sms_id,
+            json.dumps(sms_response or {}, ensure_ascii=False),
+        )
+    try:
+        await query.message.edit_reply_markup(None)
+    except Exception:
+        pass
+    if ok:
+        await query.answer("SMS отправлено.")
+    else:
+        await query.answer(f"Ошибка SMS: {err or 'unknown error'}", show_alert=True)
+        if ADMIN_TG_IDS:
+            text = (
+                "⚠️ Ошибка отправки SMS (OnlinePBX)\n"
+                f"Номер: {phone}\n"
+                f"UUID: {row['call_uuid']}\n"
+                f"Ошибка: {err or 'unknown'}"
+            )
+            for admin_id in ADMIN_TG_IDS:
+                try:
+                    await bot.send_message(admin_id, text)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to notify admin %s about SMS error: %s", admin_id, exc)
+
 # ===== /income admin command =====
 @dp.message(Command("income"))
 async def add_income(msg: Message):
@@ -11614,6 +12018,7 @@ async def main():
         await ensure_order_payments_schema(_conn)
         await ensure_jenya_card_schema(_conn)
         await ensure_client_channels_schema(_conn)
+        await ensure_onlinepbx_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(
@@ -11671,6 +12076,8 @@ async def main():
                 port=WAHELP_WEBHOOK_PORT,
                 token=WAHELP_WEBHOOK_TOKEN,
                 inbound_handler=handle_wahelp_inbound,
+                onlinepbx_token=ONLINEPBX_WEBHOOK_TOKEN,
+                onlinepbx_handler=handle_onlinepbx_inbound,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to start Wahelp webhook server: %s", exc)
