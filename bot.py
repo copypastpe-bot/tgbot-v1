@@ -176,6 +176,12 @@ ONLINEPBX_SMS_TEXT = (
     or "Здравствуйте! Вы недавно звонили в «Ракета Клин». Ответьте на это SMS, и мы свяжемся с вами."
 ).strip()
 ONLINEPBX_MIN_DIALOG_SEC = 21
+try:
+    SMSRU_LOW_BALANCE_ALERT_THRESHOLD = Decimal(
+        (os.getenv("SMSRU_LOW_BALANCE_ALERT_THRESHOLD") or "100").replace(",", ".")
+    )
+except Exception:
+    SMSRU_LOW_BALANCE_ALERT_THRESHOLD = Decimal("100")
 SHEETS_CREDENTIALS_PATH = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "docs/Sheets.json")
 TEXTS_SHEET_ID = os.getenv("TEXTS_SHEET_ID")
 TEXTS_PROMO_RANGE = os.getenv("TEXTS_PROMO_RANGE", "promo!A:C")
@@ -788,6 +794,40 @@ async def _send_sms_via_smsru(phone: str, text: str) -> tuple[bool, str | None, 
         return True, sms_id, data, None
     err = str(data.get("status_text") or data.get("status") or "sms send failed")
     return False, sms_id, data, err
+
+
+def _extract_smsru_balance(response: Mapping[str, Any] | None) -> Decimal | None:
+    if not isinstance(response, Mapping):
+        return None
+    raw = response.get("balance")
+    if raw is None:
+        return None
+    try:
+        return Decimal(str(raw).strip().replace(",", "."))
+    except Exception:
+        return None
+
+
+async def _notify_admins_low_smsru_balance(balance: Decimal) -> None:
+    if not ADMIN_TG_IDS:
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="ФА", callback_data="smsru_lowbal:fa"),
+                InlineKeyboardButton(text="ВАТАФА", callback_data="smsru_lowbal:watafa"),
+            ]
+        ]
+    )
+    text = (
+        "ПОПОЛНИ SMS.RU ПЕПЕ\n"
+        f"Баланс: {balance} ₽"
+    )
+    for admin_id in ADMIN_TG_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to notify admin %s about low sms.ru balance: %s", admin_id, exc)
 
 
 async def handle_onlinepbx_inbound(payload: Mapping[str, Any]) -> bool:
@@ -9674,6 +9714,14 @@ async def onlinepbx_sms_decision_cb(query: CallbackQuery):
                     await bot.send_message(admin_id, text)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to notify admin %s about SMS error: %s", admin_id, exc)
+    balance = _extract_smsru_balance(sms_response)
+    if balance is not None and balance < SMSRU_LOW_BALANCE_ALERT_THRESHOLD:
+        await _notify_admins_low_smsru_balance(balance)
+
+
+@dp.callback_query(F.data.startswith("smsru_lowbal:"))
+async def smsru_low_balance_noop_cb(query: CallbackQuery):
+    await query.answer()
 
 # ===== /income admin command =====
 @dp.message(Command("income"))

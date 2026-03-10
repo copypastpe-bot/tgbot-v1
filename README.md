@@ -35,6 +35,7 @@ cat > README.md <<'MD'
 - `ONLINEPBX_WEBHOOK_TOKEN` — необязательный секрет для вебхука OnlinePBX (`X-Onlinepbx-Token` или `?token=...`).
 - `SMSRU_API_ID` — API-ключ sms.ru для отправки SMS из подтверждения администратора.
 - `SMSRU_FROM` — (опционально) имя отправителя в sms.ru.
+- `SMSRU_LOW_BALANCE_ALERT_THRESHOLD` — порог баланса sms.ru для тревоги админам (по умолчанию `100`).
 - `ONLINEPBX_SMS_TEXT` — текст SMS, который отправляется клиенту после подтверждения админом.
 
 ## Система уведомлений
