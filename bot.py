@@ -1,10 +1,14 @@
 import asyncio, os, re, logging, html, random, json
 import csv, io, calendar
+import socket
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone, timedelta, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from aiohttp.abc import AbstractResolver
+from aiohttp.resolver import DefaultResolver
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.types import (
     Message,
@@ -192,6 +196,8 @@ TEXTS_SHEET_ID = os.getenv("TEXTS_SHEET_ID")
 TEXTS_PROMO_RANGE = os.getenv("TEXTS_PROMO_RANGE", "promo!A:C")
 TEXTS_BDAY_RANGE = os.getenv("TEXTS_BDAY_RANGE", "birthday!A:C")
 TEXTS_TG_LINK = os.getenv("TEXTS_TG_LINK", "")
+TELEGRAM_PROXY_URL = (os.getenv("TELEGRAM_PROXY_URL") or "").strip()
+TELEGRAM_API_IP = (os.getenv("TELEGRAM_API_IP") or "").strip()
 
 # env rules
 MIN_CASH = Decimal(os.getenv("MIN_CASH", "2500"))
@@ -249,7 +255,50 @@ DIVIDEND_COMMENT_PREFIX = "[DIV]"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-bot = Bot(BOT_TOKEN)
+
+
+class _PinnedTelegramResolver(AbstractResolver):
+    def __init__(self, pinned_ip: str) -> None:
+        self._pinned_ip = pinned_ip
+        self._default = DefaultResolver()
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: int = socket.AF_UNSPEC,
+    ) -> list[dict[str, Any]]:
+        if host == "api.telegram.org":
+            ip_family = socket.AF_INET6 if ":" in self._pinned_ip else socket.AF_INET
+            return [
+                {
+                    "hostname": host,
+                    "host": self._pinned_ip,
+                    "port": port,
+                    "family": ip_family,
+                    "proto": 0,
+                    "flags": socket.AI_NUMERICHOST,
+                }
+            ]
+        return await self._default.resolve(host, port, family)
+
+    async def close(self) -> None:
+        await self._default.close()
+
+
+def _build_telegram_session() -> AiohttpSession:
+    session = AiohttpSession(proxy=TELEGRAM_PROXY_URL or None)
+    if TELEGRAM_API_IP:
+        session._connector_init["resolver"] = _PinnedTelegramResolver(TELEGRAM_API_IP)
+        session._connector_init["family"] = socket.AF_INET6 if ":" in TELEGRAM_API_IP else socket.AF_INET
+    return session
+
+
+def _make_telegram_bot(token: str) -> Bot:
+    return Bot(token=token, session=_build_telegram_session())
+
+
+bot = _make_telegram_bot(BOT_TOKEN)
 dp = Dispatcher()
 
 _texts_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
@@ -4379,7 +4428,7 @@ async def run_rewash_followup_job() -> None:
         logging.warning("CLIENT_BOT_TOKEN not set, skipping rewash follow-up")
         return
     
-    client_bot = Bot(token=CLIENT_BOT_TOKEN)
+    client_bot = _make_telegram_bot(CLIENT_BOT_TOKEN)
     
     async with pool.acquire() as conn:
         # Находим перемывы, которым нужно отправить follow-up

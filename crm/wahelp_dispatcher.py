@@ -14,13 +14,17 @@ import os
 import re
 import asyncio
 import logging
+import socket
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from typing import Awaitable, Callable, Literal, Mapping, Sequence, Any
 from zoneinfo import ZoneInfo
 
 import asyncpg
+from aiohttp.abc import AbstractResolver
+from aiohttp.resolver import DefaultResolver
 from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramAPIError
 
 from .wahelp_client import WahelpAPIError
@@ -54,6 +58,8 @@ _followup_tasks: dict[int, asyncio.Task] = {}
 
 CLIENT_BOT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_PROXY_URL = (os.getenv("TELEGRAM_PROXY_URL") or "").strip()
+TELEGRAM_API_IP = (os.getenv("TELEGRAM_API_IP") or "").strip()
 WA_TG_FALLBACK_TEXT = (os.getenv("WA_TG_FALLBACK_TEXT") or "").strip()
 TG_LINK = (os.getenv("TEXTS_TG_LINK") or "").strip()
 DAILY_SEND_LIMIT = int(os.getenv("DAILY_SEND_LIMIT", "60") or "60")
@@ -118,6 +124,47 @@ def set_missing_messenger_logger(callback: MissingMessengerLogger | None) -> Non
     """Register optional logger that reports contacts without messengers."""
     global _missing_logger
     _missing_logger = callback
+
+
+class _PinnedTelegramResolver(AbstractResolver):
+    def __init__(self, pinned_ip: str) -> None:
+        self._pinned_ip = pinned_ip
+        self._default = DefaultResolver()
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: int = socket.AF_UNSPEC,
+    ) -> list[dict[str, Any]]:
+        if host == "api.telegram.org":
+            ip_family = socket.AF_INET6 if ":" in self._pinned_ip else socket.AF_INET
+            return [
+                {
+                    "hostname": host,
+                    "host": self._pinned_ip,
+                    "port": port,
+                    "family": ip_family,
+                    "proto": 0,
+                    "flags": socket.AI_NUMERICHOST,
+                }
+            ]
+        return await self._default.resolve(host, port, family)
+
+    async def close(self) -> None:
+        await self._default.close()
+
+
+def _build_telegram_session() -> AiohttpSession:
+    session = AiohttpSession(proxy=TELEGRAM_PROXY_URL or None)
+    if TELEGRAM_API_IP:
+        session._connector_init["resolver"] = _PinnedTelegramResolver(TELEGRAM_API_IP)
+        session._connector_init["family"] = socket.AF_INET6 if ":" in TELEGRAM_API_IP else socket.AF_INET
+    return session
+
+
+def _make_telegram_bot(token: str) -> Bot:
+    return Bot(token=token, session=_build_telegram_session())
 
 
 def _today_window_utc() -> tuple[datetime, datetime]:
@@ -188,7 +235,7 @@ async def _send_limit_alert(conn: asyncpg.Connection, total: int) -> None:
         f"Всего: {total} из {DAILY_SEND_LIMIT}\n"
         "Отправка остановлена до завтра."
     )
-    bot = Bot(token=BOT_TOKEN)
+    bot = _make_telegram_bot(BOT_TOKEN)
     try:
         for admin_id in ADMIN_TG_IDS:
             try:
@@ -224,7 +271,7 @@ async def send_to_client_bot(
     if not CLIENT_BOT_TOKEN:
         return False, "CLIENT_BOT_TOKEN not configured"
     
-    bot = Bot(token=CLIENT_BOT_TOKEN)
+    bot = _make_telegram_bot(CLIENT_BOT_TOKEN)
     try:
         await bot.send_message(bot_tg_user_id, text)
         return True, None
