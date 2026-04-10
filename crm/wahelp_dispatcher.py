@@ -129,7 +129,7 @@ def set_missing_messenger_logger(callback: MissingMessengerLogger | None) -> Non
 class _PinnedTelegramResolver(AbstractResolver):
     def __init__(self, pinned_ip: str) -> None:
         self._pinned_ip = pinned_ip
-        self._default = DefaultResolver()
+        self._default: DefaultResolver | None = None
 
     async def resolve(
         self,
@@ -149,10 +149,13 @@ class _PinnedTelegramResolver(AbstractResolver):
                     "flags": socket.AI_NUMERICHOST,
                 }
             ]
+        if self._default is None:
+            self._default = DefaultResolver()
         return await self._default.resolve(host, port, family)
 
     async def close(self) -> None:
-        await self._default.close()
+        if self._default is not None:
+            await self._default.close()
 
 
 def _build_telegram_session() -> AiohttpSession:
