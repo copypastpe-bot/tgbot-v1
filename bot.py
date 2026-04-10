@@ -1,6 +1,7 @@
 import asyncio, os, re, logging, html, random, json
 import csv, io, calendar
 import socket
+import time as monotonic_time
 from decimal import Decimal, ROUND_DOWN
 from datetime import date, datetime, timezone, timedelta, time
 from pathlib import Path
@@ -198,6 +199,9 @@ TEXTS_BDAY_RANGE = os.getenv("TEXTS_BDAY_RANGE", "birthday!A:C")
 TEXTS_TG_LINK = os.getenv("TEXTS_TG_LINK", "")
 TELEGRAM_PROXY_URL = (os.getenv("TELEGRAM_PROXY_URL") or "").strip()
 TELEGRAM_API_IP = (os.getenv("TELEGRAM_API_IP") or "").strip()
+TELEGRAM_API_IPS_RAW = (os.getenv("TELEGRAM_API_IPS") or "").strip()
+TELEGRAM_IP_PROBE_TIMEOUT_SEC = float(os.getenv("TELEGRAM_IP_PROBE_TIMEOUT_SEC", "1.5") or "1.5")
+TELEGRAM_IP_RECHECK_SEC = float(os.getenv("TELEGRAM_IP_RECHECK_SEC", "30") or "30")
 
 # env rules
 MIN_CASH = Decimal(os.getenv("MIN_CASH", "2500"))
@@ -257,10 +261,85 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class _PinnedTelegramResolver(AbstractResolver):
-    def __init__(self, pinned_ip: str) -> None:
-        self._pinned_ip = pinned_ip
+def _parse_telegram_api_ips() -> list[str]:
+    raw: list[str] = []
+    if TELEGRAM_API_IP:
+        raw.append(TELEGRAM_API_IP)
+    if TELEGRAM_API_IPS_RAW:
+        raw.extend(part.strip() for part in re.split(r"[,\s;]+", TELEGRAM_API_IPS_RAW) if part.strip())
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for ip in raw:
+        if ip not in seen:
+            seen.add(ip)
+            ordered.append(ip)
+    return ordered
+
+
+TELEGRAM_API_IP_POOL = _parse_telegram_api_ips()
+
+
+class _TelegramIPFallbackResolver(AbstractResolver):
+    def __init__(self, ip_pool: list[str]) -> None:
+        self._ip_pool = ip_pool
         self._default: DefaultResolver | None = None
+        self._selected_ip: str | None = None
+        self._selected_until = 0.0
+        self._probe_lock = asyncio.Lock()
+
+    @staticmethod
+    def _record_for_ip(host: str, ip: str, port: int) -> dict[str, Any]:
+        return {
+            "hostname": host,
+            "host": ip,
+            "port": port,
+            "family": socket.AF_INET6 if ":" in ip else socket.AF_INET,
+            "proto": 0,
+            "flags": socket.AI_NUMERICHOST,
+        }
+
+    async def _can_connect(self, ip: str, port: int) -> bool:
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host=ip, port=port, family=family),
+                timeout=TELEGRAM_IP_PROBE_TIMEOUT_SEC,
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception:
+            return False
+
+    def _iter_probe_order(self) -> list[str]:
+        if not self._selected_ip or self._selected_ip not in self._ip_pool:
+            return list(self._ip_pool)
+        idx = self._ip_pool.index(self._selected_ip)
+        return self._ip_pool[idx + 1 :] + self._ip_pool[: idx + 1]
+
+    async def _pick_reachable_ip(self, port: int) -> str:
+        now = monotonic_time.monotonic()
+        if self._selected_ip and now < self._selected_until:
+            return self._selected_ip
+
+        async with self._probe_lock:
+            now = monotonic_time.monotonic()
+            if self._selected_ip and now < self._selected_until:
+                return self._selected_ip
+
+            for candidate in self._iter_probe_order():
+                if await self._can_connect(candidate, port):
+                    if candidate != self._selected_ip:
+                        logger.warning("Telegram API IP selected: %s", candidate)
+                    self._selected_ip = candidate
+                    self._selected_until = monotonic_time.monotonic() + max(5.0, TELEGRAM_IP_RECHECK_SEC)
+                    return candidate
+
+            fallback = self._selected_ip or self._ip_pool[0]
+            logger.warning("No reachable Telegram API IP detected, fallback to %s", fallback)
+            self._selected_ip = fallback
+            self._selected_until = monotonic_time.monotonic() + 5.0
+            return fallback
 
     async def resolve(
         self,
@@ -268,18 +347,10 @@ class _PinnedTelegramResolver(AbstractResolver):
         port: int = 0,
         family: int = socket.AF_UNSPEC,
     ) -> list[dict[str, Any]]:
-        if host == "api.telegram.org":
-            ip_family = socket.AF_INET6 if ":" in self._pinned_ip else socket.AF_INET
-            return [
-                {
-                    "hostname": host,
-                    "host": self._pinned_ip,
-                    "port": port,
-                    "family": ip_family,
-                    "proto": 0,
-                    "flags": socket.AI_NUMERICHOST,
-                }
-            ]
+        if host == "api.telegram.org" and self._ip_pool:
+            resolved_port = port or 443
+            selected = await self._pick_reachable_ip(resolved_port)
+            return [self._record_for_ip(host, selected, resolved_port)]
         if self._default is None:
             self._default = DefaultResolver()
         return await self._default.resolve(host, port, family)
@@ -291,9 +362,9 @@ class _PinnedTelegramResolver(AbstractResolver):
 
 def _build_telegram_session() -> AiohttpSession:
     session = AiohttpSession(proxy=TELEGRAM_PROXY_URL or None)
-    if TELEGRAM_API_IP:
-        session._connector_init["resolver"] = _PinnedTelegramResolver(TELEGRAM_API_IP)
-        session._connector_init["family"] = socket.AF_INET6 if ":" in TELEGRAM_API_IP else socket.AF_INET
+    if TELEGRAM_API_IP_POOL:
+        session._connector_init["resolver"] = _TelegramIPFallbackResolver(TELEGRAM_API_IP_POOL)
+        session._connector_init["ttl_dns_cache"] = 0
     return session
 
 
