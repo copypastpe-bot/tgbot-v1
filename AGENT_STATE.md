@@ -2,7 +2,7 @@
 
 project: tgbot-v1
 last_updated: 2026-04-13
-updated_by: agent1
+updated_by: codex
 status: active
 confidence: high
 
@@ -12,15 +12,15 @@ confidence: high
 
 ## Current State
 
-The project is described as fully working, with `bot.py` as the real runtime core. The repository has a large `bot.py` runtime, Postgres-oriented migrations under `app/migrations/`, notification modules under `notifications/`, Wahelp integration helpers under `crm/`, and operational scripts under `scripts/`. The next planned product direction is Google Calendar exchange, documented in `technical_task_google_calendar_integration.md`.
+The project is described as fully working, with `bot.py` as the real runtime core. The repository has a large `bot.py` runtime, Postgres-oriented migrations under `app/migrations/`, notification modules under `notifications/`, Wahelp integration helpers under `crm/`, and operational scripts under `scripts/`. A shared `service_heartbeats` table plus a periodic checker in `bot.py` now monitor the companion client Telegram bot and notify admins when its heartbeat or Telegram probe goes stale.
 
 ## Active Focus
 
-Prepare for Google Calendar integration while preserving the currently working admin, master, notification, payroll, and cashflow flows.
+Preserve current admin, master, notification, payroll, and cashflow flows while adding operational safety around the companion client bot and preparing future Google Calendar work.
 
 ## Known Risks
 
-- No active blocker is currently known.
+- The new alerting depends on both repos sharing the same Postgres database and both updated runtimes being deployed.
 - The repository is old and should still be reviewed for living code versus historical tail before broader changes.
 - Notification behavior depends on both code and `docs/notification_rules.json`.
 

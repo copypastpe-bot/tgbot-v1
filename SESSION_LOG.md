@@ -63,3 +63,35 @@ scope: Refined the project snapshot and instructions using direct user guidance 
 - `bot.py`
 
 ---
+### 2026-04-13 17:05 - Added client-bot heartbeat alerts to admin bot
+
+status: completed
+actor: codex
+scope: Added a narrow operational alert path so the admin bot reports when the companion client Telegram bot stops updating its heartbeat or loses Telegram API health.
+
+#### Changes
+
+- Added shared `service_heartbeats` schema bootstrap in `bot.py`.
+- Added a periodic `check_client_bot_health()` job with one-shot alert and recovery notifications to admins/log chat.
+- Added env knobs for the monitored service key, display name, check interval, and stale threshold in `.env.example`.
+- Coordinated the design with the companion `telegram-bot-client` repo so both runtimes use the same heartbeat contract.
+
+#### Verified
+
+- Read the live scheduling/bootstrap path in `bot.py` and attached the health check without touching order, payroll, or notification business flows.
+- Reviewed the resulting diff to confirm the patch stays local to runtime bootstrap and alerting.
+- Ran syntax validation via `compile(...)` on `bot.py`.
+
+#### Next Steps
+
+- Deploy both repos together so the client bot starts writing heartbeats before or alongside the admin-bot checker.
+- After deploy, confirm that `service_heartbeats` contains `telegram-bot-client` updates and that admins receive a recovery message if the checker had already opened an alert.
+
+#### References
+
+- `bot.py`
+- `.env.example`
+- `AGENT_STATE.md`
+- `../telegram-bot-client/bot.py`
+
+---

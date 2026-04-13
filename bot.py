@@ -202,6 +202,16 @@ TELEGRAM_API_IP = (os.getenv("TELEGRAM_API_IP") or "").strip()
 TELEGRAM_API_IPS_RAW = (os.getenv("TELEGRAM_API_IPS") or "").strip()
 TELEGRAM_IP_PROBE_TIMEOUT_SEC = float(os.getenv("TELEGRAM_IP_PROBE_TIMEOUT_SEC", "1.5") or "1.5")
 TELEGRAM_IP_RECHECK_SEC = float(os.getenv("TELEGRAM_IP_RECHECK_SEC", "30") or "30")
+CLIENT_BOT_HEALTH_SERVICE_KEY = (os.getenv("CLIENT_BOT_HEALTH_SERVICE_KEY") or "telegram-bot-client").strip()
+CLIENT_BOT_HEALTH_DISPLAY_NAME = (
+    os.getenv("CLIENT_BOT_HEALTH_DISPLAY_NAME") or "Клиентский Telegram бот"
+).strip()
+CLIENT_BOT_HEALTHCHECK_INTERVAL_SEC = int(
+    os.getenv("CLIENT_BOT_HEALTHCHECK_INTERVAL_SEC", "60") or "60"
+)
+CLIENT_BOT_HEALTH_MAX_AGE_SEC = int(
+    os.getenv("CLIENT_BOT_HEALTH_MAX_AGE_SEC", "300") or "300"
+)
 
 # env rules
 MIN_CASH = Decimal(os.getenv("MIN_CASH", "2500"))
@@ -469,6 +479,7 @@ leads_promo_task: asyncio.Task | None = None
 rewash_followup_task: asyncio.Task | None = None
 rewash_counter_task: asyncio.Task | None = None
 dead_channels_cleanup_task: asyncio.Task | None = None
+client_bot_health_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
 
 # === Ignore group/supergroup/channel updates; work only in private chats ===
@@ -647,6 +658,97 @@ async def ensure_daily_job_schema(conn: asyncpg.Connection) -> None:
             job_name text PRIMARY KEY,
             last_run timestamptz NOT NULL
         );
+        """
+    )
+
+
+async def ensure_service_heartbeat_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS service_heartbeats (
+            service_key text PRIMARY KEY,
+            display_name text NOT NULL,
+            status text NOT NULL DEFAULT 'starting',
+            last_seen_at timestamptz NOT NULL DEFAULT NOW(),
+            last_ok_at timestamptz,
+            last_error text,
+            alert_open boolean NOT NULL DEFAULT FALSE,
+            last_alerted_at timestamptz,
+            last_recovered_at timestamptz,
+            created_at timestamptz NOT NULL DEFAULT NOW(),
+            updated_at timestamptz NOT NULL DEFAULT NOW(),
+            CONSTRAINT service_heartbeats_status_check
+                CHECK (status IN ('starting', 'ok', 'error'))
+        );
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS display_name text;
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'starting';
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS last_seen_at timestamptz NOT NULL DEFAULT NOW();
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS last_ok_at timestamptz;
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS last_error text;
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS alert_open boolean NOT NULL DEFAULT FALSE;
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS last_alerted_at timestamptz;
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS last_recovered_at timestamptz;
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT NOW();
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE service_heartbeats
+        ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT NOW();
+        """
+    )
+    await conn.execute(
+        """
+        UPDATE service_heartbeats
+        SET display_name = COALESCE(NULLIF(display_name, ''), service_key),
+            updated_at = COALESCE(updated_at, NOW())
+        WHERE display_name IS NULL
+           OR display_name = '';
         """
     )
 
@@ -4738,6 +4840,136 @@ async def schedule_periodic_job(interval_seconds: int, job_coro, job_name: str) 
         except Exception as exc:  # noqa: BLE001
             logging.exception("Periodic job %s failed: %s", job_name, exc)
         await asyncio.sleep(interval_seconds)
+
+
+def _format_health_dt(value: datetime | None) -> str:
+    if value is None:
+        return "нет"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M:%S MSK")
+
+
+async def _send_client_bot_health_alert(text: str) -> None:
+    targets = set(ADMIN_TG_IDS)
+    if LOGS_CHAT_ID:
+        targets.add(LOGS_CHAT_ID)
+    for chat_id in targets:
+        try:
+            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send client bot health alert to %s: %s", chat_id, exc)
+
+
+async def check_client_bot_health() -> None:
+    if pool is None:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT service_key,
+                   display_name,
+                   status,
+                   last_seen_at,
+                   last_ok_at,
+                   last_error,
+                   alert_open
+            FROM service_heartbeats
+            WHERE service_key = $1
+            """,
+            CLIENT_BOT_HEALTH_SERVICE_KEY,
+        )
+
+        degraded_reason: str | None = None
+        display_name = CLIENT_BOT_HEALTH_DISPLAY_NAME
+
+        if row is None:
+            degraded_reason = "heartbeat не найден в БД"
+        else:
+            display_name = (row["display_name"] or CLIENT_BOT_HEALTH_DISPLAY_NAME).strip()
+            status = (row["status"] or "starting").strip()
+            last_seen_at = row["last_seen_at"]
+            last_ok_at = row["last_ok_at"]
+            last_error = (row["last_error"] or "").strip()
+
+            if last_seen_at and last_seen_at.tzinfo is None:
+                last_seen_at = last_seen_at.replace(tzinfo=timezone.utc)
+            if last_ok_at and last_ok_at.tzinfo is None:
+                last_ok_at = last_ok_at.replace(tzinfo=timezone.utc)
+
+            if status != "ok":
+                degraded_reason = f"status={html.escape(status)}"
+                if last_error:
+                    degraded_reason += f"; ошибка: {html.escape(last_error[:500])}"
+            elif last_seen_at is None:
+                degraded_reason = "нет last_seen_at"
+            else:
+                seen_age_sec = (now_utc - last_seen_at).total_seconds()
+                ok_age_sec = (now_utc - last_ok_at).total_seconds() if last_ok_at else None
+                if seen_age_sec > CLIENT_BOT_HEALTH_MAX_AGE_SEC:
+                    degraded_reason = (
+                        f"heartbeat устарел на {int(seen_age_sec)} сек "
+                        f"(порог {CLIENT_BOT_HEALTH_MAX_AGE_SEC} сек)"
+                    )
+                elif last_ok_at is None:
+                    degraded_reason = "ещё не было успешного Telegram health-check"
+                elif ok_age_sec is not None and ok_age_sec > CLIENT_BOT_HEALTH_MAX_AGE_SEC:
+                    degraded_reason = (
+                        f"успешный Telegram health-check устарел на {int(ok_age_sec)} сек "
+                        f"(порог {CLIENT_BOT_HEALTH_MAX_AGE_SEC} сек)"
+                    )
+
+        alert_open = bool(row["alert_open"]) if row is not None else False
+
+        if degraded_reason and not alert_open:
+            last_seen_at = row["last_seen_at"] if row is not None else None
+            last_ok_at = row["last_ok_at"] if row is not None else None
+            last_error = (row["last_error"] or "").strip() if row is not None and row["last_error"] else ""
+            lines = [
+                f"🚨 <b>{html.escape(display_name)} недоступен</b>",
+                f"Причина: {degraded_reason}",
+                f"Сервис: <code>{html.escape(CLIENT_BOT_HEALTH_SERVICE_KEY)}</code>",
+                f"Последний heartbeat: {_format_health_dt(last_seen_at)}",
+                f"Последний успешный Telegram check: {_format_health_dt(last_ok_at)}",
+            ]
+            if last_error:
+                lines.append(f"Последняя ошибка: <code>{html.escape(last_error[:500])}</code>")
+            await _send_client_bot_health_alert("\n".join(lines))
+            await conn.execute(
+                """
+                UPDATE service_heartbeats
+                SET alert_open = TRUE,
+                    last_alerted_at = NOW(),
+                    updated_at = NOW()
+                WHERE service_key = $1
+                """,
+                CLIENT_BOT_HEALTH_SERVICE_KEY,
+            )
+            logger.warning("Client bot health alert opened: %s", degraded_reason)
+        elif not degraded_reason and alert_open:
+            await _send_client_bot_health_alert(
+                "\n".join(
+                    [
+                        f"✅ <b>{html.escape(display_name)} снова отвечает</b>",
+                        f"Сервис: <code>{html.escape(CLIENT_BOT_HEALTH_SERVICE_KEY)}</code>",
+                        f"Heartbeat: {_format_health_dt(row['last_seen_at'])}",
+                        f"Telegram check: {_format_health_dt(row['last_ok_at'])}",
+                    ]
+                )
+            )
+            await conn.execute(
+                """
+                UPDATE service_heartbeats
+                SET alert_open = FALSE,
+                    last_recovered_at = NOW(),
+                    updated_at = NOW()
+                WHERE service_key = $1
+                """,
+                CLIENT_BOT_HEALTH_SERVICE_KEY,
+            )
+            logger.info("Client bot health recovered")
 
 
 async def clear_dead_channels_weekly() -> None:
@@ -12178,7 +12410,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     async with pool.acquire() as _conn:
@@ -12187,6 +12419,7 @@ async def main():
         await ensure_notification_schema(_conn)
         await ensure_promo_schema(_conn)
         await ensure_daily_job_schema(_conn)
+        await ensure_service_heartbeat_schema(_conn)
         await ensure_order_masters_schema(_conn)
         await ensure_orders_wire_schema(_conn)
         await ensure_cashbook_wire_schema(_conn)
@@ -12233,6 +12466,14 @@ async def main():
     if dead_channels_cleanup_task is None:
         dead_channels_cleanup_task = asyncio.create_task(
             schedule_periodic_job(7 * 24 * 3600, clear_dead_channels_weekly, "dead_channels_cleanup")
+        )
+    if client_bot_health_task is None:
+        client_bot_health_task = asyncio.create_task(
+            schedule_periodic_job(
+                CLIENT_BOT_HEALTHCHECK_INTERVAL_SEC,
+                check_client_bot_health,
+                "client_bot_health",
+            )
         )
     if notification_rules is not None:
         notification_worker = NotificationWorker(
