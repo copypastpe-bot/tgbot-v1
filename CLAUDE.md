@@ -38,12 +38,27 @@ Maintain the internal cleaning-company Telegram bot without destabilizing the cu
 - Record environment-sensitive changes clearly because webhook and token settings matter to runtime behavior.
 - This is an old repository: verify whether a directory is still live before editing it.
 
+## Git Hygiene
+
+- Run `git status --short` before editing, before committing, and before deploy.
+- Commit completed logical steps in small, focused commits.
+- Keep `bot.py` fixes, notification-rule changes, and operational script changes separated when possible.
+- Do not deploy from a dirty worktree.
+
+## Deploy Rules
+
+- Deploy only from committed and pushed state.
+- If the task affects prod runtime, verify the relevant runbook in `project.md`, `scripts/`, or other project docs before deployment.
+- If no trusted deploy sequence is documented for the task, stop and document that gap instead of guessing.
+
 ## End Of Session Requirements
 
 Before ending the session:
-1. rewrite `AGENT_STATE.md` to reflect current state;
-2. append one new entry to `SESSION_LOG.md`;
-3. keep both files short, factual, and agent-readable.
+1. run `git status --short`;
+2. commit completed work in one or more small logical commits;
+3. rewrite `AGENT_STATE.md` to reflect current state;
+4. append one new entry to `SESSION_LOG.md`;
+5. keep both files short, factual, and agent-readable.
 
 ## Current Focus
 
