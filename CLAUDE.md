@@ -50,6 +50,9 @@ Maintain the internal cleaning-company Telegram bot without destabilizing the cu
 - Deploy only from committed and pushed state.
 - If the task affects prod runtime, verify the relevant runbook in `project.md`, `scripts/`, or other project docs before deployment.
 - If no trusted deploy sequence is documented for the task, stop and document that gap instead of guessing.
+- Assume the path is `local -> git -> VPS` unless project docs say otherwise.
+- Do not search for passwords, invent credentials, or guess how to get onto the server.
+- If SSH works but `sudo` or another privileged step is unavailable, stop and ask the user.
 
 ## End Of Session Requirements
 
