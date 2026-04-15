@@ -95,3 +95,36 @@ scope: Added a narrow operational alert path so the admin bot reports when the c
 - `../telegram-bot-client/bot.py`
 
 ---
+### 2026-04-15 14:20 - Restored broken prod backups and tracked operational scripts
+
+status: completed
+actor: codex
+scope: Investigated why Telegram bot backups stopped after 2026-04-10, restored the missing production backup script, and fixed the repository so future deploys keep the operational scripts.
+
+#### Changes
+
+- Diagnosed prod cron backup failures on `admin@91.200.150.68` and confirmed `/opt/telegram-bot/scripts/backup_telegram_bot.sh` was missing from the server.
+- Restored the backup script on prod, ran a manual backup successfully, and confirmed fresh local plus offsite copies were created.
+- Added `scripts/backup_telegram_bot.sh` and `scripts/reset_and_restart_bot.sh` to tracked repo state so deploys do not silently remove them again.
+- Refreshed `AGENT_STATE.md` with the operational-script tracking requirement.
+
+#### Verified
+
+- Confirmed cron still calls `/opt/telegram-bot/scripts/backup_telegram_bot.sh` at `03:40`.
+- Verified the recovered run created `tgbot_db_2026-04-15_14-07-22.sql.gz` and `tgbot_config_2026-04-15_14-07-22.tar.gz` under `/opt/telegram-bot/backups/`.
+- Verified matching offsite copies appeared under `/home/deploy/backups/telegram-bot/` on `crm-offsite-backup`.
+- Re-checked local git state before staging the scripts.
+
+#### Next Steps
+
+- Commit and deploy the newly tracked operational scripts from clean git state.
+- After the next normal cron window, confirm the scheduled `03:40` backup succeeds without manual intervention.
+
+#### References
+
+- `scripts/backup_telegram_bot.sh`
+- `scripts/reset_and_restart_bot.sh`
+- `AGENT_STATE.md`
+- `project.md`
+
+---
