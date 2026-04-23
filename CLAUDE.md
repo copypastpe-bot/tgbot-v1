@@ -58,6 +58,14 @@ Read and update only these registered files:
 - Record environment-sensitive changes clearly because webhook and token settings matter to runtime behavior.
 - This is an old repository: verify whether a directory is still live before editing it.
 
+## Skill Usage
+
+- Do not load or invoke Superpowers or other optional skills automatically at session start.
+- Before using any Superpowers skill, ask the user for permission and name the exact skill plus the reason.
+- For routine tasks such as checking databases, reading logs, inspecting git status, reviewing files, or running documented deploy/diagnostic commands, use project docs and direct commands first; do not read skills unless the user approves.
+- If the user explicitly asks to use a skill or plugin, use only the minimum relevant skill files and state that you are doing so.
+- If higher-priority runtime instructions force a skill lookup, keep it minimal and continue without broad skill exploration.
+
 ## Git Hygiene
 
 - Run `git status --short` before editing, before committing, and before deploy.
