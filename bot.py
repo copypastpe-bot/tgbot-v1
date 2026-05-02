@@ -5269,46 +5269,18 @@ async def _record_order_income(
 ):
     norm = norm_pay_method_py(method)
     comment = f"Поступление по заказу #{order_id}"
-    existing = await conn.fetchrow(
+    tx = await conn.fetchrow(
         """
-        SELECT id
-        FROM cashbook_entries
-        WHERE order_id = $1 AND kind = 'income'
-        ORDER BY id DESC
-        LIMIT 1
+        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
+        VALUES ('income', $1, $2, $3, $4, $5, now())
+        RETURNING id, happened_at
         """,
+        norm,
+        amount,
+        comment,
         order_id,
+        master_id,
     )
-    if existing:
-        tx = await conn.fetchrow(
-            """
-            UPDATE cashbook_entries
-            SET method=$1,
-                amount=$2,
-                comment=$3,
-                master_id=$4
-            WHERE id=$5
-            RETURNING id, happened_at
-            """,
-            norm,
-            amount,
-            comment,
-            master_id,
-            existing["id"],
-        )
-    else:
-        tx = await conn.fetchrow(
-            """
-            INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-            VALUES ('income', $1, $2, $3, $4, $5, now())
-            RETURNING id, happened_at
-            """,
-            norm,
-            amount,
-            comment,
-            order_id,
-            master_id,
-        )
     display = comment
     if notify_label:
         display = f"{notify_label} / Заказ №{order_id}"
