@@ -82,14 +82,27 @@ Read and update only these registered files:
 - Do not search for passwords, invent credentials, or guess how to get onto the server.
 - If SSH works but `sudo` or another privileged step is unavailable, stop and ask the user.
 
+## Context File Rules
+
+### AGENT_STATE.md
+- Rewrite fully at each session close. Maximum 60 lines.
+- Allowed: project/status header, Purpose, Current State (branch + HEAD + deploy status), Pending, Known Limitations.
+- Forbidden: Verified sections with commands or outputs, deploy receipts, local machine tooling unrelated to this project.
+
+### SESSION_LOG.md
+- Add entries at the top (newest first). Keep the last 10 entries.
+- Move entries beyond 10 to `SESSION_LOG_archive.md` in the same directory (append, never delete).
+- Each entry: maximum 25 lines — date/title, status, scope, key changes (bullets), deploy SHA if applicable, notes.
+- Forbidden: command outputs, curl responses, container statuses, full test or docker output.
+
 ## End Of Session Requirements
 
 Before ending the session:
 1. run `git status --short`;
 2. commit completed work in one or more small logical commits;
 3. rewrite /Users/evgenijpastusenko/Projects/agent1/project_ai_context/tgbot-v1/AGENT_STATE.md to reflect current state;
-4. append one new entry to /Users/evgenijpastusenko/Projects/agent1/project_ai_context/tgbot-v1/SESSION_LOG.md;
-5. keep both files short, factual, and agent-readable.
+4. add one new entry at the top of /Users/evgenijpastusenko/Projects/agent1/project_ai_context/tgbot-v1/SESSION_LOG.md;
+5. apply Context File Rules above to both files.
 
 ## Current Focus
 
