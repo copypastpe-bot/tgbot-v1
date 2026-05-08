@@ -5259,6 +5259,25 @@ async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: st
     return tx
 
 
+async def _notify_order_income(
+    conn: asyncpg.Connection,
+    total_amount: Decimal,
+    order_id: int,
+    notify_label: str | None = None,
+) -> None:
+    display = f"Поступление по заказу #{order_id}"
+    if notify_label:
+        display = f"{notify_label} / Заказ №{order_id}"
+    try:
+        if MONEY_FLOW_CHAT_ID:
+            balance = await get_cash_balance_excluding_withdrawals(conn)
+            line1 = f"✅-{format_money(Decimal(total_amount))}₽ {display}"
+            line2 = f"Касса - {format_money(balance)}₽"
+            await bot.send_message(MONEY_FLOW_CHAT_ID, line1 + "\n" + line2)
+    except Exception as _e:
+        logging.warning("money-flow order income notify failed: %s", _e)
+
+
 async def _record_order_income(
     conn: asyncpg.Connection,
     method: str,
@@ -5281,18 +5300,6 @@ async def _record_order_income(
         order_id,
         master_id,
     )
-    display = comment
-    if notify_label:
-        display = f"{notify_label} / Заказ №{order_id}"
-    # notify money-flow chat
-    try:
-        if MONEY_FLOW_CHAT_ID:
-            balance = await get_cash_balance_excluding_withdrawals(conn)
-            line1 = f"✅-{format_money(Decimal(amount))}₽ {display}"
-            line2 = f"Касса - {format_money(balance)}₽"
-            await bot.send_message(MONEY_FLOW_CHAT_ID, line1 + "\n" + line2)
-    except Exception as _e:
-        logging.warning("money-flow order income notify failed: %s", _e)
     if tx and tx.get("id"):
         try:
             if norm == "Карта Женя":
@@ -5300,7 +5307,7 @@ async def _record_order_income(
                     conn,
                     kind="income",
                     amount=amount,
-                    comment=display if notify_label else comment,
+                    comment=(f"{notify_label} / Заказ №{order_id}" if notify_label else comment),
                     created_by=None,
                     happened_at=tx["happened_at"],
                     cash_entry_id=tx["id"],
@@ -8663,32 +8670,17 @@ async def db_apply_cash_trigger(msg: Message):
         CREATE INDEX IF NOT EXISTS ix_cashbook_master ON cashbook_entries(master_id);
       END IF;
     END$$;
-
-    CREATE OR REPLACE FUNCTION orders_to_cashbook_ai()
-    RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-    BEGIN
-      IF NEW.payment_method = 'Подарочный сертификат' THEN
-        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-        VALUES ('income', NEW.payment_method, 0, 'Поступление по заказу (сертификат)', NEW.id, NEW.master_id, NEW.created_at);
-        RETURN NEW;
-      END IF;
-
-      INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-      VALUES ('income', NEW.payment_method, COALESCE(NEW.amount_cash,0), 'Поступление по заказу', NEW.id, NEW.master_id, NEW.created_at);
-      RETURN NEW;
-    END$$;
-
     DROP TRIGGER IF EXISTS trg_orders_to_cashbook ON orders;
-    CREATE TRIGGER trg_orders_to_cashbook
-    AFTER INSERT ON orders
-    FOR EACH ROW
-    EXECUTE FUNCTION orders_to_cashbook_ai();
+    DROP TRIGGER IF EXISTS orders_to_cashbook_ai ON orders;
+    DROP FUNCTION IF EXISTS public.orders_to_cashbook_ai();
+    DROP FUNCTION IF EXISTS public.trg_order_to_cashbook();
     """
     async with pool.acquire() as conn:
         await conn.execute(sql)
-    await msg.answer("✅ Колонка master_id, функция и триггер `orders_to_cashbook_ai` обновлены.")
+    await msg.answer(
+        "✅ Legacy cash trigger on `orders` disabled. "
+        "Order cashbook rows must now be created by the bot runtime only."
+    )
 # ===== Admin: WIPE TEST DATA =====
 @dp.message(Command("wipe_test_data"))
 async def wipe_test_data(msg: Message):
@@ -11972,6 +11964,13 @@ async def commit_order(msg: Message, state: FSMContext):
                         int(effective_master_id),
                         notify_label,
                     )
+                total_non_wire_amount = sum((income_amount for _, income_amount in non_wire_entries), Decimal("0"))
+                await _notify_order_income(
+                    conn,
+                    total_non_wire_amount,
+                    order_id,
+                    notify_label,
+                )
             await _enqueue_order_completed_notification(
                 conn,
                 order_id=order_id,
