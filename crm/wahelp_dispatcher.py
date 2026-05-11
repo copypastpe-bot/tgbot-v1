@@ -43,6 +43,12 @@ MAX_CHANNEL_ENABLED = (os.getenv("WAHELP_CLIENTS_MAX_ENABLED", "1") or "").strip
     "yes",
     "on",
 }
+MAX_PROMO_ENABLED = (os.getenv("WAHELP_CLIENTS_MAX_PROMO_ENABLED", "1") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 CHANNEL_ORDER: list[ChannelKind] = [WHATSAPP_CHANNEL, TELEGRAM_CHANNEL]
 if MAX_CHANNEL_ENABLED:
     CHANNEL_ORDER.append(MAX_CHANNEL)
@@ -81,6 +87,10 @@ SERVICE_WA_FOOTER_KEYS = {
     "order_rating_response_mid_client",
     "order_rating_response_low_client",
 }
+PROMO_EVENT_PREFIXES = (
+    "promo_reengage_",
+    "birthday_congrats_",
+)
 
 
 @dataclass
@@ -118,6 +128,22 @@ class ChannelAttempt:
     channel: ChannelKind
     address_kind: Literal["user_id", "phone"] = "phone"
     user_id: int | None = None
+
+
+def is_promo_event(event_key: str | None) -> bool:
+    if not event_key:
+        return False
+    return any(event_key.startswith(prefix) for prefix in PROMO_EVENT_PREFIXES)
+
+
+def is_channel_allowed_for_event(channel: ChannelKind, event_key: str | None) -> bool:
+    if channel != MAX_CHANNEL:
+        return True
+    if not MAX_CHANNEL_ENABLED:
+        return False
+    if is_promo_event(event_key) and not MAX_PROMO_ENABLED:
+        return False
+    return True
 
 
 MissingMessengerLogger = Callable[[ClientContact, ChannelKind, str], Awaitable[None]]
@@ -425,10 +451,10 @@ async def send_with_rules(
 
     # Новая логика через client_channels
     if contact.recipient_kind == "client":
-        attempts = await _build_channel_sequence_v2(conn, contact)
+        attempts = await _build_channel_sequence_v2(conn, contact, event_key=event_key)
     else:
         dead_channels = await _get_dead_channels(conn, contact)
-        attempts = _build_channel_sequence(contact, dead_channels)
+        attempts = _build_channel_sequence(contact, dead_channels, event_key=event_key)
     last_error: Exception | None = None
     last_channel: ChannelKind | None = None
     failed_channels: list[ChannelKind] = []
@@ -483,6 +509,8 @@ async def send_via_channel(
     if contact.requires_connection:
         raise WahelpAPIError(0, "Contact requires Wahelp connection", None)
     await _enforce_daily_limit(conn)
+    if not is_channel_allowed_for_event(channel, event_key):
+        raise WahelpAPIError(0, f"Channel {channel} disabled for event {event_key or '-'}", None)
     if contact.recipient_kind == "client":
         if await _is_channel_dead(conn, contact.client_id, channel):
             raise WahelpAPIError(0, f"Channel {channel} is marked as dead", None)
@@ -523,7 +551,12 @@ async def send_via_channel(
         raise
 
 
-def _build_channel_sequence(contact: ClientContact, dead_channels: set[ChannelKind]) -> Sequence[ChannelAttempt]:
+def _build_channel_sequence(
+    contact: ClientContact,
+    dead_channels: set[ChannelKind],
+    *,
+    event_key: str | None = None,
+) -> Sequence[ChannelAttempt]:
     if contact.recipient_kind == "lead":
         return _build_lead_sequence(contact)
     attempts: list[ChannelAttempt] = []
@@ -537,9 +570,13 @@ def _build_channel_sequence(contact: ClientContact, dead_channels: set[ChannelKi
         attempts.append(ChannelAttempt(channel=WHATSAPP_CHANNEL, address_kind="user_id", user_id=contact.wa_user_id))
     if contact.tg_user_id and (preferred != TELEGRAM_CHANNEL) and TELEGRAM_CHANNEL not in dead_channels:
         attempts.append(ChannelAttempt(channel=TELEGRAM_CHANNEL, address_kind="user_id", user_id=contact.tg_user_id))
-    if MAX_CHANNEL_ENABLED and contact.max_user_id and MAX_CHANNEL not in dead_channels:
+    if (
+        contact.max_user_id
+        and MAX_CHANNEL not in dead_channels
+        and is_channel_allowed_for_event(MAX_CHANNEL, event_key)
+    ):
         attempts.append(ChannelAttempt(channel=MAX_CHANNEL, address_kind="user_id", user_id=contact.max_user_id))
-    attempts.extend(_build_client_phone_attempts(contact, dead_channels))
+    attempts.extend(_build_client_phone_attempts(contact, dead_channels, event_key=event_key))
     return tuple(_deduplicate_attempts(attempts))
 
 
@@ -551,14 +588,23 @@ def _build_lead_sequence(contact: ClientContact) -> Sequence[ChannelAttempt]:
     return tuple(_deduplicate_attempts(attempts))
 
 
-def _build_client_phone_attempts(contact: ClientContact, dead_channels: set[ChannelKind]) -> list[ChannelAttempt]:
+def _build_client_phone_attempts(
+    contact: ClientContact,
+    dead_channels: set[ChannelKind],
+    *,
+    event_key: str | None = None,
+) -> list[ChannelAttempt]:
     """
     Строит последовательность попыток отправки по телефону.
     Приоритет: WA -> TG -> MAX
     """
     order: Sequence[ChannelKind]
     preferred = contact.preferred_channel
-    max_tail: tuple[ChannelKind, ...] = (MAX_CHANNEL,) if MAX_CHANNEL_ENABLED else ()
+    max_tail: tuple[ChannelKind, ...] = (
+        (MAX_CHANNEL,)
+        if is_channel_allowed_for_event(MAX_CHANNEL, event_key)
+        else ()
+    )
     if preferred == TELEGRAM_CHANNEL:
         order = (TELEGRAM_CHANNEL, WHATSAPP_CHANNEL, *max_tail)
     elif preferred == WHATSAPP_CHANNEL:
@@ -777,9 +823,15 @@ def _pick_priority_channel(rows: dict[ChannelKind, Mapping[str, Any]]) -> Channe
     return candidates[0][1]
 
 
-def _available_empty_channels(rows: dict[ChannelKind, Mapping[str, Any]]) -> list[ChannelKind]:
+def _available_empty_channels(
+    rows: dict[ChannelKind, Mapping[str, Any]],
+    *,
+    event_key: str | None = None,
+) -> list[ChannelKind]:
     available: list[ChannelKind] = []
     for channel in CHANNEL_ORDER:
+        if not is_channel_allowed_for_event(channel, event_key):
+            continue
         row = rows.get(channel)
         if not row:
             available.append(channel)
@@ -793,10 +845,14 @@ def _available_empty_channels(rows: dict[ChannelKind, Mapping[str, Any]]) -> lis
 async def _build_channel_sequence_v2(
     conn: asyncpg.Connection,
     contact: ClientContact,
+    *,
+    event_key: str | None = None,
 ) -> Sequence[ChannelAttempt]:
     rows = await _fetch_client_channel_rows(conn, contact.client_id, contact.phone)
     attempts: list[ChannelAttempt] = []
     priority_channel = _pick_priority_channel(rows)
+    if priority_channel and not is_channel_allowed_for_event(priority_channel, event_key):
+        priority_channel = None
     if priority_channel:
         row = rows.get(priority_channel)
         user_id = row.get("wahelp_user_id") if row else None
@@ -804,7 +860,7 @@ async def _build_channel_sequence_v2(
             attempts.append(ChannelAttempt(channel=priority_channel, address_kind="user_id", user_id=user_id))
         else:
             attempts.append(ChannelAttempt(channel=priority_channel, address_kind="phone"))
-    empties = _available_empty_channels(rows)
+    empties = _available_empty_channels(rows, event_key=event_key)
     for channel in empties:
         if channel == priority_channel:
             continue

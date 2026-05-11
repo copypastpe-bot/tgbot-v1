@@ -140,6 +140,7 @@ from crm import (
     ClientContact,
     DailySendLimitReached,
     WahelpAPIError,
+    is_channel_allowed_for_event,
     send_via_channel,
     send_with_rules,
     set_missing_messenger_logger,
@@ -4243,7 +4244,7 @@ async def retry_pending_sent_messages() -> None:
                     )
                     status_map = {r["channel"]: (r["status"], r["wahelp_user_id"]) for r in ch_rows}
                     channel_order = [("wa", "clients_wa"), ("tg", "clients_tg")]
-                    if WAHELP_CLIENTS_MAX_ENABLED:
+                    if WAHELP_CLIENTS_MAX_ENABLED and is_channel_allowed_for_event("clients_max", row["event_key"]):
                         channel_order.append(("max", "clients_max"))
                     candidate_channels = []
                     for key, ch in channel_order:
