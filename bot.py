@@ -135,6 +135,7 @@ from notifications import (
     load_notification_rules,
     start_wahelp_webhook,
 )
+from notifications.amocrm import format_amocrm_admin_alert, normalize_amocrm_payload
 from crm import (
     ChannelKind,
     ClientContact,
@@ -175,6 +176,8 @@ WAHELP_WEBHOOK_HOST = os.getenv("WAHELP_WEBHOOK_HOST", "0.0.0.0")
 WAHELP_WEBHOOK_PORT = int(os.getenv("WAHELP_WEBHOOK_PORT", "0") or "0")
 WAHELP_WEBHOOK_TOKEN = os.getenv("WAHELP_WEBHOOK_TOKEN")
 ONLINEPBX_WEBHOOK_TOKEN = os.getenv("ONLINEPBX_WEBHOOK_TOKEN")
+AMOCRM_WEBHOOK_TOKEN = os.getenv("AMOCRM_WEBHOOK_TOKEN")
+AMOCRM_ACCOUNT_DOMAIN = (os.getenv("AMOCRM_ACCOUNT_DOMAIN") or "").strip()
 ONLINEPBX_ALLOWED_IPS = {
     ip.strip()
     for ip in re.split(r"[ ,;]+", os.getenv("ONLINEPBX_ALLOWED_IPS", "").strip())
@@ -906,6 +909,36 @@ async def ensure_onlinepbx_schema(conn: asyncpg.Connection) -> None:
     )
 
 
+async def ensure_amocrm_webhook_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS amocrm_webhook_events (
+            id              bigserial PRIMARY KEY,
+            event_type      text NOT NULL,
+            entity_kind     text,
+            entity_id       text,
+            payload         jsonb NOT NULL,
+            handled         boolean NOT NULL DEFAULT false,
+            error           text,
+            received_at     timestamptz NOT NULL DEFAULT NOW(),
+            notified_at     timestamptz
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_amocrm_webhook_events_received
+        ON amocrm_webhook_events(received_at DESC);
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_amocrm_webhook_events_type
+        ON amocrm_webhook_events(event_type, received_at DESC);
+        """
+    )
+
+
 def _to_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -1156,6 +1189,74 @@ async def handle_onlinepbx_inbound(payload: Mapping[str, Any]) -> bool:
             WHERE id = $1 AND status = 'pending'
             """,
             request_id,
+        )
+    return True
+
+
+async def handle_amocrm_webhook(payload: Mapping[str, Any]) -> bool:
+    if pool is None:
+        return False
+
+    event = normalize_amocrm_payload(payload)
+    payload_json = json.dumps(event.payload, ensure_ascii=False)
+    initial_error = None if event.is_supported else "unsupported event"
+    async with pool.acquire() as conn:
+        event_id = await conn.fetchval(
+            """
+            INSERT INTO amocrm_webhook_events (
+                event_type, entity_kind, entity_id, payload, handled, error
+            )
+            VALUES ($1, $2, $3, $4::jsonb, false, $5)
+            RETURNING id
+            """,
+            event.event_type,
+            event.entity_kind,
+            event.entity_id,
+            payload_json,
+            initial_error,
+        )
+
+    if not event.is_supported:
+        return True
+
+    if not ADMIN_TG_IDS:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE amocrm_webhook_events
+                SET error = 'ADMIN_TG_IDS is empty'
+                WHERE id = $1
+                """,
+                event_id,
+            )
+        return True
+
+    text = format_amocrm_admin_alert(event, account_domain=AMOCRM_ACCOUNT_DOMAIN)
+    sent_count = 0
+    errors: list[str] = []
+    for admin_id in ADMIN_TG_IDS:
+        try:
+            await bot.send_message(admin_id, text, disable_web_page_preview=True)
+            sent_count += 1
+        except Exception as exc:  # noqa: BLE001
+            err = f"{admin_id}: {exc}"
+            errors.append(err)
+            logger.warning("Failed to notify admin %s about amoCRM event %s: %s", admin_id, event_id, exc)
+
+    handled = sent_count > 0
+    error_text = "; ".join(errors) if errors else None
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE amocrm_webhook_events
+            SET handled = $2,
+                error = $3,
+                notified_at = CASE WHEN $2 THEN NOW() ELSE notified_at END
+            WHERE id = $1
+            """,
+            event_id,
+            handled,
+            error_text,
         )
     return True
 
@@ -12400,6 +12501,7 @@ async def main():
         await ensure_jenya_card_schema(_conn)
         await ensure_client_channels_schema(_conn)
         await ensure_onlinepbx_schema(_conn)
+        await ensure_amocrm_webhook_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
         daily_reports_task = asyncio.create_task(
@@ -12468,6 +12570,8 @@ async def main():
                 onlinepbx_token=ONLINEPBX_WEBHOOK_TOKEN,
                 onlinepbx_allowed_ips=ONLINEPBX_ALLOWED_IPS,
                 onlinepbx_handler=handle_onlinepbx_inbound,
+                amocrm_token=AMOCRM_WEBHOOK_TOKEN,
+                amocrm_handler=handle_amocrm_webhook,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to start Wahelp webhook server: %s", exc)
