@@ -49,6 +49,7 @@ The handler must:
 
 - accept `application/x-www-form-urlencoded`, matching amoCRM webhook delivery;
 - optionally accept JSON only for local diagnostics and tests;
+- fail closed with `503` when `AMOCRM_WEBHOOK_TOKEN` is not configured;
 - verify the token from `?token=` or header `X-Amocrm-Token`;
 - return `401` for invalid token;
 - return `400` for malformed payload;
@@ -128,7 +129,7 @@ AMOCRM_WEBHOOK_TOKEN=your_amocrm_webhook_token
 AMOCRM_ACCOUNT_DOMAIN=yourcompany.amocrm.ru
 ```
 
-The webhook route may exist when `AMOCRM_WEBHOOK_TOKEN` is unset, but production deploy must set the token before registering the URL in amoCRM.
+The webhook route may exist when `AMOCRM_WEBHOOK_TOKEN` is unset, but it must return `503 amocrm_disabled`. Production deploy must set the token before registering the URL in amoCRM.
 
 ## nginx
 

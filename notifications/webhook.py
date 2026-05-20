@@ -142,10 +142,11 @@ class WahelpWebhookServer:
         return web.json_response({"ok": True, "handled": custom_handled})
 
     async def _handle_amocrm(self, request: web.Request) -> web.Response:
-        if self.amocrm_token:
-            provided = request.headers.get("X-Amocrm-Token") or request.rel_url.query.get("token")
-            if provided != self.amocrm_token:
-                return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        if not self.amocrm_token:
+            return web.json_response({"ok": False, "error": "amocrm_disabled"}, status=503)
+        provided = request.headers.get("X-Amocrm-Token") or request.rel_url.query.get("token")
+        if provided != self.amocrm_token:
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
 
         try:
             if "application/json" in (request.content_type or ""):

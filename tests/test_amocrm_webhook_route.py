@@ -23,6 +23,29 @@ class FakeRequest:
 
 
 class AmoCRMWebhookRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_when_amocrm_token_is_not_configured(self):
+        seen = []
+
+        async def handler(payload):
+            seen.append(payload)
+            return True
+
+        server = WahelpWebhookServer(
+            pool=None,
+            amocrm_token=None,
+            amocrm_handler=handler,
+        )
+
+        resp = await server._handle_amocrm(
+            FakeRequest(
+                query={"token": "anything"},
+                form={"leads[add][0][id]": "123"},
+            )
+        )
+
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(seen, [])
+
     async def test_rejects_invalid_amocrm_token(self):
         seen = []
 
