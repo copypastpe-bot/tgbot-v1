@@ -54,3 +54,44 @@ def format_dividend_alert(
         f"Получатель: {recipient}\n"
         f"Остаток кассы клининга: {_money(balance_after)}₽"
     )
+
+
+def format_cash_op_alert(
+    *,
+    op_label: str,           # 'Приход', 'Расход', 'Изъятие'
+    bucket: str,             # метод/категория
+    amount: Decimal,
+    comment: str | None,
+    balance_after: Decimal,
+) -> str:
+    lines = [
+        f"📒 Касса клининга: {op_label}",
+        f"{bucket}: {_money(amount)}₽",
+    ]
+    if comment:
+        lines.append(f"Комментарий: {comment}")
+    lines.append(f"Остаток: {_money(balance_after)}₽")
+    return "\n".join(lines)
+
+
+def format_cancel_order_alert(
+    *,
+    order_id: int,
+    address: str,
+    total_amount: Decimal,
+    bonuses_used: int,
+    bonuses_earned: int,
+    cashbook_rows_deleted: int,
+    balance_after: Decimal,
+) -> str:
+    return "\n".join(
+        [
+            f"↩️ Отменён заказ уборки #{order_id}",
+            f"Адрес: {address}",
+            f"Сумма чека была: {_money(total_amount)}₽",
+            f"Откатано строк кассы: {cashbook_rows_deleted}",
+            f"Возвращено бонусов клиенту: {bonuses_used}",
+            f"Снято начисленных бонусов: {bonuses_earned}",
+            f"Касса клининга: {_money(balance_after)}₽",
+        ]
+    )

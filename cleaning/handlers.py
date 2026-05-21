@@ -13,11 +13,17 @@ from decimal import Decimal
 
 import asyncpg
 from aiogram import F, Router
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from .access import is_cleaning_foreman
+from .admin_ops import (
+    add_cash_expense,
+    add_cash_income,
+    add_cash_withdrawal,
+    cancel_order,
+)
 from .cashbook import (
     get_cleaning_balance,
     record_dividend,
@@ -32,8 +38,20 @@ from .constants import (
     CLEANING_PAYMENT_METHODS,
     ZERO,
 )
-from .format import format_dividend_alert, format_order_provided_alert
-from .fsm import CleaningDividendFSM, CleaningOrderFSM
+from .format import (
+    format_cancel_order_alert,
+    format_cash_op_alert,
+    format_dividend_alert,
+    format_order_provided_alert,
+)
+from .fsm import (
+    CleaningCancelOrderFSM,
+    CleaningCashAddFSM,
+    CleaningCashExpenseFSM,
+    CleaningCashWithdrawalFSM,
+    CleaningDividendFSM,
+    CleaningOrderFSM,
+)
 from .notify import send_cleaning_money_flow
 from .orders import (
     PaymentPart,
@@ -139,7 +157,15 @@ async def start_cleaning_order(msg: Message, state: FSMContext, **data) -> None:
 
 
 @router.message(
-    StateFilter(CleaningOrderFSM, CleaningDividendFSM), F.text == "Отмена"
+    StateFilter(
+        CleaningOrderFSM,
+        CleaningDividendFSM,
+        CleaningCashAddFSM,
+        CleaningCashExpenseFSM,
+        CleaningCashWithdrawalFSM,
+        CleaningCancelOrderFSM,
+    ),
+    F.text == "Отмена",
 )
 async def cancel(msg: Message, state: FSMContext) -> None:
     await state.clear()
@@ -610,4 +636,292 @@ async def div_provesti(msg: Message, state: FSMContext, **kw) -> None:
         f"DIV проведён. Касса клининга: {_money_str(balance_after)}₽",
         reply_markup=ReplyKeyboardRemove(),
     )
+    await state.clear()
+
+
+# ---------- /cleaning_cash_add (manual income / deposit) ----------
+
+
+@router.message(Command("cleaning_cash_add"))
+async def start_cash_add(msg: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(CleaningCashAddFSM.method)
+    await msg.answer(
+        "Ручной приход в кассу клининга.\nВыберите метод:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=m) for m in CLEANING_PAYMENT_METHODS],
+                [KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+        ),
+    )
+
+
+@router.message(CleaningCashAddFSM.method, F.text)
+async def cash_add_method(msg: Message, state: FSMContext) -> None:
+    if msg.text not in CLEANING_PAYMENT_METHODS:
+        await msg.answer("Выберите метод кнопкой.", reply_markup=cancel_kb)
+        return
+    await state.update_data(method=msg.text)
+    await state.set_state(CleaningCashAddFSM.amount)
+    await msg.answer("Сумма (руб):", reply_markup=cancel_kb)
+
+
+@router.message(CleaningCashAddFSM.amount, F.text)
+async def cash_add_amount(msg: Message, state: FSMContext) -> None:
+    amount = parse_amount(msg.text)
+    if amount is None or amount <= 0:
+        await msg.answer("Нужно число > 0.", reply_markup=cancel_kb)
+        return
+    await state.update_data(amount=str(amount))
+    await state.set_state(CleaningCashAddFSM.comment)
+    await msg.answer("Комментарий (или «-»):", reply_markup=cancel_kb)
+
+
+@router.message(CleaningCashAddFSM.comment, F.text)
+async def cash_add_comment(msg: Message, state: FSMContext) -> None:
+    comment = msg.text.strip()
+    if comment == "-":
+        comment = ""
+    await state.update_data(comment=comment)
+    data = await state.get_data()
+    await state.set_state(CleaningCashAddFSM.confirm)
+    await msg.answer(
+        f"Подтвердите приход: {data['method']} {_money_str(Decimal(data['amount']))}₽"
+        + (f"\nКомментарий: {comment}" if comment else ""),
+        reply_markup=_confirm_kb(),
+    )
+
+
+@router.message(CleaningCashAddFSM.confirm, F.text == "Провести")
+async def cash_add_provesti(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    bot = kw["bot"]
+    data = await state.get_data()
+    amount = Decimal(data["amount"])
+    method = data["method"]
+    comment = data.get("comment") or None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await add_cash_income(conn, method=method, amount=amount, comment=comment)
+            balance_after = await get_cleaning_balance(conn)
+    await send_cleaning_money_flow(
+        bot,
+        format_cash_op_alert(
+            op_label="Приход",
+            bucket=method,
+            amount=amount,
+            comment=comment,
+            balance_after=balance_after,
+        ),
+    )
+    await msg.answer(
+        f"Приход зачислен. Касса: {_money_str(balance_after)}₽",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.clear()
+
+
+# ---------- /cleaning_cash_expense (manual expense) ----------
+
+
+@router.message(Command("cleaning_cash_expense"))
+async def start_cash_expense(msg: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(CleaningCashExpenseFSM.category)
+    await msg.answer(
+        "Ручной расход. Выберите категорию:",
+        reply_markup=_expense_category_kb(),
+    )
+
+
+@router.message(CleaningCashExpenseFSM.category, F.text)
+async def cash_exp_category(msg: Message, state: FSMContext) -> None:
+    if msg.text == "Готово":
+        await msg.answer("Категория обязательна.", reply_markup=_expense_category_kb())
+        return
+    if msg.text not in CLEANING_EXPENSE_CATEGORIES:
+        await msg.answer("Выберите категорию кнопкой.", reply_markup=_expense_category_kb())
+        return
+    await state.update_data(category=msg.text)
+    await state.set_state(CleaningCashExpenseFSM.amount)
+    await msg.answer("Сумма (руб):", reply_markup=cancel_kb)
+
+
+@router.message(CleaningCashExpenseFSM.amount, F.text)
+async def cash_exp_amount(msg: Message, state: FSMContext) -> None:
+    amount = parse_amount(msg.text)
+    if amount is None or amount <= 0:
+        await msg.answer("Нужно число > 0.", reply_markup=cancel_kb)
+        return
+    await state.update_data(amount=str(amount))
+    await state.set_state(CleaningCashExpenseFSM.comment)
+    await msg.answer("Комментарий (или «-»):", reply_markup=cancel_kb)
+
+
+@router.message(CleaningCashExpenseFSM.comment, F.text)
+async def cash_exp_comment(msg: Message, state: FSMContext) -> None:
+    comment = msg.text.strip()
+    if comment == "-":
+        comment = ""
+    await state.update_data(comment=comment)
+    data = await state.get_data()
+    await state.set_state(CleaningCashExpenseFSM.confirm)
+    await msg.answer(
+        f"Подтвердите расход: {data['category']} {_money_str(Decimal(data['amount']))}₽"
+        + (f"\nКомментарий: {comment}" if comment else ""),
+        reply_markup=_confirm_kb(),
+    )
+
+
+@router.message(CleaningCashExpenseFSM.confirm, F.text == "Провести")
+async def cash_exp_provesti(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    bot = kw["bot"]
+    data = await state.get_data()
+    amount = Decimal(data["amount"])
+    category = data["category"]
+    comment = data.get("comment") or None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await add_cash_expense(conn, category=category, amount=amount, comment=comment)
+            balance_after = await get_cleaning_balance(conn)
+    await send_cleaning_money_flow(
+        bot,
+        format_cash_op_alert(
+            op_label="Расход",
+            bucket=category,
+            amount=amount,
+            comment=comment,
+            balance_after=balance_after,
+        ),
+    )
+    await msg.answer(
+        f"Расход списан. Касса: {_money_str(balance_after)}₽",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.clear()
+
+
+# ---------- /cleaning_cash_withdrawal ----------
+
+
+@router.message(Command("cleaning_cash_withdrawal"))
+async def start_cash_withdrawal(msg: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(CleaningCashWithdrawalFSM.amount)
+    await msg.answer(
+        "Изъятие из кассы клининга (не считается расходом в P&L).\nСумма (руб):",
+        reply_markup=cancel_kb,
+    )
+
+
+@router.message(CleaningCashWithdrawalFSM.amount, F.text)
+async def cash_wd_amount(msg: Message, state: FSMContext) -> None:
+    amount = parse_amount(msg.text)
+    if amount is None or amount <= 0:
+        await msg.answer("Нужно число > 0.", reply_markup=cancel_kb)
+        return
+    await state.update_data(amount=str(amount))
+    await state.set_state(CleaningCashWithdrawalFSM.comment)
+    await msg.answer("Комментарий (или «-»):", reply_markup=cancel_kb)
+
+
+@router.message(CleaningCashWithdrawalFSM.comment, F.text)
+async def cash_wd_comment(msg: Message, state: FSMContext) -> None:
+    comment = msg.text.strip()
+    if comment == "-":
+        comment = ""
+    await state.update_data(comment=comment)
+    data = await state.get_data()
+    await state.set_state(CleaningCashWithdrawalFSM.confirm)
+    await msg.answer(
+        f"Подтвердите изъятие: {_money_str(Decimal(data['amount']))}₽"
+        + (f"\nКомментарий: {comment}" if comment else ""),
+        reply_markup=_confirm_kb(),
+    )
+
+
+@router.message(CleaningCashWithdrawalFSM.confirm, F.text == "Провести")
+async def cash_wd_provesti(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    bot = kw["bot"]
+    data = await state.get_data()
+    amount = Decimal(data["amount"])
+    comment = data.get("comment") or None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await add_cash_withdrawal(conn, amount=amount, comment=comment)
+            balance_after = await get_cleaning_balance(conn)
+    await send_cleaning_money_flow(
+        bot,
+        format_cash_op_alert(
+            op_label="Изъятие",
+            bucket="Касса клининга",
+            amount=amount,
+            comment=comment,
+            balance_after=balance_after,
+        ),
+    )
+    await msg.answer(
+        f"Изъятие проведено. Касса: {_money_str(balance_after)}₽",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.clear()
+
+
+# ---------- /cleaning_cancel_order N ----------
+
+
+@router.message(Command("cleaning_cancel_order"))
+async def start_cancel_order(msg: Message, state: FSMContext, command: CommandObject = None) -> None:
+    arg = (command.args if command else "") or ""
+    arg = arg.strip()
+    if not arg.isdigit():
+        await msg.answer("Использование: /cleaning_cancel_order N (N — id заказа уборки).")
+        return
+    order_id = int(arg)
+    await state.clear()
+    await state.update_data(cancel_order_id=order_id)
+    await state.set_state(CleaningCancelOrderFSM.confirm)
+    await msg.answer(
+        f"Отменить заказ уборки #{order_id}?\n"
+        "Будут soft-deleted все кассовые строки заказа, бонусы клиента откатятся.",
+        reply_markup=_confirm_kb(),
+    )
+
+
+@router.message(CleaningCancelOrderFSM.confirm, F.text == "Провести")
+async def cancel_order_confirmed(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    bot = kw["bot"]
+    data = await state.get_data()
+    order_id = int(data["cancel_order_id"])
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await cancel_order(conn, order_id=order_id)
+            balance_after = await get_cleaning_balance(conn) if result else None
+    if result is None:
+        await msg.answer(
+            f"Заказ #{order_id} не найден или уже отменён.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await send_cleaning_money_flow(
+            bot,
+            format_cancel_order_alert(
+                order_id=result["order_id"],
+                address=result["address"],
+                total_amount=result["total_amount"],
+                bonuses_used=result["bonuses_used"],
+                bonuses_earned=result["bonuses_earned"],
+                cashbook_rows_deleted=result["cashbook_rows_deleted"],
+                balance_after=balance_after,
+            ),
+        )
+        await msg.answer(
+            f"Заказ #{order_id} отменён. Касса: {_money_str(balance_after)}₽",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     await state.clear()

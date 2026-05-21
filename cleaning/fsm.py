@@ -24,3 +24,27 @@ class CleaningDividendFSM(StatesGroup):
     amount = State()
     comment = State()
     confirm = State()
+
+
+class CleaningCashAddFSM(StatesGroup):
+    method = State()
+    amount = State()
+    comment = State()
+    confirm = State()
+
+
+class CleaningCashExpenseFSM(StatesGroup):
+    category = State()
+    amount = State()
+    comment = State()
+    confirm = State()
+
+
+class CleaningCashWithdrawalFSM(StatesGroup):
+    amount = State()
+    comment = State()
+    confirm = State()
+
+
+class CleaningCancelOrderFSM(StatesGroup):
+    confirm = State()
