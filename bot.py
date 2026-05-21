@@ -136,6 +136,7 @@ from notifications import (
     start_wahelp_webhook,
 )
 from notifications.amocrm import format_amocrm_admin_alert, normalize_amocrm_payload
+from cleaning.schema import ensure_cleaning_schema
 from crm import (
     ChannelKind,
     ClientContact,
@@ -1769,83 +1770,6 @@ async def ensure_orders_rating_schema(conn: asyncpg.Connection) -> None:
         ADD COLUMN IF NOT EXISTS rating_requested_at timestamptz,
         ADD COLUMN IF NOT EXISTS rating_replied_at timestamptz;
         """
-    )
-
-
-async def ensure_cleaning_schema(conn: asyncpg.Connection) -> None:
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cleaning_foremen (
-            id         serial PRIMARY KEY,
-            tg_user_id bigint UNIQUE,
-            fn         text NOT NULL,
-            ln         text,
-            phone      text,
-            is_active  boolean NOT NULL DEFAULT true,
-            created_at timestamptz NOT NULL DEFAULT NOW()
-        );
-        """
-    )
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cleaning_orders (
-            id             serial PRIMARY KEY,
-            client_id      integer NOT NULL REFERENCES clients(id),
-            foreman_id     integer NOT NULL REFERENCES cleaning_foremen(id),
-            address        text NOT NULL,
-            total_amount   numeric(12,2) NOT NULL,
-            bonuses_used   numeric(12,2) NOT NULL DEFAULT 0,
-            bonuses_earned numeric(12,2) NOT NULL DEFAULT 0,
-            client_op_id   text UNIQUE,
-            happened_at    timestamptz NOT NULL DEFAULT NOW(),
-            created_at     timestamptz NOT NULL DEFAULT NOW(),
-            deleted_at     timestamptz
-        );
-        """
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cleaning_orders_client   ON cleaning_orders(client_id);"
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cleaning_orders_happened ON cleaning_orders(happened_at);"
-    )
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cleaning_order_payments (
-            id         serial PRIMARY KEY,
-            order_id   integer NOT NULL REFERENCES cleaning_orders(id) ON DELETE CASCADE,
-            method     text NOT NULL,
-            amount     numeric(12,2) NOT NULL,
-            created_at timestamptz NOT NULL DEFAULT NOW()
-        );
-        """
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cleaning_op_order ON cleaning_order_payments(order_id);"
-    )
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cleaning_cashbook (
-            id          serial PRIMARY KEY,
-            kind        text NOT NULL,
-            method      text NOT NULL,
-            amount      numeric(12,2) NOT NULL,
-            comment     text,
-            order_id    integer REFERENCES cleaning_orders(id),
-            happened_at timestamptz NOT NULL DEFAULT NOW(),
-            created_at  timestamptz NOT NULL DEFAULT NOW(),
-            deleted_at  timestamptz
-        );
-        """
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cleaning_cb_kind_method ON cleaning_cashbook(kind, method);"
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cleaning_cb_order       ON cleaning_cashbook(order_id);"
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_cleaning_cb_happened    ON cleaning_cashbook(happened_at);"
     )
 
 
