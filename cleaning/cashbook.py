@@ -13,8 +13,66 @@ from .constants import (
     CASHBOOK_KIND_EXPENSE,
     CASHBOOK_KIND_INCOME,
     CASHBOOK_KIND_WITHDRAWAL,
+    CLEANING_DIVIDEND_METHOD,
     ZERO,
 )
+
+
+async def record_income(
+    conn: asyncpg.Connection,
+    *,
+    method: str,
+    amount: Decimal,
+    order_id: int,
+    comment: str | None = None,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO cleaning_cashbook (kind, method, amount, comment, order_id)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        CASHBOOK_KIND_INCOME,
+        method,
+        amount,
+        comment,
+        order_id,
+    )
+
+
+async def record_expense(
+    conn: asyncpg.Connection,
+    *,
+    category: str,
+    amount: Decimal,
+    order_id: int | None = None,
+    comment: str | None = None,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO cleaning_cashbook (kind, method, amount, comment, order_id)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        CASHBOOK_KIND_EXPENSE,
+        category,
+        amount,
+        comment,
+        order_id,
+    )
+
+
+async def record_dividend(
+    conn: asyncpg.Connection, *, amount: Decimal, comment: str
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO cleaning_cashbook (kind, method, amount, comment)
+        VALUES ($1, $2, $3, $4)
+        """,
+        CASHBOOK_KIND_DIVIDEND,
+        CLEANING_DIVIDEND_METHOD,
+        amount,
+        comment,
+    )
 
 
 async def get_cleaning_balance(conn: asyncpg.Connection) -> Decimal:

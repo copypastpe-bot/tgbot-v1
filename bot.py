@@ -137,6 +137,7 @@ from notifications import (
 )
 from notifications.amocrm import format_amocrm_admin_alert, normalize_amocrm_payload
 from cleaning.schema import ensure_cleaning_schema
+from cleaning.handlers import router as cleaning_router
 from crm import (
     ChannelKind,
     ClientContact,
@@ -389,6 +390,7 @@ def _make_telegram_bot(token: str) -> Bot:
 
 bot = _make_telegram_bot(BOT_TOKEN)
 dp = Dispatcher()
+dp.include_router(cleaning_router)
 
 _texts_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 TEXTS_CACHE_TTL_SEC = 900
@@ -12487,6 +12489,7 @@ async def main():
     global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
+    dp["pool"] = pool
     async with pool.acquire() as _conn:
         await init_permissions(_conn)
         await _ensure_bonus_posted_column(_conn)
