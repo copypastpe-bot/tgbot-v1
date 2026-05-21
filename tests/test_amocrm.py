@@ -7,10 +7,13 @@ class AmoCRMWebhookTests(unittest.TestCase):
     def test_normalizes_added_lead(self):
         event = normalize_amocrm_payload(
             {
+                "account[_links][self]": "https://raketacleancrm.amocrm.ru",
                 "leads[add][0][id]": "123456",
                 "leads[add][0][name]": "Уборка завтра",
                 "leads[add][0][price]": "7500",
                 "leads[add][0][responsible_user_id]": "111",
+                "leads[add][0][custom_fields][0][name]": "Комментарий к заказу",
+                "leads[add][0][custom_fields][0][values][0][value]": "Чистка ковролина",
             }
         )
 
@@ -20,14 +23,19 @@ class AmoCRMWebhookTests(unittest.TestCase):
         self.assertEqual(event.entity_id, "123456")
         self.assertEqual(event.title, "Уборка завтра")
         self.assertEqual(event.amount, "7500")
+        self.assertEqual(event.account_url, "https://raketacleancrm.amocrm.ru")
+        self.assertEqual(event.comment, "Чистка ковролина")
 
     def test_normalizes_added_unsorted(self):
         event = normalize_amocrm_payload(
             {
+                "account[_links][self]": "https://raketacleancrm.amocrm.ru",
                 "unsorted[add][0][uid]": "abc-123",
+                "unsorted[add][0][lead_id]": "777",
                 "unsorted[add][0][source_name]": "Сайт",
                 "unsorted[add][0][data][name]": "Новая заявка",
                 "unsorted[add][0][data][phone]": "+79991234567",
+                "unsorted[add][0][source_data][data][0][text]": "Хочу уборку завтра",
             }
         )
 
@@ -38,10 +46,26 @@ class AmoCRMWebhookTests(unittest.TestCase):
         self.assertEqual(event.title, "Новая заявка")
         self.assertEqual(event.source, "Сайт")
         self.assertEqual(event.phone, "+79991234567")
+        self.assertEqual(event.lead_id, "777")
+        self.assertEqual(event.account_url, "https://raketacleancrm.amocrm.ru")
+        self.assertEqual(event.comment, "Хочу уборку завтра")
+
+    def test_extracts_phone_from_unsorted_source_data(self):
+        event = normalize_amocrm_payload(
+            {
+                "unsorted[add][0][uid]": "abc-123",
+                "unsorted[add][0][source_data][from]": "Исходящий +79991414561 (79040437523 - Основной номер)",
+                "unsorted[add][0][source_data][source_name]": "Телеграм",
+            }
+        )
+
+        self.assertEqual(event.phone, "+79991414561")
+        self.assertEqual(event.source, "Телеграм")
 
     def test_normalizes_added_message(self):
         event = normalize_amocrm_payload(
             {
+                "account[_links][self]": "https://raketacleancrm.amocrm.ru",
                 "message[add][0][id]": "m-1",
                 "message[add][0][talk_id]": "t-9",
                 "message[add][0][entity_id]": "123456",
@@ -59,6 +83,7 @@ class AmoCRMWebhookTests(unittest.TestCase):
         self.assertEqual(event.text, "Хочу клининг")
         self.assertEqual(event.contact_name, "Иван")
         self.assertEqual(event.source, "telegram")
+        self.assertEqual(event.account_url, "https://raketacleancrm.amocrm.ru")
 
     def test_normalizes_digital_pipeline_chat(self):
         event = normalize_amocrm_payload(
@@ -106,6 +131,27 @@ class AmoCRMWebhookTests(unittest.TestCase):
         self.assertIn("Текст: Хочу уборку завтра", text)
         self.assertIn("https://rocket.amocrm.ru/leads/detail/123456", text)
         self.assertIn("Нужно ответить или позвонить.", text)
+
+    def test_formats_unsorted_alert_with_phone_comment_and_payload_link(self):
+        event = normalize_amocrm_payload(
+            {
+                "account[_links][self]": "https://raketacleancrm.amocrm.ru",
+                "unsorted[add][0][uid]": "abc-123",
+                "unsorted[add][0][lead_id]": "31257185",
+                "unsorted[add][0][source_data][source_name]": "Телеграм",
+                "unsorted[add][0][source_data][from]": "Исходящий +79991414561 (79040437523 - Основной номер)",
+                "unsorted[add][0][source_data][data][0][text]": "Тест проверка",
+            }
+        )
+
+        text = format_amocrm_admin_alert(event)
+
+        self.assertIn("Тип: новое неразобранное", text)
+        self.assertIn("Сделка: #31257185", text)
+        self.assertIn("Телефон: +79991414561", text)
+        self.assertIn("Источник: Телеграм", text)
+        self.assertIn("Комментарий: Тест проверка", text)
+        self.assertIn("https://raketacleancrm.amocrm.ru/leads/detail/31257185", text)
 
 
 if __name__ == "__main__":

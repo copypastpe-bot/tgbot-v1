@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Mapping
 
 
@@ -22,6 +23,8 @@ class AmoCRMEvent:
     phone: str | None = None
     contact_name: str | None = None
     text: str | None = None
+    comment: str | None = None
+    account_url: str | None = None
     responsible_user_id: str | None = None
     pipeline_id: str | None = None
     status_id: str | None = None
@@ -34,6 +37,7 @@ class AmoCRMEvent:
 def normalize_amocrm_payload(payload: Mapping[str, Any]) -> AmoCRMEvent:
     flat = _stringify_payload(payload)
     event_type = _detect_event_type(flat)
+    account_url = _account_url(flat)
 
     if event_type == "leads.add":
         entity_id = _find_first(flat, ("leads[add]",), ("[id]",))
@@ -43,8 +47,10 @@ def normalize_amocrm_payload(payload: Mapping[str, Any]) -> AmoCRMEvent:
             entity_id=entity_id,
             lead_id=entity_id,
             payload=flat,
+            account_url=account_url,
             title=_find_first(flat, ("leads[add]",), ("[name]",)),
             amount=_find_first(flat, ("leads[add]",), ("[price]",)),
+            comment=_find_custom_field_value(flat, ("leads[add]",), ("Комментарий к заказу", "Комментарий")),
             responsible_user_id=_find_first(flat, ("leads[add]",), ("[responsible_user_id]",)),
             pipeline_id=_find_first(flat, ("leads[add]",), ("[pipeline_id]",)),
             status_id=_find_first(flat, ("leads[add]",), ("[status_id]",)),
@@ -52,15 +58,39 @@ def normalize_amocrm_payload(payload: Mapping[str, Any]) -> AmoCRMEvent:
 
     if event_type == "unsorted.add":
         entity_id = _find_first(flat, ("unsorted[add]",), ("[uid]", "[id]"))
+        phone_candidates = (
+            _find_first(flat, ("unsorted[add]",), ("[data][phone]", "[phone]")),
+            _find_first(flat, ("unsorted[add]",), ("[source_data][from]", "[from]")),
+            _find_first(flat, ("unsorted[add]",), ("[custom_fields][0][values][0][value]",)),
+        )
         return AmoCRMEvent(
             event_type=event_type,
             entity_kind="unsorted",
             entity_id=entity_id,
+            lead_id=_find_first(flat, ("unsorted[add]",), ("[lead_id]",)),
             payload=flat,
-            title=_find_first(flat, ("unsorted[add]",), ("[data][name]", "[name]")),
-            source=_find_first(flat, ("unsorted[add]",), ("[source_name]", "[source]", "[origin]")),
-            phone=_find_first(flat, ("unsorted[add]",), ("[data][phone]", "[phone]")),
-            contact_name=_find_first(flat, ("unsorted[add]",), ("[data][contact][name]", "[contact][name]")),
+            account_url=account_url,
+            title=_find_first(
+                flat,
+                ("unsorted[add]",),
+                ("[data][name]", "[source_data][client][name]", "[data][leads][0][name]", "[name]"),
+            ),
+            source=_find_first(
+                flat,
+                ("unsorted[add]",),
+                ("[source_data][source_name]", "[source_name]", "[source_data][site]", "[source]", "[origin]"),
+            ),
+            phone=_first_phone(phone_candidates),
+            contact_name=_find_first(
+                flat,
+                ("unsorted[add]",),
+                ("[source_data][client][name]", "[data][contacts][0][name]", "[data][contact][name]", "[contact][name]"),
+            ),
+            comment=_find_first(
+                flat,
+                ("unsorted[add]",),
+                ("[source_data][data][0][text]", "[data][leads][0][notes][0][text]", "[comment]", "[message]", "[text]"),
+            ),
         )
 
     if event_type == "message.add":
@@ -72,9 +102,11 @@ def normalize_amocrm_payload(payload: Mapping[str, Any]) -> AmoCRMEvent:
             entity_id=entity_id,
             lead_id=lead_id,
             payload=flat,
+            account_url=account_url,
             source=_find_first(flat, ("message[add]", "messages[add]"), ("[origin]", "[source]", "[source_name]")),
             contact_name=_find_first(flat, ("message[add]", "messages[add]"), ("[author][name]", "[contact][name]", "[name]")),
             text=_find_first(flat, ("message[add]", "messages[add]"), ("[text]", "[message]", "[body]")),
+            comment=_find_first(flat, ("message[add]", "messages[add]"), ("[text]", "[message]", "[body]")),
         )
 
     if event_type == "leads.chat":
@@ -85,8 +117,10 @@ def normalize_amocrm_payload(payload: Mapping[str, Any]) -> AmoCRMEvent:
             entity_id=entity_id,
             lead_id=entity_id,
             payload=flat,
+            account_url=account_url,
             contact_name=_find_first(flat, ("leads[chat]",), ("[contact][name]", "[author][name]", "[name]")),
             text=_find_first(flat, ("leads[chat]",), ("[message]", "[text]", "[body]")),
+            comment=_find_first(flat, ("leads[chat]",), ("[message]", "[text]", "[body]")),
             source=_find_first(flat, ("leads[chat]",), ("[origin]", "[source]", "[source_name]")),
         )
 
@@ -95,6 +129,7 @@ def normalize_amocrm_payload(payload: Mapping[str, Any]) -> AmoCRMEvent:
         entity_kind=None,
         entity_id=_find_first(flat, ("",), ("[id]",)),
         payload=flat,
+        account_url=account_url,
     )
 
 
@@ -126,7 +161,11 @@ def format_amocrm_admin_alert(event: AmoCRMEvent, *, account_domain: str | None 
         lines.append(f"Сумма: {event.amount}")
     if event.text:
         lines.append(f"Текст: {_clip(event.text, 700)}")
-    link = _build_lead_link(account_domain, lead_id)
+    if event.comment and event.comment != event.text:
+        lines.append(f"Комментарий: {_clip(event.comment, 700)}")
+    elif event.comment and not event.text:
+        lines.append(f"Комментарий: {_clip(event.comment, 700)}")
+    link = _build_lead_link(account_domain or event.account_url, lead_id)
     if link:
         lines.append(f"Ссылка: {link}")
     lines.extend(["", "Нужно ответить или позвонить."])
@@ -175,6 +214,57 @@ def _find_first(payload: Mapping[str, str], prefixes: tuple[str, ...], suffixes:
                 continue
             if key.endswith(suffix):
                 return value
+    return None
+
+
+def _account_url(payload: Mapping[str, str]) -> str | None:
+    direct = payload.get("account[_links][self]")
+    if direct:
+        return direct
+    subdomain = payload.get("account[subdomain]")
+    if subdomain:
+        return f"https://{subdomain}.amocrm.ru"
+    return None
+
+
+def _find_custom_field_value(
+    payload: Mapping[str, str],
+    prefixes: tuple[str, ...],
+    field_names: tuple[str, ...],
+) -> str | None:
+    for key, value in payload.items():
+        if not value or not key.endswith("[name]"):
+            continue
+        if not any(key.startswith(prefix) for prefix in prefixes):
+            continue
+        if value.strip().casefold() not in {name.casefold() for name in field_names}:
+            continue
+        value_key = key.removesuffix("[name]") + "[values][0][value]"
+        found = payload.get(value_key)
+        if found:
+            return found
+    return None
+
+
+def _first_phone(candidates: tuple[str | None, ...]) -> str | None:
+    for candidate in candidates:
+        if not candidate:
+            continue
+        phone = _extract_phone(candidate)
+        if phone:
+            return phone
+    return None
+
+
+def _extract_phone(value: str) -> str | None:
+    match = re.search(r"(?:\+7|8)\D*\d{3}\D*\d{3}\D*\d{2}\D*\d{2}", value)
+    if not match:
+        return None
+    digits = re.sub(r"\D+", "", match.group(0))
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return "+" + digits
     return None
 
 
