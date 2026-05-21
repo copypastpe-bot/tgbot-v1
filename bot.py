@@ -12471,9 +12471,10 @@ async def master_rewash_order(msg: Message, state: FSMContext):
 
 # fallback
 
-@dp.message(F.text, ~F.text.startswith("/"))
+@dp.message(F.text, ~F.text.startswith("/"), StateFilter(None))
 async def unknown(msg: Message, state: FSMContext):
-    # Если пользователь находится в процессе любого сценария — не вмешиваемся
+    # StateFilter(None) гарантирует, что fallback не ловит сообщения
+    # пользователей, находящихся в любом FSM (включая cleaning_router).
     cur = await state.get_state()
     if cur is not None:
         return
