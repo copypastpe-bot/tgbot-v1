@@ -74,6 +74,45 @@ def format_cash_op_alert(
     return "\n".join(lines)
 
 
+def format_cash_report(*, label: str, report: dict, balance_after: Decimal) -> str:
+    lines = [f"📊 Касса клининга — {label}"]
+    lines.append(f"Приход: {_money(report['income_total'])}₽")
+    for m, v in sorted(report["income_by_method"].items()):
+        lines.append(f"  • {m}: {_money(v)}₽")
+    if report["gift_total"] > 0:
+        lines.append(f"Сертификаты (вне кассы): {_money(report['gift_total'])}₽")
+    lines.append(f"Расход: {_money(report['expense_total'])}₽")
+    for c, v in sorted(report["expense_by_category"].items()):
+        lines.append(f"  • {c}: {_money(v)}₽")
+    if report["dividend_total"] > 0:
+        lines.append(f"DIV: {_money(report['dividend_total'])}₽")
+    if report["withdrawal_total"] > 0:
+        lines.append(f"Изъятия: {_money(report['withdrawal_total'])}₽")
+    if report["deposit_total"] > 0:
+        lines.append(f"Доп. внесения: {_money(report['deposit_total'])}₽")
+    lines.append(f"Прибыль (income − expense): {_money(report['profit'])}₽")
+    lines.append(f"Баланс сейчас: {_money(balance_after)}₽")
+    return "\n".join(lines)
+
+
+def format_orders_list(*, label: str, orders: list[dict]) -> str:
+    if not orders:
+        return f"📋 Уборки — {label}\nНет заказов."
+    lines = [f"📋 Уборки — {label} ({len(orders)} шт.)"]
+    total = Decimal("0")
+    for o in orders:
+        time_str = o["happened_at"].strftime("%d.%m %H:%M")
+        client = o["client_name"] or "Клиент"
+        pay = o["pay_summary"] or "—"
+        lines.append(
+            f"#{o['id']} {time_str} {client} — {o['address']} — "
+            f"{_money(o['total_amount'])}₽ ({pay})"
+        )
+        total += o["total_amount"]
+    lines.append(f"Итого: {_money(total)}₽")
+    return "\n".join(lines)
+
+
 def format_cancel_order_alert(
     *,
     order_id: int,

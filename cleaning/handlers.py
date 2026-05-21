@@ -8,8 +8,9 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from aiogram import F, Router
@@ -26,6 +27,8 @@ from .admin_ops import (
 )
 from .cashbook import (
     get_cleaning_balance,
+    get_cleaning_cash_report,
+    get_cleaning_orders_list,
     record_dividend,
     record_expense,
     record_income,
@@ -41,9 +44,39 @@ from .constants import (
 from .format import (
     format_cancel_order_alert,
     format_cash_op_alert,
+    format_cash_report,
     format_dividend_alert,
     format_order_provided_alert,
+    format_orders_list,
 )
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _period_bounds(kind: str) -> tuple[datetime, datetime, str]:
+    """day|month|year → (start_utc, end_utc, human_label).
+
+    Все вычисления через MSK, потом конвертация в UTC для SQL.
+    """
+    now_msk = datetime.now(MOSCOW_TZ)
+    if kind == "day":
+        start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_msk = start_msk + timedelta(days=1)
+        label = "день " + start_msk.strftime("%d.%m.%Y")
+    elif kind == "month":
+        start_msk = now_msk.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start_msk.month == 12:
+            end_msk = start_msk.replace(year=start_msk.year + 1, month=1)
+        else:
+            end_msk = start_msk.replace(month=start_msk.month + 1)
+        label = "месяц " + start_msk.strftime("%m.%Y")
+    elif kind == "year":
+        start_msk = now_msk.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_msk = start_msk.replace(year=start_msk.year + 1)
+        label = "год " + start_msk.strftime("%Y")
+    else:
+        raise ValueError(f"unknown period: {kind}")
+    return start_msk.astimezone(timezone.utc), end_msk.astimezone(timezone.utc), label
 from .fsm import (
     CleaningCancelOrderFSM,
     CleaningCashAddFSM,
@@ -925,3 +958,42 @@ async def cancel_order_confirmed(msg: Message, state: FSMContext, **kw) -> None:
             reply_markup=ReplyKeyboardRemove(),
         )
     await state.clear()
+
+
+# ---------- /cleaning_cash day|month|year ----------
+
+
+@router.message(Command("cleaning_cash"))
+async def cleaning_cash_report(
+    msg: Message, command: CommandObject = None, **kw
+) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    arg = ((command.args if command else "") or "").strip().lower() or "day"
+    if arg not in {"day", "month", "year"}:
+        await msg.answer("Использование: /cleaning_cash day|month|year")
+        return
+    start_utc, end_utc, label = _period_bounds(arg)
+    async with pool.acquire() as conn:
+        report = await get_cleaning_cash_report(conn, start_utc, end_utc)
+        balance_after = await get_cleaning_balance(conn)
+    await msg.answer(
+        format_cash_report(label=label, report=report, balance_after=balance_after)
+    )
+
+
+# ---------- /cleaning_orders day|month ----------
+
+
+@router.message(Command("cleaning_orders"))
+async def cleaning_orders_list(
+    msg: Message, command: CommandObject = None, **kw
+) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    arg = ((command.args if command else "") or "").strip().lower() or "day"
+    if arg not in {"day", "month"}:
+        await msg.answer("Использование: /cleaning_orders day|month")
+        return
+    start_utc, end_utc, label = _period_bounds(arg)
+    async with pool.acquire() as conn:
+        orders = await get_cleaning_orders_list(conn, start_utc, end_utc)
+    await msg.answer(format_orders_list(label=label, orders=orders))
