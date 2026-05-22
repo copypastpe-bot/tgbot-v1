@@ -11378,6 +11378,8 @@ async def cancel_any(msg: Message, state: FSMContext):
         "CleaningCashExpenseFSM",
         "CleaningCashWithdrawalFSM",
         "CleaningCancelOrderFSM",
+        "CleaningClientLookupFSM",
+        "CleaningForemanExpenseFSM",
     }
     prefix = current_state.split(":")[0] if current_state else ""
     if prefix in admin_prefixes or await has_permission(msg.from_user.id, "view_orders_reports"):
@@ -13243,6 +13245,7 @@ async def main():
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     dp["pool"] = pool
+    dp["notification_rules"] = notification_rules
     async with pool.acquire() as _conn:
         await init_permissions(_conn)
         await _ensure_bonus_posted_column(_conn)

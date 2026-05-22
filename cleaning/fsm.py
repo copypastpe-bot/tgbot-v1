@@ -49,3 +49,14 @@ class CleaningCashWithdrawalFSM(StatesGroup):
 
 class CleaningCancelOrderFSM(StatesGroup):
     confirm = State()
+
+
+class CleaningClientLookupFSM(StatesGroup):
+    phone = State()
+
+
+class CleaningForemanExpenseFSM(StatesGroup):
+    amount = State()
+    category = State()
+    comment = State()
+    confirm = State()

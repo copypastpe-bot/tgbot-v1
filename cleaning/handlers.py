@@ -16,6 +16,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from notifications import NotificationRules, enqueue_notification
 
 from .access import can_create_cleaning_order, has_permission
 from .admin_ops import (
@@ -52,6 +53,14 @@ from .format import (
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
+def _bonus_expire_label(value: datetime | None) -> str:
+    if value is None:
+        return "—"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(MOSCOW_TZ).strftime("%d.%m.%Y")
+
+
 def _period_bounds(kind: str) -> tuple[datetime, datetime, str]:
     """day|month|year → (start_utc, end_utc, human_label).
 
@@ -81,7 +90,9 @@ from .fsm import (
     CleaningCashAddFSM,
     CleaningCashExpenseFSM,
     CleaningCashWithdrawalFSM,
+    CleaningClientLookupFSM,
     CleaningDividendFSM,
+    CleaningForemanExpenseFSM,
     CleaningOrderFSM,
 )
 from .notify import send_cleaning_money_flow
@@ -188,6 +199,54 @@ def _money_str(value: Decimal) -> str:
     return f"{quant:,.2f}".replace(",", " ")
 
 
+async def _enqueue_cleaning_completed_notifications(
+    conn: asyncpg.Connection,
+    rules: NotificationRules | None,
+    *,
+    order_id: int,
+    client_id: int,
+    total: Decimal,
+    bonuses_used: int,
+    bonuses_earned: int,
+    bonus_balance: int,
+    amount_due: Decimal,
+    bonus_expires_at: datetime | None,
+    is_wire_payment: bool,
+) -> None:
+    if rules is None:
+        return
+    if is_wire_payment:
+        await enqueue_notification(
+            conn,
+            rules,
+            event_key="cleaning_order_completed_wire",
+            client_id=client_id,
+            payload={},
+        )
+    else:
+        await enqueue_notification(
+            conn,
+            rules,
+            event_key="cleaning_order_completed_summary",
+            client_id=client_id,
+            payload={
+                "total_sum": _money_str(total),
+                "used_bonus": bonuses_used,
+                "earned_bonus": bonuses_earned,
+                "bonus_balance": bonus_balance,
+                "amount_due": _money_str(amount_due),
+                "bonus_expire_date": _bonus_expire_label(bonus_expires_at),
+            },
+        )
+    await enqueue_notification(
+        conn,
+        rules,
+        event_key="cleaning_order_rating_reminder",
+        client_id=client_id,
+        payload={"order_id": order_id},
+    )
+
+
 # ---------- /cleaning_order ----------
 
 
@@ -215,6 +274,8 @@ async def start_cleaning_order(msg: Message, state: FSMContext, **data) -> None:
         CleaningCashExpenseFSM,
         CleaningCashWithdrawalFSM,
         CleaningCancelOrderFSM,
+        CleaningClientLookupFSM,
+        CleaningForemanExpenseFSM,
     ),
     F.text.in_({"Отмена", "Отменить"}),
 )
@@ -514,6 +575,7 @@ async def _show_confirm(msg: Message, state: FSMContext) -> None:
 async def do_provesti(msg: Message, state: FSMContext, **kw) -> None:
     pool: asyncpg.Pool = kw["pool"]
     bot = kw["bot"]
+    notification_rules: NotificationRules | None = kw.get("notification_rules")
     data = await state.get_data()
     foreman_tg = msg.from_user.id
 
@@ -619,6 +681,7 @@ async def do_provesti(msg: Message, state: FSMContext, **kw) -> None:
 
             # Бонусы клиента — обновляем общий баланс и пишем в bonus_transactions
             now_utc = datetime.now(timezone.utc)
+            bonus_expires_at = (datetime.now(MOSCOW_TZ) + timedelta(days=365)).astimezone(timezone.utc)
             if bonus_spend > 0:
                 await conn.execute(
                     """
@@ -636,20 +699,34 @@ async def do_provesti(msg: Message, state: FSMContext, **kw) -> None:
                 await conn.execute(
                     """
                     INSERT INTO bonus_transactions
-                        (client_id, delta, reason, created_at, happened_at, meta)
-                    VALUES ($1, $2, 'accrual', $3, $3,
+                        (client_id, delta, reason, created_at, happened_at, expires_at, meta)
+                    VALUES ($1, $2, 'accrual', $3, $3, $5,
                             jsonb_build_object('source','cleaning','order_id',$4::int))
                     """,
                     client_id,
                     bonus_earned,
                     now_utc,
                     order_id,
+                    bonus_expires_at,
                 )
             new_balance = int(client_row["bonus_balance"] or 0) - bonus_spend + bonus_earned
             await conn.execute(
                 "UPDATE clients SET bonus_balance=$1 WHERE id=$2",
                 new_balance,
                 client_id,
+            )
+            await _enqueue_cleaning_completed_notifications(
+                conn,
+                notification_rules,
+                order_id=order_id,
+                client_id=client_id,
+                total=total,
+                bonuses_used=bonus_spend,
+                bonuses_earned=bonus_earned,
+                bonus_balance=new_balance,
+                amount_due=total - Decimal(bonus_spend),
+                bonus_expires_at=bonus_expires_at if bonus_earned > 0 else None,
+                is_wire_payment=bool(data.get("is_wire_payment")),
             )
 
             balance_after = await get_cleaning_balance(conn)
@@ -698,6 +775,138 @@ async def cleaning_balance_cmd(msg: Message, **kw) -> None:
     async with pool.acquire() as conn:
         balance = await get_cleaning_balance(conn)
     await msg.answer(f"Касса клининга: {_money_str(balance)}₽")
+
+
+# ---------- cleaner client lookup ----------
+
+
+@router.message(F.text == "🔍 Клиент")
+async def cleaning_client_lookup_start(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_view_clients"):
+        await msg.answer("Команда доступна только клинерам и администраторам.")
+        return
+    await state.clear()
+    await state.set_state(CleaningClientLookupFSM.phone)
+    await msg.answer("Введите номер телефона клиента:", reply_markup=cancel_kb)
+
+
+@router.message(CleaningClientLookupFSM.phone, F.text)
+async def cleaning_client_lookup_phone(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    raw = msg.text.strip()
+    if not _is_valid_phone(raw):
+        await msg.answer(
+            "Формат номера: 9XXXXXXXXX, 8XXXXXXXXXX или +7XXXXXXXXXX",
+            reply_markup=cancel_kb,
+        )
+        return
+    async with pool.acquire() as conn:
+        rec = await find_client_by_phone(conn, raw)
+    await state.clear()
+    if rec is None:
+        await msg.answer("Не найдено.", reply_markup=cleaning_main_kb())
+        return
+    birthday = rec["birthday"].isoformat() if rec["birthday"] else "—"
+    status = rec["status"] or "—"
+    text = (
+        f"👤 {rec['full_name'] or 'Без имени'}\n"
+        f"📞 {rec['phone']}\n"
+        f"💳 {rec['bonus_balance']}\n"
+        f"🎂 {birthday}\n"
+        f"🏷️ {status}"
+    )
+    await msg.answer(text, reply_markup=cleaning_main_kb())
+
+
+# ---------- cleaner manual expense ----------
+
+
+@router.message(F.text == "➖ Добавить расход")
+async def foreman_expense_start(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_record_expense"):
+        await msg.answer("Команда доступна только клинерам и администраторам.")
+        return
+    await state.clear()
+    await state.set_state(CleaningForemanExpenseFSM.amount)
+    await msg.answer("Введите сумму расхода:", reply_markup=cancel_kb)
+
+
+@router.message(CleaningForemanExpenseFSM.amount, F.text)
+async def foreman_expense_amount(msg: Message, state: FSMContext) -> None:
+    amount = parse_amount(msg.text)
+    if amount is None or amount <= 0:
+        await msg.answer("Нужно число > 0.", reply_markup=cancel_kb)
+        return
+    await state.update_data(amount=str(amount))
+    await state.set_state(CleaningForemanExpenseFSM.category)
+    await msg.answer("Выберите категорию расхода:", reply_markup=_expense_category_kb())
+
+
+@router.message(CleaningForemanExpenseFSM.category, F.text)
+async def foreman_expense_category(msg: Message, state: FSMContext) -> None:
+    category = msg.text.strip()
+    if category == "Готово":
+        await msg.answer("Категория обязательна.", reply_markup=_expense_category_kb())
+        return
+    if category not in CLEANING_EXPENSE_CATEGORIES:
+        await msg.answer("Выберите категорию кнопкой.", reply_markup=_expense_category_kb())
+        return
+    await state.update_data(category=category)
+    await state.set_state(CleaningForemanExpenseFSM.comment)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Без комментария")], [KeyboardButton(text="Отмена")]],
+        resize_keyboard=True,
+    )
+    await msg.answer("Комментарий? (введите текст или нажмите «Без комментария»)", reply_markup=kb)
+
+
+@router.message(CleaningForemanExpenseFSM.comment, F.text)
+async def foreman_expense_comment(msg: Message, state: FSMContext) -> None:
+    comment = msg.text.strip()
+    if comment.casefold() == "без комментария" or not comment:
+        comment = "Расход"
+    await state.update_data(comment=comment)
+    data = await state.get_data()
+    amount = Decimal(data["amount"])
+    await state.set_state(CleaningForemanExpenseFSM.confirm)
+    await msg.answer(
+        "Подтвердите расход:\n"
+        f"Категория: {data['category']}\n"
+        f"Сумма: {_money_str(amount)}₽\n"
+        f"Комментарий: {comment}",
+        reply_markup=_confirm_kb(),
+    )
+
+
+@router.message(CleaningForemanExpenseFSM.confirm, F.text == "Провести")
+async def foreman_expense_confirm(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    bot = kw["bot"]
+    data = await state.get_data()
+    amount = Decimal(data["amount"])
+    category = data["category"]
+    comment = data.get("comment") or "Расход"
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await add_cash_expense(conn, category=category, amount=amount, comment=comment)
+            balance_after = await get_cleaning_balance(conn)
+    await send_cleaning_money_flow(
+        bot,
+        format_cash_op_alert(
+            op_label="Расход",
+            bucket=category,
+            amount=amount,
+            comment=comment,
+            balance_after=balance_after,
+        ),
+    )
+    await state.clear()
+    await msg.answer(
+        f"Расход списан. Касса: {_money_str(balance_after)}₽",
+        reply_markup=cleaning_main_kb(),
+    )
 
 
 # ---------- /cleaning_dividend ----------
