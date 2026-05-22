@@ -3079,6 +3079,22 @@ def _load_notification_rules() -> NotificationRules | None:
     return None
 
 # ===== RBAC helpers (DB-driven) =====
+async def ensure_staff_role_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        ALTER TABLE staff
+        DROP CONSTRAINT IF EXISTS staff_role_check
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE staff
+        ADD CONSTRAINT staff_role_check
+        CHECK (role IN ('master', 'admin', 'superadmin', 'cleaner'))
+        """
+    )
+
+
 async def get_user_role(conn: asyncpg.Connection, user_id: int) -> str | None:
     rec = await conn.fetchrow(
         "SELECT role FROM staff WHERE tg_user_id=$1 AND is_active LIMIT 1",
@@ -13247,6 +13263,7 @@ async def main():
     dp["pool"] = pool
     dp["notification_rules"] = notification_rules
     async with pool.acquire() as _conn:
+        await ensure_staff_role_schema(_conn)
         await init_permissions(_conn)
         await _ensure_bonus_posted_column(_conn)
         await ensure_notification_schema(_conn)
