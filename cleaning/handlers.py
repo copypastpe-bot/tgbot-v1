@@ -822,6 +822,7 @@ async def cleaning_client_lookup_phone(msg: Message, state: FSMContext, **kw) ->
 # ---------- cleaner manual expense ----------
 
 
+@router.message(Command("cleaning_expense"))
 @router.message(F.text == "➖ Добавить расход")
 async def foreman_expense_start(msg: Message, state: FSMContext, **kw) -> None:
     pool: asyncpg.Pool = kw["pool"]

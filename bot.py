@@ -15,6 +15,7 @@ from aiogram.types import (
     Message,
     CallbackQuery,
     BotCommand,
+    BotCommandScopeChat,
     BotCommandScopeDefault,
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -151,7 +152,14 @@ from notifications.amocrm_api import (
     should_skip_new_lead_alert,
 )
 from cleaning.schema import ensure_cleaning_schema
-from cleaning.handlers import cleaning_main_kb, router as cleaning_router
+from cleaning.handlers import (
+    cleaning_balance_cmd,
+    cleaning_client_lookup_start,
+    cleaning_main_kb,
+    foreman_expense_start,
+    router as cleaning_router,
+    start_cleaning_order,
+)
 from crm import (
     ChannelKind,
     ClientContact,
@@ -6301,9 +6309,13 @@ def norm_pay_method_py(p: str | None) -> str:
     return x
 
 async def set_commands():
-    cmds = [
+    default_cmds = [
         BotCommand(command="start", description="Старт"),
         BotCommand(command="help",  description="Помощь"),
+        BotCommand(command="whoami", description="Кто я"),
+    ]
+    admin_cmds = [
+        *default_cmds,
         BotCommand(command="order", description="Добавить заказ (мастер-меню)"),
         BotCommand(command="my_daily", description="Моя сводка за сегодня"),
         BotCommand(command="masters_all", description="Полный список мастеров"),
@@ -6319,7 +6331,47 @@ async def set_commands():
         BotCommand(command="cleaning_cash", description="Клининг: касса"),
         BotCommand(command="cleaning_orders", description="Клининг: заказы"),
     ]
-    await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
+    master_cmds = [
+        *default_cmds,
+        BotCommand(command="order", description="Добавить заказ"),
+        BotCommand(command="my_daily", description="Моя сводка за сегодня"),
+    ]
+    cleaner_cmds = [
+        *default_cmds,
+        BotCommand(command="cleaning_order", description="Клининг: провести уборку"),
+        BotCommand(command="cleaning_balance", description="Клининг: баланс"),
+        BotCommand(command="cleaning_expense", description="Клининг: добавить расход"),
+    ]
+    await bot.set_my_commands(default_cmds, scope=BotCommandScopeDefault())
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT tg_user_id, role
+            FROM staff
+            WHERE tg_user_id IS NOT NULL AND is_active = true
+            """
+        )
+    for row in rows:
+        role = row["role"]
+        if role in {"admin", "superadmin"}:
+            cmds = admin_cmds
+        elif role == "cleaner":
+            cmds = cleaner_cmds
+        elif role == "master":
+            cmds = master_cmds
+        else:
+            cmds = default_cmds
+        try:
+            await bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id=row["tg_user_id"]))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to set command menu for tg_user_id=%s role=%s: %s",
+                row["tg_user_id"],
+                role,
+                exc,
+            )
 
 # ===== Admin commands (must be defined after dp is created) =====
 @dp.message(Command("list_masters"))
@@ -12911,6 +12963,10 @@ async def commit_order(msg: Message, state: FSMContext):
 # 🔍 Клиент — поиск клиента по номеру
 @dp.message(F.text == "🔍 Клиент")
 async def master_find_start(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+    if role == "cleaner":
+        return await cleaning_client_lookup_start(msg, state, pool=pool)
     if not await ensure_master(msg.from_user.id):
         return await msg.answer("Доступно только мастерам.")
     await state.set_state(MasterFSM.waiting_phone)
@@ -13235,6 +13291,23 @@ async def master_rewash_order(msg: Message, state: FSMContext):
     )
 
 # fallback
+
+@dp.message(F.text.in_({"🧹 Провести уборку", "💰 Баланс", "➖ Добавить расход"}), StateFilter(None))
+async def cleaner_button_bridge(msg: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+    if role != "cleaner":
+        return await msg.answer(
+            "Команда не распознана. Выберите действие на клавиатуре ниже.",
+            reply_markup=await keyboard_for_user(msg.from_user.id),
+        )
+    if msg.text == "🧹 Провести уборку":
+        return await start_cleaning_order(msg, state, pool=pool)
+    if msg.text == "💰 Баланс":
+        return await cleaning_balance_cmd(msg, pool=pool)
+    if msg.text == "➖ Добавить расход":
+        return await foreman_expense_start(msg, state, pool=pool)
+
 
 @dp.message(F.text, ~F.text.startswith("/"), StateFilter(None))
 async def unknown(msg: Message, state: FSMContext):
