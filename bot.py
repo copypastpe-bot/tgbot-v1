@@ -151,7 +151,7 @@ from notifications.amocrm_api import (
     should_skip_new_lead_alert,
 )
 from cleaning.schema import ensure_cleaning_schema
-from cleaning.handlers import router as cleaning_router
+from cleaning.handlers import cleaning_main_kb, router as cleaning_router
 from crm import (
     ChannelKind,
     ClientContact,
@@ -3129,6 +3129,13 @@ PERMISSIONS_CANON = [
     "view_own_salary",
     "view_own_income",
     "import_leads",
+    "cleaning_create_orders",
+    "cleaning_view_balance",
+    "cleaning_view_clients",
+    "cleaning_record_expense",
+    "cleaning_view_reports",
+    "cleaning_manage_cash",
+    "cleaning_cancel_orders",
 ]
 
 ROLE_MATRIX = {
@@ -3152,11 +3159,24 @@ ROLE_MATRIX = {
         "view_own_salary",
         "view_own_income",
         "import_leads",
+        "cleaning_create_orders",
+        "cleaning_view_balance",
+        "cleaning_view_clients",
+        "cleaning_record_expense",
+        "cleaning_view_reports",
+        "cleaning_manage_cash",
+        "cleaning_cancel_orders",
     ],
     "master": [
         "create_orders_clients",
         "view_own_salary",
         "view_own_income",
+    ],
+    "cleaner": [
+        "cleaning_create_orders",
+        "cleaning_view_balance",
+        "cleaning_view_clients",
+        "cleaning_record_expense",
     ],
 }
 
@@ -6278,6 +6298,10 @@ async def set_commands():
         BotCommand(command="dividend", description="Выплата дивидендов"),
         BotCommand(command="investment", description="Внесение инвестиций"),
         BotCommand(command="jenya_card", description="Баланс Карты Жени"),
+        BotCommand(command="cleaning_order", description="Клининг: провести уборку"),
+        BotCommand(command="cleaning_balance", description="Клининг: баланс"),
+        BotCommand(command="cleaning_cash", description="Клининг: касса"),
+        BotCommand(command="cleaning_orders", description="Клининг: заказы"),
     ]
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
 
@@ -7196,6 +7220,19 @@ async def help_cmd(msg: Message):
             "/my_daily — ежедневная сводка (заказы, оплаты, ЗП, наличка)\n"
             "\n"
             "Для оформления заказа используйте кнопки внизу."
+        )
+    elif role == "cleaner":
+        text = (
+            "Команды клинера:\n"
+            "/whoami — кто я, мои права\n"
+            "\n"
+            "/cleaning_order — провести уборку\n"
+            "\n"
+            "/cleaning_balance — баланс кассы клининга\n"
+            "\n"
+            "/find <телефон> — найти клиента\n"
+            "\n"
+            "Для работы используйте кнопки внизу."
         )
     else:
         text = (
@@ -11334,9 +11371,25 @@ async def cancel_any(msg: Message, state: FSMContext):
         "UploadFSM",
         "ReportsFSM",
     }
+    cleaning_prefixes = {
+        "CleaningOrderFSM",
+        "CleaningDividendFSM",
+        "CleaningCashAddFSM",
+        "CleaningCashExpenseFSM",
+        "CleaningCashWithdrawalFSM",
+        "CleaningCancelOrderFSM",
+    }
     prefix = current_state.split(":")[0] if current_state else ""
     if prefix in admin_prefixes or await has_permission(msg.from_user.id, "view_orders_reports"):
         return await msg.answer("Отменено.", reply_markup=admin_root_kb())
+
+    if prefix in cleaning_prefixes:
+        return await msg.answer("Отменено.", reply_markup=cleaning_main_kb())
+
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, msg.from_user.id)
+    if role == "cleaner":
+        return await msg.answer("Отменено.", reply_markup=cleaning_main_kb())
 
     if await ensure_master(msg.from_user.id):
         return await msg.answer("Отменено.", reply_markup=master_kb)
@@ -11356,6 +11409,19 @@ async def ensure_master(user_id: int) -> bool:
     # Master access is defined by permission to create orders/clients
     return await has_permission(user_id, "create_orders_clients")
 
+
+async def keyboard_for_user(user_id: int) -> ReplyKeyboardMarkup:
+    global pool
+    async with pool.acquire() as conn:
+        role = await get_user_role(conn, user_id)
+    if role in ("admin", "superadmin"):
+        return admin_root_kb()
+    if role == "cleaner":
+        return cleaning_main_kb()
+    if role == "master":
+        return master_kb
+    return main_kb
+
 @dp.message(CommandStart())
 async def start_handler(msg: Message, state: FSMContext):
     await _ensure_pending_wire_on_abort(state)
@@ -11367,10 +11433,22 @@ async def start_handler(msg: Message, state: FSMContext):
     if role in ("admin", "superadmin"):
         await admin_menu_start(msg, state)
         return
+    if role == "cleaner":
+        await msg.answer(
+            "Привет! Это внутренний бот клининга. Нажми нужную кнопку.",
+            reply_markup=cleaning_main_kb(),
+        )
+        return
+    if role == "master":
+        await msg.answer(
+            "Привет! Это внутренний бот. Нажми нужную кнопку.",
+            reply_markup=master_main_kb()
+        )
+        return
 
     await msg.answer(
-        "Привет! Это внутренний бот. Нажми нужную кнопку.",
-        reply_markup=master_main_kb()
+        "Привет! Это внутренний бот.",
+        reply_markup=main_kb
     )
 
 # ---- /find ----
@@ -11398,7 +11476,7 @@ async def find_cmd(msg: Message):
     )
     if status == 'lead':
         text += "\n\nЭто лид. Нажмите «🧾 Заказ», чтобы оформить первый заказ и обновить имя."
-    kb = master_kb if await ensure_master(msg.from_user.id) else main_kb
+    kb = await keyboard_for_user(msg.from_user.id)
     await msg.answer(text, reply_markup=kb)
 
 # ===== FSM: Я ВЫПОЛНИЛ ЗАКАЗ =====
@@ -13149,11 +13227,16 @@ async def unknown(msg: Message, state: FSMContext):
         return
     if await has_permission(msg.from_user.id, "view_orders_reports"):
         kb = admin_root_kb()
-    elif await ensure_master(msg.from_user.id):
-        kb = master_kb
     else:
-        kb = main_kb
-    await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
+        async with pool.acquire() as conn:
+            role = await get_user_role(conn, msg.from_user.id)
+        if role == "cleaner":
+            kb = cleaning_main_kb()
+        elif await ensure_master(msg.from_user.id):
+            kb = master_kb
+        else:
+            kb = main_kb
+    await msg.answer("Команда не распознана. Выберите действие на клавиатуре ниже.", reply_markup=kb)
 
 async def main():
     global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task

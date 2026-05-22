@@ -18,7 +18,7 @@ from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
-from .access import is_cleaning_foreman
+from .access import can_create_cleaning_order, has_permission
 from .admin_ops import (
     add_cash_expense,
     add_cash_income,
@@ -143,11 +143,12 @@ def _confirm_kb() -> ReplyKeyboardMarkup:
     )
 
 
-def _foreman_kb() -> ReplyKeyboardMarkup:
+def cleaning_main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🧹 Провести уборку")],
-            [KeyboardButton(text="💰 Баланс кассы клининга")],
+            [KeyboardButton(text="🔍 Клиент"), KeyboardButton(text="💰 Баланс")],
+            [KeyboardButton(text="➖ Добавить расход")],
         ],
         resize_keyboard=True,
     )
@@ -155,7 +156,12 @@ def _foreman_kb() -> ReplyKeyboardMarkup:
 
 async def _is_foreman(pool: asyncpg.Pool, tg_user_id: int) -> bool:
     async with pool.acquire() as conn:
-        return await is_cleaning_foreman(conn, tg_user_id)
+        return await can_create_cleaning_order(conn, tg_user_id)
+
+
+async def _has_permission(pool: asyncpg.Pool, tg_user_id: int, permission: str) -> bool:
+    async with pool.acquire() as conn:
+        return await has_permission(conn, tg_user_id, permission)
 
 
 def _is_valid_phone(s: str) -> bool:
@@ -593,7 +599,7 @@ async def do_provesti(msg: Message, state: FSMContext, **kw) -> None:
     await send_cleaning_money_flow(bot, text)
     await msg.answer(
         f"Заказ #{order_id} проведён. Касса клининга: {_money_str(balance_after)}₽.",
-        reply_markup=_foreman_kb(),
+        reply_markup=cleaning_main_kb(),
     )
     await state.clear()
 
@@ -602,12 +608,11 @@ async def do_provesti(msg: Message, state: FSMContext, **kw) -> None:
 
 
 @router.message(Command("cleaning_balance"))
-@router.message(F.text == "💰 Баланс кассы клининга")
+@router.message(F.text.in_({"💰 Баланс", "💰 Баланс кассы клининга"}))
 async def cleaning_balance_cmd(msg: Message, **kw) -> None:
     pool: asyncpg.Pool = kw["pool"]
-    if not await _is_foreman(pool, msg.from_user.id):
-        # админы — позже через get_user_role; пока разрешим всем foreman'ам
-        await msg.answer("Команда доступна только клининг-бригадирам.")
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_view_balance"):
+        await msg.answer("Команда доступна только клинерам и администраторам.")
         return
     async with pool.acquire() as conn:
         balance = await get_cleaning_balance(conn)
@@ -619,8 +624,10 @@ async def cleaning_balance_cmd(msg: Message, **kw) -> None:
 
 @router.message(Command("cleaning_dividend"))
 async def start_cleaning_dividend(msg: Message, state: FSMContext, **kw) -> None:
-    # пока не делаем role-check — команда видна только тем, кто её знает.
-    # admin-роль подключим позже, см. дизайн §5.
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_manage_cash"):
+        await msg.answer("Команда доступна только администраторам.")
+        return
     await state.clear()
     await state.set_state(CleaningDividendFSM.amount)
     await msg.answer("DIV-выплата клининга.\nВведите сумму (руб):", reply_markup=cancel_kb)
@@ -676,7 +683,11 @@ async def div_provesti(msg: Message, state: FSMContext, **kw) -> None:
 
 
 @router.message(Command("cleaning_cash_add"))
-async def start_cash_add(msg: Message, state: FSMContext) -> None:
+async def start_cash_add(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_manage_cash"):
+        await msg.answer("Команда доступна только администраторам.")
+        return
     await state.clear()
     await state.set_state(CleaningCashAddFSM.method)
     await msg.answer(
@@ -760,7 +771,11 @@ async def cash_add_provesti(msg: Message, state: FSMContext, **kw) -> None:
 
 
 @router.message(Command("cleaning_cash_expense"))
-async def start_cash_expense(msg: Message, state: FSMContext) -> None:
+async def start_cash_expense(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_manage_cash"):
+        await msg.answer("Команда доступна только администраторам.")
+        return
     await state.clear()
     await state.set_state(CleaningCashExpenseFSM.category)
     await msg.answer(
@@ -841,7 +856,11 @@ async def cash_exp_provesti(msg: Message, state: FSMContext, **kw) -> None:
 
 
 @router.message(Command("cleaning_cash_withdrawal"))
-async def start_cash_withdrawal(msg: Message, state: FSMContext) -> None:
+async def start_cash_withdrawal(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_manage_cash"):
+        await msg.answer("Команда доступна только администраторам.")
+        return
     await state.clear()
     await state.set_state(CleaningCashWithdrawalFSM.amount)
     await msg.answer(
@@ -908,7 +927,13 @@ async def cash_wd_provesti(msg: Message, state: FSMContext, **kw) -> None:
 
 
 @router.message(Command("cleaning_cancel_order"))
-async def start_cancel_order(msg: Message, state: FSMContext, command: CommandObject = None) -> None:
+async def start_cancel_order(
+    msg: Message, state: FSMContext, command: CommandObject = None, **kw
+) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_cancel_orders"):
+        await msg.answer("Команда доступна только администраторам.")
+        return
     arg = (command.args if command else "") or ""
     arg = arg.strip()
     if not arg.isdigit():
@@ -968,6 +993,9 @@ async def cleaning_cash_report(
     msg: Message, command: CommandObject = None, **kw
 ) -> None:
     pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_view_reports"):
+        await msg.answer("Команда доступна только администраторам.")
+        return
     arg = ((command.args if command else "") or "").strip().lower() or "day"
     if arg not in {"day", "month", "year"}:
         await msg.answer("Использование: /cleaning_cash day|month|year")
@@ -989,6 +1017,9 @@ async def cleaning_orders_list(
     msg: Message, command: CommandObject = None, **kw
 ) -> None:
     pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_view_reports"):
+        await msg.answer("Команда доступна только администраторам.")
+        return
     arg = ((command.args if command else "") or "").strip().lower() or "day"
     if arg not in {"day", "month"}:
         await msg.answer("Использование: /cleaning_orders day|month")
