@@ -136,6 +136,20 @@ from notifications import (
     start_wahelp_webhook,
 )
 from notifications.amocrm import format_amocrm_admin_alert, normalize_amocrm_payload
+from notifications.amocrm_api import (
+    AmoCRMAPIAuthError,
+    AmoCRMAPIClient,
+    AmoCRMAPIRateLimitError,
+    AmoCRMAlert,
+    build_new_lead_alert,
+    build_unanswered_message_alert,
+    build_unsorted_alert,
+    extract_event_entity_id,
+    extract_event_identity,
+    format_amocrm_api_alert,
+    normalize_lead,
+    should_skip_new_lead_alert,
+)
 from cleaning.schema import ensure_cleaning_schema
 from cleaning.handlers import router as cleaning_router
 from crm import (
@@ -156,6 +170,14 @@ def is_valid_phone_format(s: str) -> bool:
     d = re.sub(r"[^0-9]", "", s or "")  # оставляем только цифры
     # 11 цифр и начинается с 7 или 8 — ок; 10 цифр и начинается с 9 — ок
     return (len(d) == 11 and d[0] in ("7", "8")) or (len(d) == 10 and d[0] == "9")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or str(default)).strip())
+    except Exception:
+        return default
+
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -180,6 +202,14 @@ WAHELP_WEBHOOK_TOKEN = os.getenv("WAHELP_WEBHOOK_TOKEN")
 ONLINEPBX_WEBHOOK_TOKEN = os.getenv("ONLINEPBX_WEBHOOK_TOKEN")
 AMOCRM_WEBHOOK_TOKEN = os.getenv("AMOCRM_WEBHOOK_TOKEN")
 AMOCRM_ACCOUNT_DOMAIN = (os.getenv("AMOCRM_ACCOUNT_DOMAIN") or "").strip()
+AMOCRM_API_BASE = (os.getenv("AMOCRM_API_BASE") or "").strip().rstrip("/")
+AMOCRM_API_TOKEN = (os.getenv("AMOCRM_API_TOKEN") or "").strip()
+AMOCRM_PIPELINE_ID = _env_int("AMOCRM_PIPELINE_ID", 0)
+AMOCRM_NEW_LEAD_STATUS_ID = _env_int("AMOCRM_NEW_LEAD_STATUS_ID", 0)
+AMOCRM_POLL_INTERVAL_SEC = max(10, _env_int("AMOCRM_POLL_INTERVAL_SEC", 30))
+AMOCRM_UNANSWERED_DELAY_SEC = max(60, _env_int("AMOCRM_UNANSWERED_DELAY_SEC", 600))
+AMOCRM_ACCEPTED_CALL_MIN_DURATION_SEC = max(1, _env_int("AMOCRM_ACCEPTED_CALL_MIN_DURATION_SEC", 20))
+AMOCRM_LOOKBACK_MINUTES = max(1, _env_int("AMOCRM_LOOKBACK_MINUTES", 30))
 ONLINEPBX_ALLOWED_IPS = {
     ip.strip()
     for ip in re.split(r"[ ,;]+", os.getenv("ONLINEPBX_ALLOWED_IPS", "").strip())
@@ -487,6 +517,7 @@ rewash_followup_task: asyncio.Task | None = None
 rewash_counter_task: asyncio.Task | None = None
 dead_channels_cleanup_task: asyncio.Task | None = None
 client_bot_health_task: asyncio.Task | None = None
+amocrm_api_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
 
 # === Ignore group/supergroup/channel updates; work only in private chats ===
@@ -942,6 +973,105 @@ async def ensure_amocrm_webhook_schema(conn: asyncpg.Connection) -> None:
     )
 
 
+async def ensure_amocrm_api_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS amocrm_api_state (
+            stream text PRIMARY KEY,
+            cursor_created_at integer NOT NULL DEFAULT 0,
+            updated_at timestamptz NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS amocrm_api_events (
+            event_id text PRIMARY KEY,
+            event_type text NOT NULL,
+            entity_id text,
+            payload jsonb NOT NULL,
+            action text NOT NULL,
+            error text,
+            created_at integer,
+            processed_at timestamptz NOT NULL DEFAULT NOW(),
+            notified_at timestamptz
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS amocrm_unsorted_seen (
+            uid text PRIMARY KEY,
+            pipeline_id bigint,
+            payload jsonb NOT NULL,
+            action text NOT NULL,
+            error text,
+            created_at integer,
+            processed_at timestamptz NOT NULL DEFAULT NOW(),
+            notified_at timestamptz
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS amocrm_pending_incoming (
+            id bigserial PRIMARY KEY,
+            event_id text NOT NULL UNIQUE,
+            message_id text,
+            lead_id bigint,
+            contact_id bigint,
+            talk_id text,
+            payload jsonb NOT NULL,
+            created_at integer NOT NULL,
+            due_at timestamptz NOT NULL,
+            status text NOT NULL DEFAULT 'pending',
+            notified_at timestamptz,
+            answered_at timestamptz,
+            error text
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_amocrm_pending_incoming_due
+        ON amocrm_pending_incoming(status, due_at);
+        """
+    )
+
+
+async def _amocrm_get_cursor(conn: asyncpg.Connection, stream: str, default_created_at: int) -> int:
+    value = await conn.fetchval(
+        "SELECT cursor_created_at FROM amocrm_api_state WHERE stream=$1",
+        stream,
+    )
+    if value is None:
+        await conn.execute(
+            """
+            INSERT INTO amocrm_api_state (stream, cursor_created_at)
+            VALUES ($1, $2)
+            ON CONFLICT (stream) DO NOTHING
+            """,
+            stream,
+            default_created_at,
+        )
+        return default_created_at
+    return int(value)
+
+
+async def _amocrm_set_cursor(conn: asyncpg.Connection, stream: str, cursor_created_at: int) -> None:
+    await conn.execute(
+        """
+        INSERT INTO amocrm_api_state (stream, cursor_created_at, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (stream) DO UPDATE
+        SET cursor_created_at=EXCLUDED.cursor_created_at,
+            updated_at=NOW()
+        """,
+        stream,
+        cursor_created_at,
+    )
+
+
 def _to_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -1262,6 +1392,481 @@ async def handle_amocrm_webhook(payload: Mapping[str, Any]) -> bool:
             error_text,
         )
     return True
+
+
+def _amocrm_api_enabled() -> bool:
+    return bool(AMOCRM_API_BASE and AMOCRM_API_TOKEN and AMOCRM_PIPELINE_ID)
+
+
+def _amocrm_default_cursor() -> int:
+    dt = datetime.now(timezone.utc) - timedelta(minutes=AMOCRM_LOOKBACK_MINUTES)
+    return int(dt.timestamp())
+
+
+def _amocrm_created_at(payload: Mapping[str, Any], default: int | None = None) -> int:
+    if default is None:
+        default = _amocrm_default_cursor()
+    return _to_int(payload.get("created_at"), default)
+
+
+def _amocrm_payload_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(dict(payload), ensure_ascii=False)
+
+
+def _amocrm_payload_from_db(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+            if isinstance(loaded, Mapping):
+                return dict(loaded)
+        except Exception:
+            return {}
+    return {}
+
+
+async def _amocrm_mark_event_action(
+    conn: asyncpg.Connection,
+    event_id: str,
+    action: str,
+    *,
+    error: str | None = None,
+    notified: bool = False,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE amocrm_api_events
+        SET action=$2,
+            error=$3,
+            notified_at=CASE WHEN $4 THEN NOW() ELSE notified_at END
+        WHERE event_id=$1
+        """,
+        event_id,
+        action,
+        error,
+        notified,
+    )
+
+
+async def _notify_admins_amocrm_api_alert(alert: AmoCRMAlert) -> bool:
+    if not ADMIN_TG_IDS:
+        return False
+    text = format_amocrm_api_alert(alert)
+    sent = 0
+    for admin_id in ADMIN_TG_IDS:
+        try:
+            await bot.send_message(admin_id, text, disable_web_page_preview=True)
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to notify admin %s about amoCRM API alert: %s", admin_id, exc)
+    return sent > 0
+
+
+async def _amocrm_fetch_first_contact(
+    client: AmoCRMAPIClient,
+    lead_contact_ids: Sequence[int],
+) -> Mapping[str, Any] | None:
+    for contact_id in lead_contact_ids:
+        try:
+            return await client.fetch_contact(int(contact_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to fetch amoCRM contact %s: %s", contact_id, exc)
+    return None
+
+
+async def _amocrm_resolve_target_lead(
+    client: AmoCRMAPIClient,
+    identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    lead_id = _to_int(identity.get("lead_id"), 0)
+    if lead_id:
+        lead = await client.fetch_lead(lead_id)
+        return lead if _to_int(lead.get("pipeline_id"), 0) == AMOCRM_PIPELINE_ID else None
+
+    contact_id = _to_int(identity.get("contact_id"), 0)
+    if not contact_id:
+        return None
+    leads = await client.fetch_contact_leads(contact_id, pipeline_id=AMOCRM_PIPELINE_ID)
+    for lead in leads:
+        if _to_int(lead.get("pipeline_id"), 0) == AMOCRM_PIPELINE_ID:
+            return lead
+    return None
+
+
+async def _amocrm_poll_new_leads_once(client: AmoCRMAPIClient) -> None:
+    if pool is None:
+        return
+    default_cursor = _amocrm_default_cursor()
+    async with pool.acquire() as conn:
+        cursor = await _amocrm_get_cursor(conn, "lead_events", default_cursor)
+
+    events = await client.fetch_events(event_types=["lead_added"], created_from=cursor)
+    max_created_at = cursor
+    for event in events:
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            continue
+        event_type = str(event.get("type") or "")
+        created_at = _amocrm_created_at(event, cursor)
+        max_created_at = max(max_created_at, created_at)
+        lead_id = extract_event_entity_id(event)
+        async with pool.acquire() as conn:
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO amocrm_api_events (
+                    event_id, event_type, entity_id, payload, action, created_at
+                )
+                VALUES ($1, $2, $3, $4::jsonb, 'pending', $5)
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id
+                """,
+                event_id,
+                event_type,
+                str(lead_id) if lead_id else None,
+                _amocrm_payload_json(event),
+                created_at,
+            )
+        if not inserted:
+            continue
+        if not lead_id:
+            async with pool.acquire() as conn:
+                await _amocrm_mark_event_action(conn, event_id, "error", error="missing lead id")
+            continue
+
+        try:
+            lead_payload = await client.fetch_lead(lead_id)
+            lead = normalize_lead(lead_payload)
+            notes = await client.fetch_lead_notes(lead.lead_id) if lead.status_id == AMOCRM_NEW_LEAD_STATUS_ID else []
+            if should_skip_new_lead_alert(
+                lead,
+                target_pipeline_id=AMOCRM_PIPELINE_ID,
+                new_lead_status_id=AMOCRM_NEW_LEAD_STATUS_ID,
+                notes=notes,
+                accepted_call_min_duration_sec=AMOCRM_ACCEPTED_CALL_MIN_DURATION_SEC,
+            ):
+                async with pool.acquire() as conn:
+                    await _amocrm_mark_event_action(conn, event_id, "ignored")
+                continue
+
+            contact = await _amocrm_fetch_first_contact(client, lead.contact_ids)
+            alert = build_new_lead_alert(lead, contact=contact, api_base=AMOCRM_API_BASE)
+            notified = await _notify_admins_amocrm_api_alert(alert)
+            async with pool.acquire() as conn:
+                await _amocrm_mark_event_action(
+                    conn,
+                    event_id,
+                    "notified" if notified else "error",
+                    error=None if notified else "ADMIN_TG_IDS is empty or Telegram send failed",
+                    notified=notified,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to process amoCRM lead event %s: %s", event_id, exc)
+            async with pool.acquire() as conn:
+                await _amocrm_mark_event_action(conn, event_id, "error", error=str(exc)[:500])
+
+    async with pool.acquire() as conn:
+        await _amocrm_set_cursor(conn, "lead_events", max_created_at)
+
+
+async def _amocrm_poll_unsorted_once(client: AmoCRMAPIClient) -> None:
+    if pool is None:
+        return
+    default_cursor = _amocrm_default_cursor()
+    async with pool.acquire() as conn:
+        cursor = await _amocrm_get_cursor(conn, "unsorted", default_cursor)
+
+    items = await client.fetch_unsorted(pipeline_id=AMOCRM_PIPELINE_ID, created_from=cursor)
+    max_created_at = cursor
+    for item in items:
+        uid = str(item.get("uid") or item.get("id") or "").strip()
+        if not uid:
+            continue
+        created_at = _amocrm_created_at(item, cursor)
+        max_created_at = max(max_created_at, created_at)
+        pipeline_id = _to_int(item.get("pipeline_id"), 0)
+        if pipeline_id and pipeline_id != AMOCRM_PIPELINE_ID:
+            continue
+        async with pool.acquire() as conn:
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO amocrm_unsorted_seen (
+                    uid, pipeline_id, payload, action, created_at
+                )
+                VALUES ($1, $2, $3::jsonb, 'pending', $4)
+                ON CONFLICT (uid) DO NOTHING
+                RETURNING uid
+                """,
+                uid,
+                pipeline_id or None,
+                _amocrm_payload_json(item),
+                created_at,
+            )
+        if not inserted:
+            continue
+        try:
+            alert = build_unsorted_alert(item, api_base=AMOCRM_API_BASE)
+            notified = await _notify_admins_amocrm_api_alert(alert)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE amocrm_unsorted_seen
+                    SET action=$2,
+                        error=$3,
+                        notified_at=CASE WHEN $4 THEN NOW() ELSE notified_at END
+                    WHERE uid=$1
+                    """,
+                    uid,
+                    "notified" if notified else "error",
+                    None if notified else "ADMIN_TG_IDS is empty or Telegram send failed",
+                    notified,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to process amoCRM unsorted %s: %s", uid, exc)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE amocrm_unsorted_seen SET action='error', error=$2 WHERE uid=$1",
+                    uid,
+                    str(exc)[:500],
+                )
+
+    async with pool.acquire() as conn:
+        await _amocrm_set_cursor(conn, "unsorted", max_created_at)
+
+
+async def _amocrm_close_pending_for_outgoing(conn: asyncpg.Connection, identity: Mapping[str, Any]) -> int:
+    talk_id = str(identity.get("talk_id") or "").strip()
+    lead_id = _to_int(identity.get("lead_id"), 0)
+    contact_id = _to_int(identity.get("contact_id"), 0)
+    if talk_id:
+        result = await conn.execute(
+            """
+            UPDATE amocrm_pending_incoming
+            SET status='answered',
+                answered_at=NOW()
+            WHERE status='pending' AND talk_id=$1
+            """,
+            talk_id,
+        )
+    elif lead_id:
+        result = await conn.execute(
+            """
+            UPDATE amocrm_pending_incoming
+            SET status='answered',
+                answered_at=NOW()
+            WHERE status='pending' AND lead_id=$1
+            """,
+            lead_id,
+        )
+    elif contact_id:
+        result = await conn.execute(
+            """
+            UPDATE amocrm_pending_incoming
+            SET status='answered',
+                answered_at=NOW()
+            WHERE status='pending' AND contact_id=$1
+            """,
+            contact_id,
+        )
+    else:
+        return 0
+    try:
+        return int(result.rsplit(" ", 1)[-1])
+    except Exception:
+        return 0
+
+
+async def _amocrm_poll_chat_events_once(client: AmoCRMAPIClient) -> None:
+    if pool is None:
+        return
+    default_cursor = _amocrm_default_cursor()
+    async with pool.acquire() as conn:
+        cursor = await _amocrm_get_cursor(conn, "chat_events", default_cursor)
+
+    events = await client.fetch_events(
+        event_types=["incoming_chat_message", "outgoing_chat_message"],
+        created_from=cursor,
+        entity="contact",
+    )
+    max_created_at = cursor
+    for event in events:
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            continue
+        event_type = str(event.get("type") or "")
+        created_at = _amocrm_created_at(event, cursor)
+        max_created_at = max(max_created_at, created_at)
+        identity = extract_event_identity(event)
+        payload = {"event": dict(event), "identity": identity}
+        async with pool.acquire() as conn:
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO amocrm_api_events (
+                    event_id, event_type, entity_id, payload, action, created_at
+                )
+                VALUES ($1, $2, $3, $4::jsonb, 'pending', $5)
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id
+                """,
+                event_id,
+                event_type,
+                str(identity.get("lead_id") or identity.get("contact_id") or ""),
+                _amocrm_payload_json(payload),
+                created_at,
+            )
+        if not inserted:
+            continue
+
+        try:
+            if event_type == "incoming_chat_message":
+                lead_payload = await _amocrm_resolve_target_lead(client, identity)
+                if not lead_payload:
+                    async with pool.acquire() as conn:
+                        await _amocrm_mark_event_action(conn, event_id, "ignored", error="no target pipeline lead")
+                    continue
+                lead = normalize_lead(lead_payload)
+                contact_id = _to_int(identity.get("contact_id"), 0)
+                if not contact_id and lead.contact_ids:
+                    contact_id = lead.contact_ids[0]
+                due_at = datetime.fromtimestamp(created_at, tz=timezone.utc) + timedelta(
+                    seconds=AMOCRM_UNANSWERED_DELAY_SEC
+                )
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO amocrm_pending_incoming (
+                            event_id, message_id, lead_id, contact_id, talk_id,
+                            payload, created_at, due_at, status
+                        )
+                        VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,'pending')
+                        ON CONFLICT (event_id) DO NOTHING
+                        """,
+                        event_id,
+                        identity.get("message_id"),
+                        lead.lead_id,
+                        contact_id or None,
+                        str(identity.get("talk_id") or "") or None,
+                        _amocrm_payload_json(payload),
+                        created_at,
+                        due_at,
+                    )
+                    await _amocrm_mark_event_action(conn, event_id, "pending")
+            elif event_type == "outgoing_chat_message":
+                async with pool.acquire() as conn:
+                    closed = await _amocrm_close_pending_for_outgoing(conn, identity)
+                    await _amocrm_mark_event_action(
+                        conn,
+                        event_id,
+                        "answered" if closed else "ignored",
+                        error=None if closed else "no matching pending incoming",
+                    )
+            else:
+                async with pool.acquire() as conn:
+                    await _amocrm_mark_event_action(conn, event_id, "ignored", error="unsupported chat event")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to process amoCRM chat event %s: %s", event_id, exc)
+            async with pool.acquire() as conn:
+                await _amocrm_mark_event_action(conn, event_id, "error", error=str(exc)[:500])
+
+    async with pool.acquire() as conn:
+        await _amocrm_set_cursor(conn, "chat_events", max_created_at)
+
+
+async def _amocrm_notify_due_unanswered_once(client: AmoCRMAPIClient) -> None:
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, payload, lead_id, contact_id
+            FROM amocrm_pending_incoming
+            WHERE status='pending' AND due_at <= NOW()
+            ORDER BY due_at ASC
+            LIMIT 50
+            """
+        )
+    for row in rows:
+        row_id = int(row["id"])
+        payload = _amocrm_payload_from_db(row["payload"])
+        identity = payload.get("identity") if isinstance(payload.get("identity"), Mapping) else {}
+        lead_payload: Mapping[str, Any] | None = None
+        contact_payload: Mapping[str, Any] | None = None
+        try:
+            lead_id = _to_int(row["lead_id"], 0)
+            contact_id = _to_int(row["contact_id"], 0)
+            if lead_id:
+                lead_payload = await client.fetch_lead(lead_id)
+                if _to_int(lead_payload.get("pipeline_id"), 0) != AMOCRM_PIPELINE_ID:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE amocrm_pending_incoming
+                            SET status='ignored',
+                                error='lead moved out of target pipeline'
+                            WHERE id=$1
+                            """,
+                            row_id,
+                        )
+                    continue
+                if not contact_id:
+                    lead = normalize_lead(lead_payload)
+                    if lead.contact_ids:
+                        contact_id = lead.contact_ids[0]
+            if contact_id:
+                contact_payload = await client.fetch_contact(contact_id)
+            alert = build_unanswered_message_alert(
+                lead=lead_payload,
+                contact=contact_payload,
+                text=str(identity.get("text") or "").strip() or None,
+                api_base=AMOCRM_API_BASE,
+            )
+            notified = await _notify_admins_amocrm_api_alert(alert)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE amocrm_pending_incoming
+                    SET status=$2,
+                        notified_at=CASE WHEN $2='notified' THEN NOW() ELSE notified_at END,
+                        error=$3
+                    WHERE id=$1
+                    """,
+                    row_id,
+                    "notified" if notified else "error",
+                    None if notified else "ADMIN_TG_IDS is empty or Telegram send failed",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to notify amoCRM pending incoming %s: %s", row_id, exc)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE amocrm_pending_incoming SET status='error', error=$2 WHERE id=$1",
+                    row_id,
+                    str(exc)[:500],
+                )
+
+
+async def amocrm_api_polling_loop() -> None:
+    if not _amocrm_api_enabled():
+        logger.info("amoCRM API polling disabled")
+        return
+    logger.info("amoCRM API polling enabled for pipeline %s", AMOCRM_PIPELINE_ID)
+    async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+        while True:
+            try:
+                await _amocrm_poll_new_leads_once(client)
+                await _amocrm_poll_unsorted_once(client)
+                await _amocrm_poll_chat_events_once(client)
+                await _amocrm_notify_due_unanswered_once(client)
+            except AmoCRMAPIAuthError as exc:
+                logger.error("amoCRM API auth failed; polling stopped: %s", exc)
+                return
+            except AmoCRMAPIRateLimitError as exc:
+                logger.warning("amoCRM API rate limited; next cycle will retry: %s", exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("amoCRM API polling cycle failed: %s", exc)
+            await asyncio.sleep(AMOCRM_POLL_INTERVAL_SEC)
+
 
 LEADS_PROMO_CAMPAIGNS: dict[str, list[str]] = {
     "week1": [
@@ -12487,7 +13092,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Нажми «🧾 Я ВЫПОЛНИЛ ЗАКАЗ» или /help", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_followup_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     dp["pool"] = pool
@@ -12507,6 +13112,7 @@ async def main():
         await ensure_client_channels_schema(_conn)
         await ensure_onlinepbx_schema(_conn)
         await ensure_amocrm_webhook_schema(_conn)
+        await ensure_amocrm_api_schema(_conn)
         await ensure_cleaning_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
@@ -12555,6 +13161,8 @@ async def main():
                 "client_bot_health",
             )
         )
+    if amocrm_api_task is None and _amocrm_api_enabled():
+        amocrm_api_task = asyncio.create_task(amocrm_api_polling_loop())
     if notification_rules is not None:
         notification_worker = NotificationWorker(
             pool,
@@ -12590,6 +13198,12 @@ async def main():
             await notification_worker.stop()
         if wahelp_webhook is not None:
             await wahelp_webhook.stop()
+        if amocrm_api_task is not None:
+            amocrm_api_task.cancel()
+            try:
+                await amocrm_api_task
+            except asyncio.CancelledError:
+                pass
 
 if __name__ == "__main__":
     asyncio.run(main())
