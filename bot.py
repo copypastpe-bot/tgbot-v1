@@ -1448,6 +1448,43 @@ async def _amocrm_mark_event_action(
     )
 
 
+async def _amocrm_has_notified_lead_alert(
+    conn: asyncpg.Connection,
+    lead_id: int,
+    *,
+    excluding_event_id: str | None = None,
+) -> bool:
+    if not lead_id:
+        return False
+    lead_id_text = str(lead_id)
+    api_event = await conn.fetchval(
+        """
+        SELECT 1
+        FROM amocrm_api_events
+        WHERE action='notified'
+          AND event_type='lead_added'
+          AND entity_id=$1
+          AND ($2::text IS NULL OR event_id<>$2)
+        LIMIT 1
+        """,
+        lead_id_text,
+        excluding_event_id,
+    )
+    if api_event:
+        return True
+    unsorted = await conn.fetchval(
+        """
+        SELECT 1
+        FROM amocrm_unsorted_seen
+        WHERE action='notified'
+          AND payload @> $1::jsonb
+        LIMIT 1
+        """,
+        json.dumps({"_embedded": {"leads": [{"id": lead_id}]}}, ensure_ascii=False),
+    )
+    return bool(unsorted)
+
+
 async def _notify_admins_amocrm_api_alert(alert: AmoCRMAlert) -> bool:
     if not ADMIN_TG_IDS:
         return False
@@ -1536,6 +1573,10 @@ async def _amocrm_poll_new_leads_once(client: AmoCRMAPIClient) -> None:
         try:
             lead_payload = await client.fetch_lead(lead_id)
             lead = normalize_lead(lead_payload)
+            async with pool.acquire() as conn:
+                if await _amocrm_has_notified_lead_alert(conn, lead.lead_id, excluding_event_id=event_id):
+                    await _amocrm_mark_event_action(conn, event_id, "ignored", error="lead already notified")
+                    continue
             notes = await client.fetch_lead_notes(lead.lead_id) if lead.status_id == AMOCRM_NEW_LEAD_STATUS_ID else []
             if should_skip_new_lead_alert(
                 lead,
@@ -1604,6 +1645,23 @@ async def _amocrm_poll_unsorted_once(client: AmoCRMAPIClient) -> None:
             continue
         try:
             embedded = item.get("_embedded") if isinstance(item.get("_embedded"), Mapping) else {}
+            leads = embedded.get("leads") if isinstance(embedded.get("leads"), list) else []
+            lead_id = 0
+            if leads and isinstance(leads[0], Mapping):
+                lead_id = _to_int(leads[0].get("id"), 0)
+            if lead_id:
+                async with pool.acquire() as conn:
+                    if await _amocrm_has_notified_lead_alert(conn, lead_id):
+                        await conn.execute(
+                            """
+                            UPDATE amocrm_unsorted_seen
+                            SET action='ignored',
+                                error='lead already notified'
+                            WHERE uid=$1
+                            """,
+                            uid,
+                        )
+                        continue
             contacts = embedded.get("contacts") if isinstance(embedded.get("contacts"), list) else []
             contact = None
             if contacts and isinstance(contacts[0], Mapping) and contacts[0].get("id") is not None:
