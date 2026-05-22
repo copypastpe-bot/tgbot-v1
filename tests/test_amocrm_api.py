@@ -213,7 +213,27 @@ class AmoCRMAlertRulesTests(unittest.TestCase):
                 target_pipeline_id=55,
                 new_lead_status_id=777,
                 notes=notes,
-                accepted_call_min_duration_sec=20,
+            )
+        )
+
+    def test_skips_new_lead_when_new_lead_status_and_short_call(self):
+        lead = AmoCRMLead(
+            lead_id=123,
+            name="Входящий звонок",
+            pipeline_id=55,
+            status_id=777,
+            created_at=100,
+            contact_ids=[10],
+            payload={},
+        )
+        notes = [{"note_type": "call_in", "params": {"duration": 0}}]
+
+        self.assertTrue(
+            should_skip_new_lead_alert(
+                lead,
+                target_pipeline_id=55,
+                new_lead_status_id=777,
+                notes=notes,
             )
         )
 
@@ -234,7 +254,6 @@ class AmoCRMAlertRulesTests(unittest.TestCase):
                 target_pipeline_id=55,
                 new_lead_status_id=777,
                 notes=[],
-                accepted_call_min_duration_sec=20,
             )
         )
 

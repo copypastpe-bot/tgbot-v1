@@ -195,6 +195,10 @@ def is_accepted_call_note(note: Mapping[str, Any], *, min_duration_sec: int) -> 
     return duration >= min_duration_sec
 
 
+def is_call_note(note: Mapping[str, Any]) -> bool:
+    return str(note.get("note_type") or "") == "call_in"
+
+
 def extract_event_type(event: Mapping[str, Any]) -> str:
     return str(event.get("type") or "").strip()
 
@@ -272,13 +276,13 @@ def should_skip_new_lead_alert(
     target_pipeline_id: int,
     new_lead_status_id: int,
     notes: list[Mapping[str, Any]],
-    accepted_call_min_duration_sec: int,
+    accepted_call_min_duration_sec: int | None = None,
 ) -> bool:
     if lead.pipeline_id != target_pipeline_id:
         return True
     if lead.status_id != new_lead_status_id:
         return False
-    return any(is_accepted_call_note(note, min_duration_sec=accepted_call_min_duration_sec) for note in notes)
+    return any(is_call_note(note) for note in notes)
 
 
 def build_new_lead_alert(
@@ -410,6 +414,7 @@ __all__ = [
     "extract_lead_contact_ids",
     "format_amocrm_api_alert",
     "is_accepted_call_note",
+    "is_call_note",
     "normalize_lead",
     "should_skip_new_lead_alert",
 ]

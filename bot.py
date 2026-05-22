@@ -208,7 +208,6 @@ AMOCRM_PIPELINE_ID = _env_int("AMOCRM_PIPELINE_ID", 0)
 AMOCRM_NEW_LEAD_STATUS_ID = _env_int("AMOCRM_NEW_LEAD_STATUS_ID", 0)
 AMOCRM_POLL_INTERVAL_SEC = max(10, _env_int("AMOCRM_POLL_INTERVAL_SEC", 30))
 AMOCRM_UNANSWERED_DELAY_SEC = max(60, _env_int("AMOCRM_UNANSWERED_DELAY_SEC", 600))
-AMOCRM_ACCEPTED_CALL_MIN_DURATION_SEC = max(1, _env_int("AMOCRM_ACCEPTED_CALL_MIN_DURATION_SEC", 20))
 AMOCRM_LOOKBACK_MINUTES = max(1, _env_int("AMOCRM_LOOKBACK_MINUTES", 30))
 ONLINEPBX_ALLOWED_IPS = {
     ip.strip()
@@ -1543,7 +1542,6 @@ async def _amocrm_poll_new_leads_once(client: AmoCRMAPIClient) -> None:
                 target_pipeline_id=AMOCRM_PIPELINE_ID,
                 new_lead_status_id=AMOCRM_NEW_LEAD_STATUS_ID,
                 notes=notes,
-                accepted_call_min_duration_sec=AMOCRM_ACCEPTED_CALL_MIN_DURATION_SEC,
             ):
                 async with pool.acquire() as conn:
                     await _amocrm_mark_event_action(conn, event_id, "ignored")
