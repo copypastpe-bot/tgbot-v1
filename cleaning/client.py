@@ -43,7 +43,7 @@ async def find_client_by_phone(
         return None
     return await conn.fetchrow(
         """
-        SELECT id, full_name, phone, bonus_balance
+        SELECT id, full_name, phone, address, birthday, status, bonus_balance
         FROM clients
         WHERE regexp_replace(COALESCE(phone,''), '[^0-9]+', '', 'g') = ANY($1::text[])
         LIMIT 1
@@ -67,7 +67,7 @@ async def upsert_client(
         ON CONFLICT (phone) DO UPDATE SET
             full_name = COALESCE(EXCLUDED.full_name, clients.full_name),
             status    = 'client'
-        RETURNING id, full_name, phone, bonus_balance
+        RETURNING id, full_name, phone, address, bonus_balance
         """,
         full_name,
         phone_norm,

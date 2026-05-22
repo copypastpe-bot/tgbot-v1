@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -88,30 +87,43 @@ from .fsm import (
 from .notify import send_cleaning_money_flow
 from .orders import (
     PaymentPart,
+    calculate_bonus_earned,
+    calculate_bonus_max,
     cashbook_rows_from_payments,
+    get_min_order_amount,
+    is_wire_payment_method,
     parse_amount,
-    payments_balance_diff,
+    validate_payment_parts,
 )
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="cleaning")
 
-BONUS_RATE = Decimal(os.getenv("BONUS_RATE_PERCENT", "5")) / Decimal(100)
-MAX_BONUS_RATE = Decimal(os.getenv("MAX_BONUS_SPEND_RATE_PERCENT", "50")) / Decimal(100)
-
 cancel_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Отмена")]], resize_keyboard=True
 )
 
 
-def _pay_method_kb() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text=m) for m in CLEANING_PAYMENT_METHODS],
-        [KeyboardButton(text=CLEANING_GIFT_CERT_LABEL)],
-        [KeyboardButton(text="Отмена")],
+def _pay_method_kb(*, allow_wire: bool = True) -> ReplyKeyboardMarkup:
+    methods = CLEANING_PAYMENT_METHODS if allow_wire else [
+        m for m in CLEANING_PAYMENT_METHODS if not is_wire_payment_method(m)
     ]
+    rows = [[KeyboardButton(text=m) for m in methods]]
+    rows.append([KeyboardButton(text=CLEANING_GIFT_CERT_LABEL)])
+    rows.append([KeyboardButton(text="Отмена")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def _address_choice_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Использовать этот адрес")],
+            [KeyboardButton(text="Другой адрес")],
+            [KeyboardButton(text="Отмена")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def _expense_category_kb() -> ReplyKeyboardMarkup:
@@ -137,7 +149,7 @@ def _confirm_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Провести")],
-            [KeyboardButton(text="Отмена")],
+            [KeyboardButton(text="Отменить")],
         ],
         resize_keyboard=True,
     )
@@ -204,11 +216,11 @@ async def start_cleaning_order(msg: Message, state: FSMContext, **data) -> None:
         CleaningCashWithdrawalFSM,
         CleaningCancelOrderFSM,
     ),
-    F.text == "Отмена",
+    F.text.in_({"Отмена", "Отменить"}),
 )
 async def cancel(msg: Message, state: FSMContext) -> None:
     await state.clear()
-    await msg.answer("Отменено.", reply_markup=ReplyKeyboardRemove())
+    await msg.answer("Отменено.", reply_markup=cleaning_main_kb())
 
 
 @router.message(CleaningOrderFSM.phone, F.text)
@@ -228,8 +240,19 @@ async def got_phone(msg: Message, state: FSMContext, **data) -> None:
     if client:
         payload["client_id"] = client["id"]
         payload["client_name"] = client["full_name"] or ""
+        payload["client_phone"] = client["phone"] or phone_norm
+        payload["client_address"] = client["address"] or ""
         payload["bonus_balance"] = int(client["bonus_balance"] or 0)
         await state.update_data(**payload)
+        if payload["client_address"]:
+            await state.set_state(CleaningOrderFSM.address_choice)
+            await msg.answer(
+                f"Клиент: {client['full_name'] or 'Без имени'}\n"
+                f"Бонусов: {payload['bonus_balance']}\n"
+                f"Адрес из базы: {payload['client_address']}",
+                reply_markup=_address_choice_kb(),
+            )
+            return
         await state.set_state(CleaningOrderFSM.address)
         await msg.answer(
             f"Клиент: {client['full_name'] or 'Без имени'}\n"
@@ -239,6 +262,8 @@ async def got_phone(msg: Message, state: FSMContext, **data) -> None:
         )
     else:
         payload["client_id"] = None
+        payload["client_phone"] = phone_norm
+        payload["client_address"] = ""
         payload["bonus_balance"] = 0
         await state.update_data(**payload)
         await state.set_state(CleaningOrderFSM.name)
@@ -256,13 +281,34 @@ async def got_name(msg: Message, state: FSMContext) -> None:
     await msg.answer("Введите адрес уборки:", reply_markup=cancel_kb)
 
 
+@router.message(CleaningOrderFSM.address_choice, F.text)
+async def got_address_choice(msg: Message, state: FSMContext) -> None:
+    choice = msg.text.strip()
+    data = await state.get_data()
+    if choice == "Использовать этот адрес":
+        address = (data.get("client_address") or "").strip()
+        if not address:
+            await state.set_state(CleaningOrderFSM.address)
+            await msg.answer("Введите адрес уборки:", reply_markup=cancel_kb)
+            return
+        await state.update_data(address=address, address_from_client=True)
+        await state.set_state(CleaningOrderFSM.amount)
+        await msg.answer("Введите сумму чека (руб):", reply_markup=cancel_kb)
+        return
+    if choice == "Другой адрес":
+        await state.set_state(CleaningOrderFSM.address)
+        await msg.answer("Введите адрес уборки:", reply_markup=cancel_kb)
+        return
+    await msg.answer("Выберите вариант кнопкой.", reply_markup=_address_choice_kb())
+
+
 @router.message(CleaningOrderFSM.address, F.text)
 async def got_address(msg: Message, state: FSMContext) -> None:
     address = msg.text.strip()
     if not address:
         await msg.answer("Адрес не может быть пустым.", reply_markup=cancel_kb)
         return
-    await state.update_data(address=address)
+    await state.update_data(address=address, address_from_client=False)
     await state.set_state(CleaningOrderFSM.amount)
     await msg.answer("Введите сумму чека (руб):", reply_markup=cancel_kb)
 
@@ -273,71 +319,96 @@ async def got_amount(msg: Message, state: FSMContext) -> None:
     if amount is None or amount <= 0:
         await msg.answer("Нужно число > 0. Повторите.", reply_markup=cancel_kb)
         return
-    await state.update_data(total_amount=str(amount))
-    data = await state.get_data()
-    balance = int(data.get("bonus_balance") or 0)
-    if balance > 0:
-        max_spend = int((amount * MAX_BONUS_RATE).to_integral_value())
-        max_spend = min(max_spend, balance)
-        await state.update_data(bonus_max=max_spend)
-        await state.set_state(CleaningOrderFSM.bonus_spend)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text=f"Списать {max_spend}"), KeyboardButton(text="0")],
-                [KeyboardButton(text="Отмена")],
-            ],
-            resize_keyboard=True,
-        )
+    min_amount = get_min_order_amount()
+    if amount < min_amount:
         await msg.answer(
-            f"Бонусов у клиента: {balance}. Максимум к списанию: {max_spend}.\n"
-            "Введите сколько списать (число) или нажмите кнопку:",
-            reply_markup=kb,
+            f"Минимальный чек уборки: {_money_str(min_amount)}₽. Повторите.",
+            reply_markup=cancel_kb,
         )
-    else:
-        await state.update_data(bonus_spend=0)
-        await _start_payment_collection(msg, state)
+        return
+    await state.update_data(total_amount=str(amount))
+    await state.set_state(CleaningOrderFSM.pay_method)
+    await msg.answer("Выберите способ оплаты:", reply_markup=_pay_method_kb(allow_wire=True))
 
 
 @router.message(CleaningOrderFSM.bonus_spend, F.text)
 async def got_bonus_spend(msg: Message, state: FSMContext) -> None:
     data = await state.get_data()
     text = msg.text.strip()
-    if text.lower().startswith("списать"):
-        spend_value = data.get("bonus_max") or 0
+    if text == "Не списывать":
+        spend_value = Decimal("0")
+    elif text.lower().startswith("списать"):
+        spend_value = Decimal(data.get("bonus_max") or 0)
     else:
         parsed = parse_amount(text)
         if parsed is None:
             await msg.answer("Нужно число ≥ 0.", reply_markup=cancel_kb)
             return
-        spend_value = int(parsed)
-    max_spend = int(data.get("bonus_max") or 0)
+        spend_value = parsed
+    max_spend = Decimal(data.get("bonus_max") or 0)
     if spend_value > max_spend:
-        await msg.answer(f"Максимум к списанию: {max_spend}.", reply_markup=cancel_kb)
+        await msg.answer(f"Максимум к списанию: {_money_str(max_spend)}.", reply_markup=cancel_kb)
         return
-    await state.update_data(bonus_spend=spend_value)
-    await _start_payment_collection(msg, state)
-
-
-async def _start_payment_collection(msg: Message, state: FSMContext) -> None:
-    await state.update_data(payments=[])
-    data = await state.get_data()
-    total = Decimal(data["total_amount"])
-    used = Decimal(int(data.get("bonus_spend") or 0))
-    expected = total - used
-    await state.set_state(CleaningOrderFSM.pay_method)
-    await msg.answer(
-        f"Сумма к оплате: {_money_str(expected)}₽.\nВыберите метод оплаты:",
-        reply_markup=_pay_method_kb(),
-    )
+    method = data.get("pending_pay_method")
+    await state.update_data(bonus_spend=int(spend_value), bonus_step_done=True)
+    await state.set_state(CleaningOrderFSM.pay_amount)
+    await msg.answer(f"Сумма по «{method}»:", reply_markup=cancel_kb)
 
 
 @router.message(CleaningOrderFSM.pay_method, F.text)
 async def got_pay_method(msg: Message, state: FSMContext) -> None:
     method = msg.text.strip()
+    data = await state.get_data()
+    payments = list(data.get("payments") or [])
+    allow_wire = not payments and not data.get("bonus_step_done")
     if method not in CLEANING_ALL_PAYMENT_LABELS:
-        await msg.answer("Выберите метод кнопкой.", reply_markup=_pay_method_kb())
+        await msg.answer("Выберите метод кнопкой.", reply_markup=_pay_method_kb(allow_wire=allow_wire))
+        return
+    if is_wire_payment_method(method):
+        if not allow_wire:
+            await msg.answer(
+                "Расчётный нельзя смешивать с другими способами оплаты.",
+                reply_markup=_pay_method_kb(allow_wire=False),
+            )
+            return
+        total = Decimal(data["total_amount"])
+        await state.update_data(
+            payments=[{"method": method, "amount": str(total)}],
+            bonus_spend=0,
+            bonus_earned=0,
+            is_wire_payment=True,
+            bonus_step_done=True,
+        )
+        await state.set_state(CleaningOrderFSM.expense_category)
+        await msg.answer(
+            "Оплата по расчётному счёту принята. Бонусы не списываем и не начисляем.\n"
+            "Теперь расходы по заказу. Выберите категорию или «Готово»:",
+            reply_markup=_expense_category_kb(),
+        )
         return
     await state.update_data(pending_pay_method=method)
+    if not data.get("bonus_step_done"):
+        total = Decimal(data["total_amount"])
+        balance = int(data.get("bonus_balance") or 0)
+        bonus_max = calculate_bonus_max(total, balance)
+        if balance > 0 and bonus_max > 0:
+            await state.update_data(bonus_max=str(bonus_max), payments=[])
+            await state.set_state(CleaningOrderFSM.bonus_spend)
+            kb = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text=f"Списать {int(bonus_max)} бонусов")],
+                    [KeyboardButton(text="Не списывать")],
+                    [KeyboardButton(text="Отмена")],
+                ],
+                resize_keyboard=True,
+            )
+            await msg.answer(
+                f"Бонусов у клиента: {balance}. Максимум к списанию: {int(bonus_max)}.\n"
+                "Выберите списание:",
+                reply_markup=kb,
+            )
+            return
+        await state.update_data(bonus_spend=0, bonus_step_done=True, payments=[])
     await state.set_state(CleaningOrderFSM.pay_amount)
     await msg.answer(f"Сумма по «{method}»:", reply_markup=cancel_kb)
 
@@ -356,8 +427,9 @@ async def got_pay_amount(msg: Message, state: FSMContext) -> None:
     parts = [PaymentPart(p["method"], Decimal(p["amount"])) for p in payments]
     total = Decimal(data["total_amount"])
     used = Decimal(int(data.get("bonus_spend") or 0))
-    diff = payments_balance_diff(parts, total, used)
-    if diff == 0:
+    ok, error = validate_payment_parts(parts, total, used)
+    diff = sum((p.amount for p in parts), ZERO) - (total - used)
+    if ok:
         await state.set_state(CleaningOrderFSM.expense_category)
         await msg.answer(
             "Оплата сошлась. Теперь расходы по заказу.\nВыберите категорию или «Готово»:",
@@ -366,7 +438,7 @@ async def got_pay_amount(msg: Message, state: FSMContext) -> None:
         return
     if diff > 0:
         await msg.answer(
-            f"Переплата: {_money_str(diff)}₽. Удалите лишнюю часть или начните заново /cleaning_order.",
+            f"{error} Удалите лишнюю часть или начните заново /cleaning_order.",
             reply_markup=cancel_kb,
         )
         return
@@ -374,7 +446,7 @@ async def got_pay_amount(msg: Message, state: FSMContext) -> None:
     await state.set_state(CleaningOrderFSM.pay_method)
     await msg.answer(
         f"Принято. Осталось: {_money_str(remaining)}₽.\nВыберите следующий метод:",
-        reply_markup=_pay_method_kb(),
+        reply_markup=_pay_method_kb(allow_wire=False),
     )
 
 
@@ -416,12 +488,14 @@ async def _show_confirm(msg: Message, state: FSMContext) -> None:
     used = Decimal(int(data.get("bonus_spend") or 0))
     payments = data.get("payments") or []
     expenses = data.get("expenses") or []
+    primary_method = payments[0]["method"] if payments else ""
+    earned = calculate_bonus_earned(primary_method, total - used)
     lines = [
         "Подтвердите проведение уборки:",
         f"Клиент: {data.get('client_name') or '—'} ({data.get('phone_norm')})",
         f"Адрес: {data.get('address')}",
         f"Сумма чека: {_money_str(total)}₽",
-        f"Списано бонусов: {used}",
+        f"Бонусы: списано {int(used)}, начислено {earned}",
         "Оплата:",
     ]
     for p in payments:
@@ -457,7 +531,7 @@ async def do_provesti(msg: Message, state: FSMContext, **kw) -> None:
             # клиент (upsert)
             if data.get("client_id"):
                 client_row = await conn.fetchrow(
-                    "SELECT id, full_name, bonus_balance FROM clients WHERE id=$1",
+                    "SELECT id, full_name, phone, address, bonus_balance FROM clients WHERE id=$1",
                     data["client_id"],
                 )
                 if client_row is None:
@@ -471,12 +545,20 @@ async def do_provesti(msg: Message, state: FSMContext, **kw) -> None:
                 )
 
             client_id = client_row["id"]
+            if not (client_row["address"] or "").strip() and data.get("address"):
+                await conn.execute(
+                    "UPDATE clients SET address=$1 WHERE id=$2 AND (address IS NULL OR address = '')",
+                    data["address"],
+                    client_id,
+                )
             total = Decimal(data["total_amount"])
             bonus_spend = int(data.get("bonus_spend") or 0)
-            # Начисление: процент от безбонусной суммы оплаты (как в химчистке: от cash_payment)
-            # Здесь упрощаем — от (total - bonus_spend), сертификат тоже учитывается как платёж.
-            # Если бизнес скажет иначе — поправим, открытый момент уже в дизайне.
-            bonus_earned = int(((total - Decimal(bonus_spend)) * BONUS_RATE).to_integral_value())
+            payments = data.get("payments") or []
+            primary_method = payments[0]["method"] if payments else ""
+            bonus_earned = calculate_bonus_earned(
+                primary_method,
+                total - Decimal(bonus_spend),
+            )
 
             client_op_id = data.get("client_op_id")
             order_row = await conn.fetchrow(
@@ -503,7 +585,6 @@ async def do_provesti(msg: Message, state: FSMContext, **kw) -> None:
                 return
             order_id = order_row["id"]
 
-            payments = data.get("payments") or []
             for p in payments:
                 method = p["method"]
                 amount = Decimal(p["amount"])
