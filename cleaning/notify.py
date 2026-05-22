@@ -29,4 +29,8 @@ async def send_cleaning_money_flow(bot: Bot, text: str) -> None:
             parse_mode=ParseMode.HTML,
         )
     except Exception as exc:
-        logger.warning("Failed to send cleaning money-flow message: %s", exc)
+        logger.warning(
+            "Failed to send cleaning money-flow message to chat_id=%s: %s",
+            CLEANING_MONEY_FLOW_CHAT_ID,
+            exc,
+        )
