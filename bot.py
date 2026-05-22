@@ -1603,7 +1603,15 @@ async def _amocrm_poll_unsorted_once(client: AmoCRMAPIClient) -> None:
         if not inserted:
             continue
         try:
-            alert = build_unsorted_alert(item, api_base=AMOCRM_API_BASE)
+            embedded = item.get("_embedded") if isinstance(item.get("_embedded"), Mapping) else {}
+            contacts = embedded.get("contacts") if isinstance(embedded.get("contacts"), list) else []
+            contact = None
+            if contacts and isinstance(contacts[0], Mapping) and contacts[0].get("id") is not None:
+                try:
+                    contact = await client.fetch_contact(int(contacts[0]["id"]))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to fetch amoCRM unsorted contact %s: %s", contacts[0].get("id"), exc)
+            alert = build_unsorted_alert(item, api_base=AMOCRM_API_BASE, contact=contact)
             notified = await _notify_admins_amocrm_api_alert(alert)
             async with pool.acquire() as conn:
                 await conn.execute(

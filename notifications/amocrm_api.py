@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Mapping
 
 import aiohttp
@@ -305,23 +306,43 @@ def build_new_lead_alert(
     )
 
 
-def build_unsorted_alert(item: Mapping[str, Any], *, api_base: str) -> AmoCRMAlert:
+def build_unsorted_alert(
+    item: Mapping[str, Any],
+    *,
+    api_base: str,
+    contact: Mapping[str, Any] | None = None,
+) -> AmoCRMAlert:
     embedded = item.get("_embedded") if isinstance(item.get("_embedded"), Mapping) else {}
     leads = embedded.get("leads") or []
     lead_id = None
     if leads and isinstance(leads[0], Mapping) and leads[0].get("id") is not None:
         lead_id = int(leads[0]["id"])
+    contacts = embedded.get("contacts") or []
+    contact_id = None
+    if contacts and isinstance(contacts[0], Mapping) and contacts[0].get("id") is not None:
+        contact_id = int(contacts[0]["id"])
     metadata = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+    contact_name = _first_text(
+        _nested_text(metadata, "client", "name"),
+        str(contact.get("name") or "").strip() if contact else None,
+        str(metadata.get("from") or "").strip() if not _extract_phone(str(metadata.get("from") or "")) else None,
+        str(metadata.get("name") or "").strip(),
+    )
+    phone = _first_text(
+        extract_contact_phone(contact),
+        _extract_phone(str(metadata.get("phone") or "")),
+        _extract_phone(str(metadata.get("from") or "")),
+    )
     return AmoCRMAlert(
         alert_type="new_unsorted",
-        title=str(item.get("name") or item.get("source_name") or "").strip() or None,
+        title=None,
         lead_id=lead_id,
-        contact_id=None,
-        contact_name=str(metadata.get("from") or metadata.get("name") or "").strip() or None,
-        phone=str(metadata.get("phone") or metadata.get("from") or "").strip() or None,
-        source=str(item.get("source_name") or item.get("category") or "").strip() or None,
+        contact_id=contact_id,
+        contact_name=contact_name,
+        phone=phone,
+        source=_human_source_name(item, metadata),
         text=str(metadata.get("text") or metadata.get("message") or "").strip() or None,
-        comment=str(item.get("uid") or "").strip() or None,
+        comment=_unsorted_comment(item, metadata),
         link=build_lead_link(api_base, lead_id),
     )
 
@@ -361,7 +382,7 @@ def format_amocrm_api_alert(alert: AmoCRMAlert) -> str:
     ]
     if alert.lead_id:
         lines.append(f"Сделка: #{alert.lead_id}")
-    if alert.title:
+    if alert.title and alert.alert_type != "new_unsorted":
         lines.append(f"Название: {alert.title}")
     if alert.contact_name:
         lines.append(f"Клиент: {alert.contact_name}")
@@ -383,6 +404,63 @@ def build_lead_link(api_base: str, lead_id: int | str | None) -> str | None:
     if not api_base or not lead_id:
         return None
     return f"{api_base.rstrip('/')}/leads/detail/{lead_id}"
+
+
+def _extract_phone(value: str) -> str | None:
+    match = re.search(r"(?:\+7|8)\D*\d{3}\D*\d{3}\D*\d{2}\D*\d{2}", value)
+    return match.group(0).strip() if match else None
+
+
+def _first_text(*values: str | None) -> str | None:
+    for value in values:
+        if value:
+            cleaned = str(value).strip()
+            if cleaned:
+                return cleaned
+    return None
+
+
+def _nested_text(payload: Mapping[str, Any], *path: str) -> str | None:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return str(current).strip() if current else None
+
+
+def _human_source_name(item: Mapping[str, Any], metadata: Mapping[str, Any]) -> str | None:
+    raw = _first_text(
+        str(metadata.get("source_name") or "").strip(),
+        str(metadata.get("service") or "").strip(),
+        str(item.get("source_name") or "").strip(),
+        str(item.get("category") or "").strip(),
+    )
+    if not raw:
+        return None
+    lowered = raw.casefold()
+    if lowered == "max":
+        return "MAX"
+    if "telegram" in lowered or "телеграм" in lowered:
+        return "Telegram"
+    if "whatsapp" in lowered or "wahelp" in lowered:
+        return "WhatsApp/мессенджер"
+    if lowered == "sip" or "onlinepbx" in lowered:
+        return "Телефония"
+    return raw
+
+
+def _unsorted_comment(item: Mapping[str, Any], metadata: Mapping[str, Any]) -> str:
+    category = str(item.get("category") or "").casefold()
+    service = str(metadata.get("service") or "").casefold()
+    source = str(metadata.get("source_name") or item.get("source_name") or "").casefold()
+    if category == "sip" or "onlinepbx" in service or source == "sip":
+        return "звонок"
+    if category == "chats" or "whatbot" in service:
+        return "сообщение"
+    if "site" in source or "сайт" in source:
+        return "заявка с сайта"
+    return "заявка"
 
 
 def _as_int(value: Any, default: int = 0) -> int:

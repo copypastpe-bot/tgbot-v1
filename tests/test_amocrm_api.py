@@ -337,7 +337,44 @@ class AmoCRMPollingAlertBuildTests(unittest.TestCase):
         self.assertEqual(alert.alert_type, "new_unsorted")
         self.assertEqual(alert.lead_id, 123)
         self.assertEqual(alert.phone, "+79991234567")
-        self.assertEqual(alert.source, "SIP")
+        self.assertEqual(alert.source, "Телефония")
+        self.assertEqual(alert.comment, "звонок")
+
+    def test_build_unsorted_chat_alert_uses_contact_phone_and_human_source(self):
+        item = {
+            "uid": "u-2",
+            "category": "chats",
+            "source_name": "wahelp.whatbot:31207071-b4af-4f73-affd-f713223faba5",
+            "metadata": {
+                "from": "Сергей",
+                "service": "wahelp.whatbot",
+                "source_name": "max",
+                "client": {"name": "Сергей"},
+            },
+            "_embedded": {
+                "leads": [{"id": 31252599}],
+                "contacts": [{"id": 38665409}],
+            },
+        }
+        contact = {
+            "id": 38665409,
+            "name": "Сергей",
+            "custom_fields_values": [
+                {"field_code": "PHONE", "values": [{"value": "+79991234567"}]},
+            ],
+        }
+
+        alert = build_unsorted_alert(item, api_base="https://example.amocrm.ru", contact=contact)
+        text = format_amocrm_api_alert(alert)
+
+        self.assertEqual(alert.title, None)
+        self.assertEqual(alert.contact_name, "Сергей")
+        self.assertEqual(alert.phone, "+79991234567")
+        self.assertEqual(alert.source, "MAX")
+        self.assertEqual(alert.comment, "сообщение")
+        self.assertNotIn("Название:", text)
+        self.assertNotIn("Телефон: Сергей", text)
+        self.assertIn("Телефон: +79991234567", text)
 
 
 class AmoCRMIncomingMessageTests(unittest.TestCase):
