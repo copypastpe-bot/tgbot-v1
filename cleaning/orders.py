@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+import os
+from typing import Mapping
 
 from .constants import CLEANING_GIFT_CERT_LABEL, ZERO
 
@@ -35,6 +37,55 @@ def parse_amount(text: str) -> Decimal | None:
     return value
 
 
+def _env_decimal(env: Mapping[str, str], key: str, default: str) -> Decimal:
+    raw = env.get(key, default)
+    parsed = parse_amount(str(raw))
+    return parsed if parsed is not None else Decimal(default)
+
+
+def qround_ruble(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("1."), rounding=ROUND_DOWN)
+
+
+def get_min_order_amount(env: Mapping[str, str] = os.environ) -> Decimal:
+    return _env_decimal(env, "CLEANING_MIN_ORDER_AMOUNT", "5500")
+
+
+def get_min_cash_amount(env: Mapping[str, str] = os.environ) -> Decimal:
+    return _env_decimal(env, "MIN_CASH", "2500")
+
+
+def get_bonus_rate(env: Mapping[str, str] = os.environ) -> Decimal:
+    return _env_decimal(env, "BONUS_RATE_PERCENT", "5") / Decimal(100)
+
+
+def get_max_bonus_spend_rate(env: Mapping[str, str] = os.environ) -> Decimal:
+    return _env_decimal(env, "MAX_BONUS_SPEND_RATE_PERCENT", "50") / Decimal(100)
+
+
+def calculate_bonus_max(
+    total: Decimal, balance: int | Decimal, env: Mapping[str, str] = os.environ
+) -> Decimal:
+    balance_amount = Decimal(balance or 0)
+    max_by_rate = qround_ruble(total * get_max_bonus_spend_rate(env))
+    max_by_min_cash = qround_ruble(total - get_min_cash_amount(env))
+    return max(ZERO, min(max_by_rate, balance_amount, max_by_min_cash))
+
+
+def is_wire_payment_method(method: str | None) -> bool:
+    return (method or "").strip().casefold() == "расчётный"
+
+
+def calculate_bonus_earned(
+    payment_method: str | None,
+    cash_payment: Decimal,
+    env: Mapping[str, str] = os.environ,
+) -> int:
+    if is_wire_payment_method(payment_method):
+        return 0
+    return int(qround_ruble(cash_payment * get_bonus_rate(env)))
+
+
 def payments_balance_diff(
     parts: list[PaymentPart], total: Decimal, bonuses_used: Decimal
 ) -> Decimal:
@@ -45,6 +96,20 @@ def payments_balance_diff(
     paid = sum((p.amount for p in parts), ZERO)
     expected = total - bonuses_used
     return paid - expected
+
+
+def validate_payment_parts(
+    parts: list[PaymentPart], total: Decimal, bonuses_used: Decimal
+) -> tuple[bool, str]:
+    if not parts:
+        return False, "Добавьте хотя бы одну часть оплаты."
+    wire_parts = [p for p in parts if is_wire_payment_method(p.method)]
+    if wire_parts and len(parts) > 1:
+        return False, "Расчётный нельзя смешивать с другими способами оплаты."
+    diff = payments_balance_diff(parts, total, bonuses_used)
+    if diff != 0:
+        return False, f"Оплата не сходится на {diff}."
+    return True, ""
 
 
 def cashbook_rows_from_payments(

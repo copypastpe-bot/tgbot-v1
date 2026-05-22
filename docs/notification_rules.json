@@ -41,6 +41,17 @@
       "variables": []
     },
     {
+      "key": "cleaning_order_completed_wire",
+      "name": "Клининг: заказ выполнен (р/с)",
+      "recipient": "client",
+      "condition": null,
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Заказ выполнен ✅\nПосле поступления оплаты мы сразу пришлём уведомление.\nСпасибо, что выбрали raketaclean.ru ✨",
+      "variables": []
+    },
+    {
       "key": "order_wire_payment_received",
       "name": "Оплата по р/с получена",
       "recipient": "client",
@@ -175,6 +186,25 @@
       "note": "Начисление и списание описаны в этом сообщении, отдельные уведомления не нужны."
     },
     {
+      "key": "cleaning_order_completed_summary",
+      "name": "Клининг: выполнение заказа (финальная сводка)",
+      "recipient": "client",
+      "condition": "order.status == 'completed'",
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Заказ выполнен ✅\n\n**Сумма чека:** {{total_sum}} ₽\n**Оплачено бонусами:** {{used_bonus}} баллов\n**К оплате:** {{amount_due}} ₽\n\n**Начислено бонусов:** {{earned_bonus}} баллов (действуют до {{bonus_expire_date}})\n**Баланс бонусов:** {{bonus_balance}} баллов\n\nСпасибо, что выбрали **raketaclean.ru** ✨",
+      "variables": [
+        "total_sum",
+        "used_bonus",
+        "amount_due",
+        "earned_bonus",
+        "bonus_expire_date",
+        "bonus_balance"
+      ],
+      "note": "Клининговый контур использует отдельный event_key, текст совпадает с химчисткой."
+    },
+    {
       "key": "order_rating_reminder",
       "name": "Напоминание об оценке после заказа",
       "recipient": "client",
@@ -183,6 +213,18 @@
         "delay_minutes": 1440
       },
       "note": "Отправляется через 24 часа после выполнения заказа",
+      "template": "Здравствуйте! Это компания **raketaclean.ru** 🙂\nМы недавно выполняли для вас услуги и нам важно знать, всё ли понравилось.\nПожалуйста оцените нашу работу от **1 до 5** (1 — низкая оценка, 5 — высокая) и просто отправьте цифру в ответ.",
+      "variables": []
+    },
+    {
+      "key": "cleaning_order_rating_reminder",
+      "name": "Клининг: напоминание об оценке после заказа",
+      "recipient": "client",
+      "condition": "order.status == 'completed'",
+      "timing": {
+        "delay_minutes": 1440
+      },
+      "note": "Отправляется через 24 часа после выполнения заказа; текст совпадает с химчисткой.",
       "template": "Здравствуйте! Это компания **raketaclean.ru** 🙂\nМы недавно выполняли для вас услуги и нам важно знать, всё ли понравилось.\nПожалуйста оцените нашу работу от **1 до 5** (1 — низкая оценка, 5 — высокая) и просто отправьте цифру в ответ.",
       "variables": []
     },
