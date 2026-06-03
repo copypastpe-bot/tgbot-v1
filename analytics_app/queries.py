@@ -4,6 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from .management import ExpenseRow, OrderMetricRow, PayrollMetricRow, build_management_dashboard
 from .money import CashbookRow, summarize_cashbook_rows, summarize_cleaning_rows
 
 
@@ -29,7 +30,79 @@ def _row_to_cashbook(row: Any) -> CashbookRow:
     )
 
 
-async def build_main_cash_dashboard(conn, *, start_utc: datetime, end_utc: datetime) -> dict[str, Any]:
+def _row_to_order_metric(row: Any) -> OrderMetricRow:
+    return OrderMetricRow(
+        id=int(_get(row, "id", 0)),
+        created_at=_get(row, "created_at"),
+        master_id=_get(row, "master_id"),
+        master_name=str(_get(row, "master_name", "Без мастера") or "Без мастера"),
+        amount_total=_decimal(_get(row, "amount_total", 0)),
+        amount_cash=_decimal(_get(row, "amount_cash", 0)),
+        bonus_spent=_decimal(_get(row, "bonus_spent", 0)),
+        bonus_earned=_decimal(_get(row, "bonus_earned", 0)),
+    )
+
+
+def _row_to_payroll_metric(row: Any) -> PayrollMetricRow:
+    return PayrollMetricRow(
+        order_id=int(_get(row, "order_id", 0)),
+        master_id=_get(row, "master_id"),
+        master_name=str(_get(row, "master_name", "Без мастера") or "Без мастера"),
+        base_pay=_decimal(_get(row, "base_pay", 0)),
+        fuel_pay=_decimal(_get(row, "fuel_pay", 0)),
+        upsell_pay=_decimal(_get(row, "upsell_pay", 0)),
+        total_pay=_decimal(_get(row, "total_pay", 0)),
+    )
+
+
+def _row_to_expense_metric(row: Any) -> ExpenseRow:
+    return ExpenseRow(
+        id=int(_get(row, "id", 0)),
+        happened_at=_get(row, "happened_at"),
+        amount=_decimal(_get(row, "amount", 0)),
+        method=str(_get(row, "method", "")),
+        comment=str(_get(row, "comment", "")),
+    )
+
+
+async def build_main_cash_dashboard(
+    conn, *, start_utc: datetime, end_utc: datetime, group_by: str = "day"
+) -> dict[str, Any]:
+    order_rows = await conn.fetch(
+        """
+        SELECT o.id, o.created_at, o.master_id,
+               TRIM(COALESCE(s.first_name, '') || ' ' || COALESCE(s.last_name, '')) AS master_name,
+               COALESCE(o.amount_total, 0) AS amount_total,
+               COALESCE(o.amount_cash, 0) AS amount_cash,
+               COALESCE(o.bonus_spent, 0) AS bonus_spent,
+               COALESCE(o.bonus_earned, 0) AS bonus_earned
+        FROM orders o
+        LEFT JOIN staff s ON s.id = o.master_id
+        WHERE o.created_at >= $1
+          AND o.created_at <  $2
+        ORDER BY o.created_at DESC, o.id DESC
+        """,
+        start_utc,
+        end_utc,
+    )
+    payroll_rows = await conn.fetch(
+        """
+        SELECT pi.order_id, pi.master_id,
+               TRIM(COALESCE(s.first_name, '') || ' ' || COALESCE(s.last_name, '')) AS master_name,
+               COALESCE(pi.base_pay, 0) AS base_pay,
+               COALESCE(pi.fuel_pay, 0) AS fuel_pay,
+               COALESCE(pi.upsell_pay, 0) AS upsell_pay,
+               COALESCE(pi.total_pay, 0) AS total_pay
+        FROM payroll_items pi
+        JOIN orders o ON o.id = pi.order_id
+        LEFT JOIN staff s ON s.id = pi.master_id
+        WHERE o.created_at >= $1
+          AND o.created_at <  $2
+        ORDER BY o.created_at DESC, pi.order_id DESC
+        """,
+        start_utc,
+        end_utc,
+    )
     rows = await conn.fetch(
         """
         SELECT id, happened_at, kind, method, amount,
@@ -39,6 +112,9 @@ async def build_main_cash_dashboard(conn, *, start_utc: datetime, end_utc: datet
         FROM cashbook_entries
         WHERE happened_at >= $1
           AND happened_at <  $2
+          AND kind = 'expense'
+          AND COALESCE(is_deleted,false)=false
+          AND order_id IS NULL
         ORDER BY happened_at DESC, id DESC
         LIMIT 500
         """,
@@ -60,10 +136,17 @@ async def build_main_cash_dashboard(conn, *, start_utc: datetime, end_utc: datet
         """
     )
     summary = summarize_cashbook_rows([_row_to_cashbook(row) for row in rows])
+    management = build_management_dashboard(
+        orders=[_row_to_order_metric(row) for row in order_rows],
+        payroll=[_row_to_payroll_metric(row) for row in payroll_rows],
+        expenses=[_row_to_expense_metric(row) for row in rows if not _row_to_cashbook(row).is_deleted],
+        group_by=group_by,
+    )
     return {
         "summary": summary,
         "balance": _decimal(balance),
         "ledger": rows,
+        "management": management,
     }
 
 
