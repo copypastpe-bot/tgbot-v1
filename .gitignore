@@ -27,6 +27,7 @@ import/
 .vscode/
 .idea/
 .superpowers/
+.worktrees/
 Сохраняем файл на всякий/
 .env
 .venv-wahelp/
