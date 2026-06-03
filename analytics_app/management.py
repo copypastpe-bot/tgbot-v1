@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -112,6 +112,41 @@ def _build_master_salaries(
     return sorted(result, key=lambda item: item.salary, reverse=True)
 
 
+def _build_charts(dashboard: ManagementDashboard) -> dict[str, object]:
+    return {
+        "waterfall": {
+            "labels": [
+                "Чеки",
+                "Бонусы",
+                "Живые деньги",
+                "Зарплаты",
+                "Расходы",
+                "Опер. прибыль",
+            ],
+            "values": [
+                float(dashboard.waterfall[key])
+                for key in [
+                    "gross_checks",
+                    "bonuses_spent",
+                    "live_money",
+                    "salaries",
+                    "other_expenses",
+                    "operating_profit",
+                ]
+            ],
+        },
+        "expense_groups": {
+            "labels": [group.name for group in dashboard.expense_groups],
+            "values": [float(group.amount) for group in dashboard.expense_groups],
+        },
+        "salary_by_master": {
+            "labels": [row.master_name for row in dashboard.master_salaries],
+            "values": [float(row.salary) for row in dashboard.master_salaries],
+        },
+        "time_series": {"labels": [], "datasets": []},
+    }
+
+
 def build_management_dashboard(
     *,
     orders: list[OrderMetricRow],
@@ -140,7 +175,7 @@ def build_management_dashboard(
         "operating_profit": operating_profit,
     }
 
-    return ManagementDashboard(
+    dashboard = ManagementDashboard(
         gross_checks=gross_checks,
         live_money=live_money,
         bonuses_spent=bonuses_spent,
@@ -159,3 +194,4 @@ def build_management_dashboard(
         waterfall=waterfall,
         charts={},
     )
+    return replace(dashboard, charts=_build_charts(dashboard))

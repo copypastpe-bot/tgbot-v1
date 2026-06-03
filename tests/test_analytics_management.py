@@ -140,3 +140,51 @@ class AnalyticsManagementTests(unittest.TestCase):
         )
 
         self.assertEqual([row.id for row in dashboard.top_expenses], [2, 3, 1])
+
+    def test_charts_include_waterfall_and_expense_groups(self):
+        orders = [
+            OrderMetricRow(
+                id=1,
+                created_at=datetime(2026, 6, 1, tzinfo=ZoneInfo("UTC")),
+                master_id=10,
+                master_name="Анна",
+                amount_total=Decimal("5000"),
+                amount_cash=Decimal("4000"),
+                bonus_spent=Decimal("1000"),
+                bonus_earned=Decimal("0"),
+            ),
+        ]
+        payroll = [
+            PayrollMetricRow(
+                order_id=1,
+                master_id=10,
+                master_name="Анна",
+                base_pay=Decimal("1000"),
+                fuel_pay=Decimal("150"),
+                upsell_pay=Decimal("0"),
+                total_pay=Decimal("1150"),
+            ),
+        ]
+        expenses = [
+            ExpenseRow(
+                id=1,
+                happened_at=datetime(2026, 6, 1, tzinfo=ZoneInfo("UTC")),
+                amount=Decimal("700"),
+                method="прочее",
+                comment="Химия",
+            ),
+        ]
+
+        dashboard = build_management_dashboard(
+            orders=orders,
+            payroll=payroll,
+            expenses=expenses,
+            group_by="day",
+        )
+
+        self.assertEqual(dashboard.charts["waterfall"]["labels"][0], "Чеки")
+        self.assertEqual(
+            dashboard.charts["expense_groups"]["labels"],
+            ["Материалы/химия"],
+        )
+        self.assertIn("time_series", dashboard.charts)
