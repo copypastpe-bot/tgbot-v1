@@ -106,6 +106,17 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 [
                     {
+                        "id": 6,
+                        "happened_at": datetime(2026, 6, 2, tzinfo=ZoneInfo("UTC")),
+                        "kind": "income",
+                        "method": "Наличные",
+                        "amount": Decimal("300"),
+                        "comment": "Заказ",
+                        "order_id": 1,
+                        "master_id": 10,
+                        "is_deleted": False,
+                    },
+                    {
                         "id": 7,
                         "happened_at": datetime(2026, 6, 2, tzinfo=ZoneInfo("UTC")),
                         "kind": "expense",
@@ -130,8 +141,13 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dashboard["management"].gross_checks, Decimal("5000"))
         self.assertEqual(dashboard["management"].salary_total, Decimal("1150"))
         self.assertEqual(dashboard["management"].other_expenses, Decimal("700"))
+        self.assertEqual(dashboard["summary"].income, Decimal("300"))
+        self.assertEqual(len(dashboard["ledger"]), 2)
         self.assertEqual(dashboard["balance"], Decimal("1234"))
         self.assertEqual(len(conn.fetch_calls), 3)
+        ledger_sql = conn.fetch_calls[2][0].lower()
+        self.assertNotIn("and kind = 'expense'", ledger_sql)
+        self.assertNotIn("and order_id is null", ledger_sql)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 from .management import ExpenseRow, OrderMetricRow, PayrollMetricRow, build_management_dashboard
-from .money import CashbookRow, summarize_cashbook_rows, summarize_cleaning_rows
+from .money import CashbookRow, is_dividend, is_withdrawal, summarize_cashbook_rows, summarize_cleaning_rows
 
 
 def _decimal(value: Any) -> Decimal:
@@ -65,6 +65,17 @@ def _row_to_expense_metric(row: Any) -> ExpenseRow:
     )
 
 
+def _is_operating_expense(row: Any) -> bool:
+    cashbook_row = _row_to_cashbook(row)
+    if cashbook_row.is_deleted:
+        return False
+    if cashbook_row.kind != "expense":
+        return False
+    if _get(row, "order_id") is not None:
+        return False
+    return not (is_withdrawal(cashbook_row) or is_dividend(cashbook_row))
+
+
 async def build_main_cash_dashboard(
     conn, *, start_utc: datetime, end_utc: datetime, group_by: str = "day"
 ) -> dict[str, Any]:
@@ -112,9 +123,6 @@ async def build_main_cash_dashboard(
         FROM cashbook_entries
         WHERE happened_at >= $1
           AND happened_at <  $2
-          AND kind = 'expense'
-          AND COALESCE(is_deleted,false)=false
-          AND order_id IS NULL
         ORDER BY happened_at DESC, id DESC
         LIMIT 500
         """,
@@ -139,7 +147,7 @@ async def build_main_cash_dashboard(
     management = build_management_dashboard(
         orders=[_row_to_order_metric(row) for row in order_rows],
         payroll=[_row_to_payroll_metric(row) for row in payroll_rows],
-        expenses=[_row_to_expense_metric(row) for row in rows if not _row_to_cashbook(row).is_deleted],
+        expenses=[_row_to_expense_metric(row) for row in rows if _is_operating_expense(row)],
         group_by=group_by,
     )
     return {
