@@ -33,6 +33,32 @@ class AnalyticsDateTests(unittest.TestCase):
         self.assertEqual(rng.start_date, date(2026, 6, 3))
         self.assertEqual(rng.end_date, date(2026, 6, 3))
 
+    def test_date_from_date_to_aliases_are_accepted(self):
+        rng = resolve_date_range(
+            {"date_from": "2026-04-01", "date_to": "2026-04-15"},
+            today=date(2026, 6, 3),
+        )
+
+        self.assertEqual(rng.start_date, date(2026, 4, 1))
+        self.assertEqual(rng.end_date, date(2026, 4, 15))
+        self.assertEqual(rng.group_by, "day")
+
+    def test_group_by_auto_week_for_medium_ranges(self):
+        rng = resolve_date_range(
+            {"date_from": "2026-01-01", "date_to": "2026-03-31"},
+            today=date(2026, 6, 3),
+        )
+
+        self.assertEqual(rng.group_by, "week")
+
+    def test_group_by_auto_month_for_long_ranges(self):
+        rng = resolve_date_range(
+            {"date_from": "2026-01-01", "date_to": "2026-12-31"},
+            today=date(2026, 6, 3),
+        )
+
+        self.assertEqual(rng.group_by, "month")
+
 
 if __name__ == "__main__":
     unittest.main()

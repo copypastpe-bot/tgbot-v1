@@ -35,13 +35,23 @@ def _bounds(start_date: date, end_date: date) -> tuple[datetime, datetime]:
     return start_local.astimezone(UTC), end_local.astimezone(UTC)
 
 
+def _auto_group_by(start_date: date, end_date: date) -> str:
+    days = (end_date - start_date).days + 1
+    if days > 180:
+        return "month"
+    if days > 45:
+        return "week"
+    return "day"
+
+
 def resolve_date_range(params: Mapping[str, str], *, today: date | None = None) -> DateRange:
     current = today or datetime.now(MOSCOW_TZ).date()
-    group_by = params.get("group") if params.get("group") in {"day", "week", "month"} else "day"
-    custom_start = _parse_date(params.get("start"))
-    custom_end = _parse_date(params.get("end"))
+    explicit_group = params.get("group") if params.get("group") in {"day", "week", "month"} else None
+    custom_start = _parse_date(params.get("start") or params.get("date_from"))
+    custom_end = _parse_date(params.get("end") or params.get("date_to"))
     if custom_start and custom_end and custom_start <= custom_end:
         start_date, end_date = custom_start, custom_end
+        group_by = explicit_group or _auto_group_by(start_date, end_date)
         start_utc, end_utc = _bounds(start_date, end_date)
         return DateRange(start_date, end_date, start_utc, end_utc, group_by)
 
@@ -55,10 +65,14 @@ def resolve_date_range(params: Mapping[str, str], *, today: date | None = None) 
     elif period == "year":
         start_date = date(current.year, 1, 1)
         end_date = date(current.year, 12, 31)
-        group_by = "month"
     else:
         start_date = current
         end_date = current
+
+    if explicit_group:
+        group_by = explicit_group
+    else:
+        group_by = _auto_group_by(start_date, end_date)
 
     start_utc, end_utc = _bounds(start_date, end_date)
     return DateRange(start_date, end_date, start_utc, end_utc, group_by)
