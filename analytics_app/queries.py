@@ -65,6 +65,10 @@ def _row_to_expense_metric(row: Any) -> ExpenseRow:
     )
 
 
+def _row_scope(row: Any) -> str:
+    return str(_get(row, "row_scope", "ledger") or "ledger")
+
+
 def _is_operating_expense(row: Any) -> bool:
     cashbook_row = _row_to_cashbook(row)
     if cashbook_row.is_deleted:
@@ -84,11 +88,16 @@ async def build_main_cash_dashboard(
         SELECT o.id, o.created_at, o.master_id,
                TRIM(COALESCE(s.first_name, '') || ' ' || COALESCE(s.last_name, '')) AS master_name,
                COALESCE(o.amount_total, 0) AS amount_total,
-               COALESCE(o.amount_cash, 0) AS amount_cash,
+               COALESCE(op.live_money, o.amount_cash, 0) AS amount_cash,
                COALESCE(o.bonus_spent, 0) AS bonus_spent,
                COALESCE(o.bonus_earned, 0) AS bonus_earned
         FROM orders o
         LEFT JOIN staff s ON s.id = o.master_id
+        LEFT JOIN (
+            SELECT order_id, COALESCE(SUM(amount), 0) AS live_money
+            FROM order_payments
+            GROUP BY order_id
+        ) op ON op.order_id = o.id
         WHERE o.created_at >= $1
           AND o.created_at <  $2
         ORDER BY o.created_at DESC, o.id DESC
@@ -116,15 +125,43 @@ async def build_main_cash_dashboard(
     )
     rows = await conn.fetch(
         """
-        SELECT id, happened_at, kind, method, amount,
-               COALESCE(comment, '') AS comment,
-               order_id, master_id,
-               COALESCE(is_deleted, false) AS is_deleted
-        FROM cashbook_entries
-        WHERE happened_at >= $1
-          AND happened_at <  $2
-        ORDER BY happened_at DESC, id DESC
-        LIMIT 500
+        SELECT row_scope, id, happened_at, kind, method, amount,
+               comment, order_id, master_id, is_deleted
+        FROM (
+            SELECT 0 AS row_sort, ledger_rows.*
+            FROM (
+                SELECT 'ledger'::text AS row_scope, id, happened_at, kind, method, amount,
+                       COALESCE(comment, '') AS comment,
+                       order_id, master_id,
+                       COALESCE(is_deleted, false) AS is_deleted
+                FROM cashbook_entries
+                WHERE happened_at >= $1
+                  AND happened_at <  $2
+                ORDER BY happened_at DESC, id DESC
+                LIMIT 500
+            ) ledger_rows
+
+            UNION ALL
+
+            SELECT 1 AS row_sort,
+                   'operating_expense'::text AS row_scope, id, happened_at, kind, method, amount,
+                   COALESCE(comment, '') AS comment,
+                   order_id, master_id,
+                   COALESCE(is_deleted, false) AS is_deleted
+            FROM cashbook_entries
+            WHERE happened_at >= $1
+              AND happened_at <  $2
+              AND kind = 'expense'
+              AND COALESCE(is_deleted, false) = false
+              AND order_id IS NULL
+              AND NOT (
+                  COALESCE(comment, '') ILIKE '[WDR]%'
+                  OR COALESCE(comment, '') ILIKE 'изъят%'
+                  OR COALESCE(method, '') = 'DIV'
+                  OR COALESCE(comment, '') ILIKE '[DIV]%'
+              )
+        ) scoped_rows
+        ORDER BY row_sort ASC, happened_at DESC, id DESC
         """,
         start_utc,
         end_utc,
@@ -143,17 +180,23 @@ async def build_main_cash_dashboard(
         WHERE COALESCE(is_deleted,false)=false
         """
     )
-    summary = summarize_cashbook_rows([_row_to_cashbook(row) for row in rows])
+    ledger_rows = [row for row in rows if _row_scope(row) == "ledger"]
+    expense_rows = [
+        row
+        for row in rows
+        if _row_scope(row) == "operating_expense" and _is_operating_expense(row)
+    ]
+    summary = summarize_cashbook_rows([_row_to_cashbook(row) for row in ledger_rows])
     management = build_management_dashboard(
         orders=[_row_to_order_metric(row) for row in order_rows],
         payroll=[_row_to_payroll_metric(row) for row in payroll_rows],
-        expenses=[_row_to_expense_metric(row) for row in rows if _is_operating_expense(row)],
+        expenses=[_row_to_expense_metric(row) for row in expense_rows],
         group_by=group_by,
     )
     return {
         "summary": summary,
         "balance": _decimal(balance),
-        "ledger": rows,
+        "ledger": ledger_rows,
         "management": management,
     }
 

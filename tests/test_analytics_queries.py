@@ -107,6 +107,7 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
                 [
                     {
                         "id": 6,
+                        "row_scope": "ledger",
                         "happened_at": datetime(2026, 6, 2, tzinfo=ZoneInfo("UTC")),
                         "kind": "income",
                         "method": "Наличные",
@@ -118,6 +119,7 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
                     },
                     {
                         "id": 7,
+                        "row_scope": "operating_expense",
                         "happened_at": datetime(2026, 6, 2, tzinfo=ZoneInfo("UTC")),
                         "kind": "expense",
                         "method": "прочее",
@@ -142,12 +144,17 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dashboard["management"].salary_total, Decimal("1150"))
         self.assertEqual(dashboard["management"].other_expenses, Decimal("700"))
         self.assertEqual(dashboard["summary"].income, Decimal("300"))
-        self.assertEqual(len(dashboard["ledger"]), 2)
+        self.assertEqual(dashboard["summary"].expense, Decimal("0"))
+        self.assertEqual(len(dashboard["ledger"]), 1)
         self.assertEqual(dashboard["balance"], Decimal("1234"))
         self.assertEqual(len(conn.fetch_calls), 3)
+        order_sql = conn.fetch_calls[0][0].lower()
+        self.assertIn("order_payments", order_sql)
+        self.assertIn("coalesce(op.live_money, o.amount_cash, 0) as amount_cash", order_sql)
         ledger_sql = conn.fetch_calls[2][0].lower()
-        self.assertNotIn("and kind = 'expense'", ledger_sql)
-        self.assertNotIn("and order_id is null", ledger_sql)
+        self.assertIn("row_scope", ledger_sql)
+        self.assertIn("operating_expense", ledger_sql)
+        self.assertIn("union all", ledger_sql)
 
 
 if __name__ == "__main__":
