@@ -33,8 +33,6 @@ def classify_expense(*, method: str, comment: str) -> str:
     for label, needles in RULES:
         if any(needle in haystack for needle in needles):
             return label
-    if method and method.lower() not in {"прочее", "наличные", "карта"}:
-        return method
     return "Без категории"
 
 

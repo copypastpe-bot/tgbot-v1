@@ -19,6 +19,7 @@ class AnalyticsExpenseGroupTests(unittest.TestCase):
 
     def test_uncategorized_remains_visible(self):
         self.assertEqual(classify_expense(method="прочее", comment="непонятный расход"), "Без категории")
+        self.assertEqual(classify_expense(method="СБП", comment="непонятный расход"), "Без категории")
 
     def test_group_expenses_returns_amount_share_count_and_examples(self):
         rows = [
