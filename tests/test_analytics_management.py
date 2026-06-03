@@ -93,6 +93,19 @@ class AnalyticsManagementTests(unittest.TestCase):
         self.assertEqual(dashboard.operating_profit, Decimal("3200"))
         self.assertEqual(dashboard.waterfall["gross_checks"], Decimal("8000"))
         self.assertEqual(dashboard.waterfall["operating_profit"], Decimal("3200"))
+        self.assertEqual(
+            [row.master_name for row in dashboard.master_salaries],
+            ["Борис", "Анна"],
+        )
+        boris, anna = dashboard.master_salaries
+        self.assertEqual(boris.gross_checks, Decimal("3000"))
+        self.assertEqual(boris.live_money, Decimal("3000"))
+        self.assertEqual(boris.salary, Decimal("1650"))
+        self.assertEqual(boris.salary_percent, Decimal("0.55"))
+        self.assertEqual(anna.gross_checks, Decimal("5000"))
+        self.assertEqual(anna.live_money, Decimal("4000"))
+        self.assertEqual(anna.salary, Decimal("1150"))
+        self.assertEqual(anna.salary_percent, Decimal("0.23"))
 
     def test_top_expenses_sorted_descending(self):
         expenses = [

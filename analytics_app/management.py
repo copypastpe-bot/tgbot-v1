@@ -81,7 +81,6 @@ def ratio(numerator: Decimal, denominator: Decimal) -> Decimal:
 def _build_master_salaries(
     orders: list[OrderMetricRow],
     payroll: list[PayrollMetricRow],
-    gross_checks: Decimal,
 ) -> list[MasterSalarySummary]:
     order_bucket: dict[int | None, list[OrderMetricRow]] = {}
     payroll_bucket: dict[int | None, list[PayrollMetricRow]] = {}
@@ -98,15 +97,16 @@ def _build_master_salaries(
         master_orders = order_bucket.get(master_id, [])
         master_payroll = payroll_bucket.get(master_id, [])
         salary = sum((row.total_pay for row in master_payroll), ZERO)
+        master_gross = sum((row.amount_total for row in master_orders), ZERO)
         result.append(
             MasterSalarySummary(
                 master_id=master_id,
                 master_name=names.get(master_id) or "Без мастера",
                 orders_count=len(master_orders),
-                gross_checks=sum((row.amount_total for row in master_orders), ZERO),
+                gross_checks=master_gross,
                 live_money=sum((row.amount_cash for row in master_orders), ZERO),
                 salary=salary,
-                salary_percent=ratio(salary, gross_checks),
+                salary_percent=ratio(salary, master_gross),
             )
         )
     return sorted(result, key=lambda item: item.salary, reverse=True)
@@ -155,7 +155,7 @@ def build_management_dashboard(
         operating_profit=operating_profit,
         expense_groups=group_expenses(expenses),
         top_expenses=sorted(expenses, key=lambda row: row.amount, reverse=True)[:10],
-        master_salaries=_build_master_salaries(orders, payroll, gross_checks),
+        master_salaries=_build_master_salaries(orders, payroll),
         waterfall=waterfall,
         charts={},
     )
