@@ -14,6 +14,7 @@ class AnalyticsExpenseGroupTests(unittest.TestCase):
         self.assertEqual(classify_expense(method="прочее", comment="Купили химию"), "Материалы/химия")
         self.assertEqual(classify_expense(method="прочее", comment="Авито реклама"), "Реклама/маркетинг")
         self.assertEqual(classify_expense(method="прочее", comment="Бензин мастер"), "Транспорт/логистика")
+        self.assertEqual(classify_expense(method="прочее", comment="ГСМ теплоходы"), "Транспорт/логистика")
         self.assertEqual(classify_expense(method="прочее", comment="Дима С ВХ"), "Зарплата/подрядчики")
         self.assertEqual(classify_expense(method="прочее", comment="Ковры школа"), "Партнеры")
         self.assertEqual(classify_expense(method="прочее", comment="Артгорький доработки сайта"), "Реклама/маркетинг")

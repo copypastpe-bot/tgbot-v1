@@ -23,6 +23,10 @@ def _json_amounts(values: dict[str, Decimal]) -> str:
     )
 
 
+def _script_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
+
+
 def render_login(*, error: bool) -> str:
     error_html = '<div class="error">Неверный логин или пароль</div>' if error else ""
     return f"""<!doctype html>
@@ -212,7 +216,7 @@ def render_dashboard(
       </table>
     </section>
   </main>
-  <script id="chart-data" type="application/json">{html.escape(json.dumps(chart_data, ensure_ascii=False))}</script>
+  <script id="chart-data" type="application/json">{_script_json(chart_data)}</script>
   <script src="/static/app.js"></script>
 </body>
 </html>"""
@@ -318,7 +322,7 @@ def render_management_dashboard(
       </table>
     </section>
   </main>
-  <script id="management-chart-data" type="application/json">{html.escape(json.dumps(chart_data, ensure_ascii=False))}</script>
+  <script id="management-chart-data" type="application/json">{_script_json(chart_data)}</script>
   <script src="/static/app.js"></script>
 </body>
 </html>"""

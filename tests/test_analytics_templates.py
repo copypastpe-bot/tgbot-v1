@@ -1,4 +1,6 @@
 import unittest
+import json
+import re
 from decimal import Decimal
 
 from analytics_app.management import ManagementDashboard
@@ -78,6 +80,14 @@ class AnalyticsTemplateTests(unittest.TestCase):
         self.assertIn('name="date_from"', html)
         self.assertIn('name="date_to"', html)
         self.assertIn("management-chart-data", html)
+        payload = re.search(
+            r'<script id="management-chart-data" type="application/json">(.*?)</script>',
+            html,
+            re.S,
+        )
+        self.assertIsNotNone(payload)
+        self.assertNotIn("&quot;", payload.group(1))
+        self.assertEqual(json.loads(payload.group(1))["waterfall"]["labels"], ["Доходы"])
 
 
 if __name__ == "__main__":

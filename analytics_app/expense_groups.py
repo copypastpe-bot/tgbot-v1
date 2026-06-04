@@ -73,6 +73,8 @@ def classify_expense(*, method: str, comment: str) -> str:
     if (method or "").upper() == "DIV":
         return "Дивиденды/изъятия"
     normalized_comment = (comment or "").strip().lower()
+    if "гсм" in haystack:
+        return "Транспорт/логистика"
     if normalized_comment in {"дима", "женя", "дима/женя", "дииа"}:
         return "Зарплата/подрядчики"
     if normalized_comment.startswith("дима ") and any(ch.isdigit() for ch in normalized_comment):
