@@ -77,6 +77,7 @@ class WireLinkFSM(StatesGroup):
 class ExpenseFSM(StatesGroup):
     waiting_amount = State()
     waiting_comment = State()
+    waiting_category = State()
     waiting_owner = State()
     waiting_confirm = State()
 
@@ -151,6 +152,7 @@ from notifications.amocrm_api import (
     normalize_lead,
     should_skip_new_lead_alert,
 )
+from expense_categories import EXPENSE_CATEGORIES, normalize_expense_category, suggest_expense_category
 from cleaning.schema import ensure_cleaning_schema
 from cleaning.handlers import (
     cleaning_balance_cmd,
@@ -2403,9 +2405,22 @@ async def ensure_cashbook_wire_schema(conn: asyncpg.Connection) -> None:
     )
     await conn.execute(
         """
+        ALTER TABLE cashbook_entries
+        ADD COLUMN IF NOT EXISTS category text;
+        """
+    )
+    await conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_cashbook_entries_awaiting
         ON cashbook_entries(awaiting_order)
         WHERE kind='income';
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_cashbook_entries_expense_category
+        ON cashbook_entries(category)
+        WHERE kind='expense' AND category IS NOT NULL;
         """
     )
 
@@ -5841,6 +5856,24 @@ def confirm_inline_kb(prefix: str) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def expense_category_suggestion_kb(category: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Оставить: {category}", callback_data="expense_category:keep")
+    kb.button(text="Выбрать другую", callback_data="expense_category:change")
+    kb.button(text="Отмена", callback_data="expense_category:cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def expense_category_pick_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for idx, category in enumerate(EXPENSE_CATEGORIES):
+        kb.button(text=category, callback_data=f"expense_category:pick:{idx}")
+    kb.button(text="Отмена", callback_data="expense_category:cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def _is_withdraw_entry(row) -> bool:
     if row["kind"] != "expense":
         return False
@@ -6056,14 +6089,22 @@ async def _record_income(
     return tx
 
 
-async def _record_expense(conn: asyncpg.Connection, amount: Decimal, comment: str, method: str = "прочее"):
+async def _record_expense(
+    conn: asyncpg.Connection,
+    amount: Decimal,
+    comment: str,
+    method: str = "прочее",
+    *,
+    category: str | None = None,
+):
+    stored_category = normalize_expense_category(category)
     tx = await conn.fetchrow(
         """
-        INSERT INTO cashbook_entries(kind, method, amount, comment, order_id, master_id, happened_at)
-        VALUES ('expense', $1, $2, $3, NULL, NULL, now())
+        INSERT INTO cashbook_entries(kind, method, amount, comment, category, order_id, master_id, happened_at)
+        VALUES ('expense', $1, $2, $3, $4, NULL, NULL, now())
         RETURNING id, happened_at
         """,
-        method, amount, comment or "Расход",
+        method, amount, comment or "Расход", stored_category,
     )
     # notify money-flow chat
     try:
@@ -9136,11 +9177,50 @@ async def expense_wizard_comment(msg: Message, state: FSMContext):
         return await msg.answer("Операция отменена.", reply_markup=admin_root_kb())
     if txt.casefold() == "без комментария":
         txt = "Расход"
-    data = await state.get_data()
-    amount = Decimal(data.get("amount"))
-    await state.update_data(comment=txt)
-    await state.set_state(ExpenseFSM.waiting_owner)
+    category = suggest_expense_category(comment=txt)
+    await state.update_data(comment=txt, category=category)
+    await state.set_state(ExpenseFSM.waiting_category)
     await msg.answer(
+        f"Категория по комментарию: {category}",
+        reply_markup=expense_category_suggestion_kb(category),
+    )
+
+
+@dp.callback_query(ExpenseFSM.waiting_category)
+async def expense_category_handler(query: CallbackQuery, state: FSMContext):
+    data = (query.data or "").strip()
+    if not data.startswith("expense_category:"):
+        await query.answer()
+        return
+
+    await query.answer()
+
+    if data == "expense_category:cancel":
+        await query.message.edit_reply_markup(None)
+        await state.clear()
+        await state.set_state(AdminMenuFSM.root)
+        await query.message.answer("Расход отменён.", reply_markup=admin_root_kb())
+        return
+
+    if data == "expense_category:change":
+        await query.message.edit_text("Выберите категорию расхода:", reply_markup=expense_category_pick_kb())
+        return
+
+    if data.startswith("expense_category:pick:"):
+        try:
+            idx = int(data.rsplit(":", 1)[-1])
+            category = EXPENSE_CATEGORIES[idx]
+        except Exception:
+            return await query.message.answer("Не удалось выбрать категорию. Попробуйте ещё раз.")
+        await state.update_data(category=category)
+        await query.message.edit_reply_markup(None)
+    elif data == "expense_category:keep":
+        await query.message.edit_reply_markup(None)
+    else:
+        return
+
+    await state.set_state(ExpenseFSM.waiting_owner)
+    await query.message.answer(
         "Кто оплачивает расход? Выберите «Дима» (обычная касса) или «Женя» (карта).",
         reply_markup=expense_owner_kb,
     )
@@ -9166,12 +9246,15 @@ async def expense_wizard_owner(msg: Message, state: FSMContext):
     data = await state.get_data()
     amount = Decimal(data.get("amount"))
     comment = data.get("comment") or "Расход"
+    category = normalize_expense_category(data.get("category")) or suggest_expense_category(comment=comment)
+    await state.update_data(category=category)
     await state.set_state(ExpenseFSM.waiting_confirm)
     owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
     lines = [
         "Подтвердите расход:",
         f"Сумма: {format_money(amount)}₽",
         f"Комментарий: {comment}",
+        f"Категория: {category}",
         f"Источник: {owner_label}",
     ]
     await msg.answer("\n".join(lines), reply_markup=confirm_inline_kb("expense_confirm"))
@@ -10612,6 +10695,7 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
         amount = Decimal(payload.get("amount") or "0")
         comment = payload.get("comment") or "Расход"
         owner = (payload.get("expense_owner") or "dima").lower()
+        category = normalize_expense_category(payload.get("category")) or suggest_expense_category(comment=comment)
     except Exception as exc:  # noqa: BLE001
         logging.exception("expense confirm payload error: %s", exc)
         await state.clear()
@@ -10621,7 +10705,7 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
 
     async with pool.acquire() as conn:
         try:
-            tx = await _record_expense(conn, amount, comment, method="прочее")
+            tx = await _record_expense(conn, amount, comment, method="прочее", category=category)
             if owner == "jenya":
                 try:
                     await _record_jenya_card_entry(
@@ -10645,7 +10729,7 @@ async def expense_confirm_handler(query: CallbackQuery, state: FSMContext):
     when = tx["happened_at"].strftime("%Y-%m-%d %H:%M")
     owner_label = "Карта Женя" if owner == "jenya" else "Касса (Дима)"
     await query.message.answer(
-        f"Расход №{tx['id']}: {format_money(amount)}₽ — {when}\nКомментарий: {comment}\nИсточник: {owner_label}",
+        f"Расход №{tx['id']}: {format_money(amount)}₽ — {when}\nКомментарий: {comment}\nКатегория: {category}\nИсточник: {owner_label}",
         reply_markup=admin_root_kb(),
     )
     await state.clear()
@@ -11012,8 +11096,9 @@ async def add_expense(msg: Message, command: CommandObject):
     except Exception:
         return await msg.answer(f"Ошибка: '{amount_str}' не является корректной суммой.")
 
+    category = suggest_expense_category(comment=comment)
     async with pool.acquire() as conn:
-        rec = await _record_expense(conn, amount, comment, method="прочее")
+        rec = await _record_expense(conn, amount, comment, method="прочее", category=category)
         if owner == "jenya":
             try:
                 await _record_jenya_card_entry(
@@ -11034,6 +11119,7 @@ async def add_expense(msg: Message, command: CommandObject):
             f"Сумма: {amount}₽",
             f"Когда: {rec['happened_at']:%Y-%m-%d %H:%M}",
             f"Комментарий: {comment}",
+            f"Категория: {category}",
             f"Источник: {owner_label}",
         ])
     )

@@ -1,6 +1,7 @@
 import unittest
 from decimal import Decimal
 
+from expense_categories import suggest_expense_category
 from analytics_app.expense_groups import (
     ExpenseGroup,
     classify_expense,
@@ -28,6 +29,10 @@ class AnalyticsExpenseGroupTests(unittest.TestCase):
         self.assertEqual(classify_expense(method="прочее", comment="непонятный расход"), "Без категории")
         self.assertEqual(classify_expense(method="СБП", comment="непонятный расход"), "Без категории")
 
+    def test_bot_suggestion_uses_actual_category_for_unknown_comments(self):
+        self.assertEqual(suggest_expense_category(comment="непонятный расход"), "Прочее")
+        self.assertEqual(suggest_expense_category(comment="ГСМ теплоходы"), "Транспорт/логистика")
+
     def test_group_expenses_returns_amount_share_count_and_examples(self):
         rows = [
             ExpenseRow(id=1, happened_at=None, amount=Decimal("1000"), method="прочее", comment="Химия"),
@@ -40,6 +45,22 @@ class AnalyticsExpenseGroupTests(unittest.TestCase):
         self.assertEqual(groups[0], ExpenseGroup(name="Материалы/химия", amount=Decimal("1500"), share=Decimal("0.75"), count=2, examples=["Химия", "Химия перчатки"]))
         self.assertEqual(groups[1].name, "Без категории")
         self.assertEqual(groups[1].share, Decimal("0.25"))
+
+    def test_group_expenses_prefers_stored_category(self):
+        rows = [
+            ExpenseRow(
+                id=1,
+                happened_at=None,
+                amount=Decimal("1000"),
+                method="прочее",
+                comment="Непонятно",
+                category="Партнеры",
+            ),
+        ]
+
+        groups = group_expenses(rows)
+
+        self.assertEqual(groups[0].name, "Партнеры")
 
 
 if __name__ == "__main__":

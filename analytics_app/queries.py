@@ -68,6 +68,7 @@ def _row_to_expense_metric(row: Any) -> ExpenseRow:
         amount=_decimal(_get(row, "amount", 0)),
         method=str(_get(row, "method", "")),
         comment=str(_get(row, "comment", "")),
+        category=str(_get(row, "category", "")),
     )
 
 
@@ -190,15 +191,16 @@ async def build_main_cash_dashboard(
     rows = await conn.fetch(
         """
         SELECT row_scope, id, happened_at, kind, method, amount,
-               comment, order_id, master_id, is_deleted
+               comment, category, order_id, master_id, is_deleted
         FROM (
             SELECT 0 AS row_sort, ledger_rows.*
             FROM (
                 SELECT 'ledger'::text AS row_scope, id, happened_at, kind, method, amount,
                        COALESCE(comment, '') AS comment,
+                       COALESCE(to_jsonb(ce)->>'category', '') AS category,
                        order_id, master_id,
                        COALESCE(is_deleted, false) AS is_deleted
-                FROM cashbook_entries
+                FROM cashbook_entries ce
                 WHERE happened_at >= $1
                   AND happened_at <  $2
                 ORDER BY happened_at DESC, id DESC
@@ -210,9 +212,10 @@ async def build_main_cash_dashboard(
             SELECT 1 AS row_sort,
                    'operating_expense'::text AS row_scope, id, happened_at, kind, method, amount,
                    COALESCE(comment, '') AS comment,
+                   COALESCE(to_jsonb(ce)->>'category', '') AS category,
                    order_id, master_id,
                    COALESCE(is_deleted, false) AS is_deleted
-            FROM cashbook_entries
+            FROM cashbook_entries ce
             WHERE happened_at >= $1
               AND happened_at <  $2
               AND kind = 'expense'

@@ -15,6 +15,7 @@ class ExpenseRow:
     amount: Decimal
     method: str
     comment: str
+    category: str = ""
 
 
 @dataclass(frozen=True)
