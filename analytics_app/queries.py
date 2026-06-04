@@ -8,7 +8,6 @@ from .management import ExpenseRow, OrderMetricRow, PayrollMetricRow, build_mana
 from .money import (
     CashbookRow,
     is_dividend,
-    is_payroll_payout,
     is_withdrawal,
     summarize_cashbook_rows,
     summarize_cleaning_rows,
@@ -82,9 +81,7 @@ def _is_operating_expense(row: Any) -> bool:
         return False
     if cashbook_row.kind != "expense":
         return False
-    if _get(row, "order_id") is not None:
-        return False
-    return not (is_withdrawal(cashbook_row) or is_dividend(cashbook_row) or is_payroll_payout(cashbook_row))
+    return not (is_withdrawal(cashbook_row) or is_dividend(cashbook_row))
 
 
 async def build_main_cash_dashboard(
@@ -146,6 +143,50 @@ async def build_main_cash_dashboard(
         start_utc,
         end_utc,
     )
+    cash_metrics = await conn.fetchrow(
+        """
+        SELECT
+          COALESCE(SUM(
+            CASE
+              WHEN kind = 'income'
+                AND NOT COALESCE(comment, '') ILIKE 'Стартовый остаток%'
+              THEN amount
+              ELSE 0
+            END
+          ), 0)::numeric(12,2) AS cash_income,
+          COALESCE(SUM(
+            CASE
+              WHEN kind = 'expense'
+               AND NOT (
+                 COALESCE(comment, '') ILIKE '[WDR]%'
+                 OR COALESCE(comment, '') ILIKE 'изъят%'
+                 OR COALESCE(method, '') = 'DIV'
+                 OR COALESCE(comment, '') ILIKE '[DIV]%'
+               )
+              THEN amount
+              ELSE 0
+            END
+          ), 0)::numeric(12,2) AS cash_expense,
+          COALESCE(SUM(
+            CASE
+              WHEN kind = 'expense'
+               AND (
+                 COALESCE(method, '') = 'DIV'
+                 OR COALESCE(comment, '') ILIKE '[DIV]%'
+               )
+              THEN amount
+              ELSE 0
+            END
+          ), 0)::numeric(12,2) AS div_paid
+        FROM cashbook_entries
+        WHERE happened_at >= $1
+          AND happened_at <  $2
+          AND COALESCE(is_deleted, false) = false
+          AND kind <> 'opening_balance'
+        """,
+        start_utc,
+        end_utc,
+    )
     rows = await conn.fetch(
         """
         SELECT row_scope, id, happened_at, kind, method, amount,
@@ -176,20 +217,11 @@ async def build_main_cash_dashboard(
               AND happened_at <  $2
               AND kind = 'expense'
               AND COALESCE(is_deleted, false) = false
-              AND order_id IS NULL
               AND NOT (
                   COALESCE(comment, '') ILIKE '[WDR]%'
                   OR COALESCE(comment, '') ILIKE 'изъят%'
                   OR COALESCE(method, '') = 'DIV'
                   OR COALESCE(comment, '') ILIKE '[DIV]%'
-                  OR COALESCE(comment, '') ILIKE 'зп%'
-                  OR COALESCE(comment, '') ILIKE 'з/п%'
-                  OR COALESCE(comment, '') ILIKE 'з.п%'
-                  OR COALESCE(comment, '') ILIKE '%зарплат%'
-                  OR (
-                      COALESCE(comment, '') ILIKE '%выплат%'
-                      AND COALESCE(comment, '') ILIKE '%мастер%'
-                  )
               )
         ) scoped_rows
         ORDER BY row_sort ASC, happened_at DESC, id DESC
@@ -223,6 +255,9 @@ async def build_main_cash_dashboard(
         payroll=[_row_to_payroll_metric(row) for row in payroll_rows],
         expenses=[_row_to_expense_metric(row) for row in expense_rows],
         group_by=group_by,
+        cash_income=_decimal(_get(cash_metrics, "cash_income", 0)),
+        cash_expense=_decimal(_get(cash_metrics, "cash_expense", 0)),
+        div_paid=_decimal(_get(cash_metrics, "div_paid", 0)),
     )
     return {
         "summary": summary,

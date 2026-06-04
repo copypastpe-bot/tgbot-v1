@@ -77,6 +77,9 @@ class AnalyticsManagementTests(unittest.TestCase):
             payroll=payroll,
             expenses=expenses,
             group_by="day",
+            cash_income=Decimal("10000"),
+            cash_expense=Decimal("3000"),
+            div_paid=Decimal("500"),
         )
 
         self.assertEqual(dashboard.gross_checks, Decimal("8000"))
@@ -89,10 +92,14 @@ class AnalyticsManagementTests(unittest.TestCase):
         self.assertEqual(dashboard.salary_base, Decimal("2000"))
         self.assertEqual(dashboard.salary_fuel, Decimal("300"))
         self.assertEqual(dashboard.salary_upsell, Decimal("500"))
-        self.assertEqual(dashboard.other_expenses, Decimal("1000"))
-        self.assertEqual(dashboard.operating_profit, Decimal("3200"))
-        self.assertEqual(dashboard.waterfall["gross_checks"], Decimal("8000"))
-        self.assertEqual(dashboard.waterfall["operating_profit"], Decimal("3200"))
+        self.assertEqual(dashboard.cash_income, Decimal("10000"))
+        self.assertEqual(dashboard.cash_expense, Decimal("3000"))
+        self.assertEqual(dashboard.cash_profit, Decimal("7000"))
+        self.assertEqual(dashboard.div_paid, Decimal("500"))
+        self.assertEqual(dashboard.other_expenses, Decimal("3000"))
+        self.assertEqual(dashboard.operating_profit, Decimal("7000"))
+        self.assertEqual(dashboard.waterfall["cash_income"], Decimal("10000"))
+        self.assertEqual(dashboard.waterfall["cash_profit"], Decimal("7000"))
         self.assertEqual(
             [row.master_name for row in dashboard.master_salaries],
             ["Борис", "Анна"],
@@ -180,9 +187,12 @@ class AnalyticsManagementTests(unittest.TestCase):
             payroll=payroll,
             expenses=expenses,
             group_by="day",
+            cash_income=Decimal("5000"),
+            cash_expense=Decimal("700"),
+            div_paid=Decimal("0"),
         )
 
-        self.assertEqual(dashboard.charts["waterfall"]["labels"][0], "Чеки")
+        self.assertEqual(dashboard.charts["waterfall"]["labels"][0], "Доходы")
         self.assertEqual(
             dashboard.charts["expense_groups"]["labels"],
             ["Материалы/химия"],

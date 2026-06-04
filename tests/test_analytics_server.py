@@ -39,8 +39,12 @@ def fake_management_dashboard():
         salary_upsell=Decimal("50"),
         other_expenses=Decimal("100"),
         operating_profit=Decimal("500"),
+        cash_income=Decimal("1000"),
+        cash_expense=Decimal("500"),
+        cash_profit=Decimal("500"),
+        div_paid=Decimal("50"),
         charts={
-            "waterfall": {"labels": ["Чеки"], "values": [1000]},
+            "waterfall": {"labels": ["Доходы"], "values": [1000]},
             "expense_groups": {"labels": [], "values": []},
             "salary_by_master": {"labels": [], "values": []},
             "time_series": {"labels": [], "datasets": []},
@@ -112,8 +116,8 @@ class AnalyticsServerTests(AioHTTPTestCase):
 
         self.assertEqual(page.status, 200)
         self.assertIn("Основная касса", text)
-        self.assertIn("Управленческий обзор", text)
-        self.assertIn("Бонусная потеря", text)
+        self.assertIn("Кассовая прибыль", text)
+        self.assertIn("Заказы и зарплата", text)
 
     async def test_cleaning_requires_auth_and_renders_after_login(self):
         login = await self.client.post(

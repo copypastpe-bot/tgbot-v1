@@ -65,6 +65,10 @@ class ManagementDashboard:
     salary_upsell: Decimal
     other_expenses: Decimal
     operating_profit: Decimal
+    cash_income: Decimal = ZERO
+    cash_expense: Decimal = ZERO
+    cash_profit: Decimal = ZERO
+    div_paid: Decimal = ZERO
     expense_groups: list[object] = field(default_factory=list)
     top_expenses: list[ExpenseRow] = field(default_factory=list)
     master_salaries: list[MasterSalarySummary] = field(default_factory=list)
@@ -116,22 +120,16 @@ def _build_charts(dashboard: ManagementDashboard) -> dict[str, object]:
     return {
         "waterfall": {
             "labels": [
-                "Чеки",
-                "Бонусы",
-                "Живые деньги",
-                "Зарплаты",
+                "Доходы",
                 "Расходы",
-                "Опер. прибыль",
+                "Прибыль",
             ],
             "values": [
                 float(dashboard.waterfall[key])
                 for key in [
-                    "gross_checks",
-                    "bonuses_spent",
-                    "live_money",
-                    "salaries",
-                    "other_expenses",
-                    "operating_profit",
+                    "cash_income",
+                    "cash_expense",
+                    "cash_profit",
                 ]
             ],
         },
@@ -153,6 +151,9 @@ def build_management_dashboard(
     payroll: list[PayrollMetricRow],
     expenses: list[ExpenseRow],
     group_by: str,
+    cash_income: Decimal | None = None,
+    cash_expense: Decimal | None = None,
+    div_paid: Decimal = ZERO,
 ) -> ManagementDashboard:
     from .expense_groups import group_expenses
 
@@ -164,18 +165,20 @@ def build_management_dashboard(
     salary_base = sum((row.base_pay for row in payroll), ZERO)
     salary_fuel = sum((row.fuel_pay for row in payroll), ZERO)
     salary_upsell = sum((row.upsell_pay for row in payroll), ZERO)
-    other_expenses = sum((row.amount for row in expenses), ZERO)
-    operating_profit = live_money - salary_total - other_expenses
+    expense_total = cash_expense if cash_expense is not None else sum((row.amount for row in expenses), ZERO)
+    income_total = cash_income if cash_income is not None else live_money
+    cash_profit = income_total - expense_total
     waterfall = {
-        "gross_checks": gross_checks,
-        "bonuses_spent": -bonuses_spent,
-        "live_money": live_money,
-        "salaries": -salary_total,
-        "other_expenses": -other_expenses,
-        "operating_profit": operating_profit,
+        "cash_income": income_total,
+        "cash_expense": -expense_total,
+        "cash_profit": cash_profit,
     }
 
     dashboard = ManagementDashboard(
+        cash_income=income_total,
+        cash_expense=expense_total,
+        cash_profit=cash_profit,
+        div_paid=div_paid,
         gross_checks=gross_checks,
         live_money=live_money,
         bonuses_spent=bonuses_spent,
@@ -186,8 +189,8 @@ def build_management_dashboard(
         salary_base=salary_base,
         salary_fuel=salary_fuel,
         salary_upsell=salary_upsell,
-        other_expenses=other_expenses,
-        operating_profit=operating_profit,
+        other_expenses=expense_total,
+        operating_profit=cash_profit,
         expense_groups=group_expenses(expenses),
         top_expenses=sorted(expenses, key=lambda row: row.amount, reverse=True)[:10],
         master_salaries=_build_master_salaries(orders, payroll),

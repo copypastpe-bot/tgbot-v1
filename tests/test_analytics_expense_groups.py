@@ -13,7 +13,13 @@ class AnalyticsExpenseGroupTests(unittest.TestCase):
     def test_classifies_known_keywords(self):
         self.assertEqual(classify_expense(method="прочее", comment="Купили химию"), "Материалы/химия")
         self.assertEqual(classify_expense(method="прочее", comment="Авито реклама"), "Реклама/маркетинг")
-        self.assertEqual(classify_expense(method="прочее", comment="Бензин мастер"), "Топливо/транспорт")
+        self.assertEqual(classify_expense(method="прочее", comment="Бензин мастер"), "Транспорт/логистика")
+        self.assertEqual(classify_expense(method="прочее", comment="Дима С ВХ"), "Зарплата/подрядчики")
+        self.assertEqual(classify_expense(method="прочее", comment="Ковры школа"), "Партнеры")
+        self.assertEqual(classify_expense(method="прочее", comment="Артгорький доработки сайта"), "Реклама/маркетинг")
+        self.assertEqual(classify_expense(method="прочее", comment="Блю и смарт мастер"), "Материалы/химия")
+        self.assertEqual(classify_expense(method="прочее", comment="Турбина"), "Ремонт оборудования")
+        self.assertEqual(classify_expense(method="прочее", comment="Полозов др"), "Премии/подарки сотрудникам")
         self.assertEqual(classify_expense(method="DIV", comment="[DIV] Дивиденды"), "Дивиденды/изъятия")
         self.assertEqual(classify_expense(method="Наличные", comment="[WDR] Изъятие"), "Дивиденды/изъятия")
 

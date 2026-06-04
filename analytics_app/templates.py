@@ -268,20 +268,27 @@ def render_management_dashboard(
     </header>
     {note_html}
     <section class="dashboard-section">
-      <h2>Управленческий обзор</h2>
+      <h2>Кассовая прибыль</h2>
       <div class="metrics management-metrics">
-        <div><span>Чеки</span><strong>{money(dashboard.gross_checks)}</strong></div>
-        <div><span>Живые деньги</span><strong>{money(dashboard.live_money)}</strong></div>
-        <div><span>Зарплата</span><strong>{money(dashboard.salary_total)}</strong><small>Зарплата от чеков: {percent(dashboard.salary_percent)}</small></div>
-        <div><span>Бонусная потеря</span><strong>{money(dashboard.bonuses_spent)}</strong><small>{percent(dashboard.bonus_loss_percent)} от чеков</small></div>
-        <div><span>Прочие расходы</span><strong>{money(dashboard.other_expenses)}</strong></div>
-        <div><span>Опер. прибыль</span><strong>{money(dashboard.operating_profit)}</strong></div>
+        <div><span>Доходы</span><strong>{money(dashboard.cash_income)}</strong></div>
+        <div><span>Расходы</span><strong>{money(dashboard.cash_expense)}</strong></div>
+        <div><span>Прибыль</span><strong>{money(dashboard.cash_profit)}</strong></div>
+        <div><span>DIV выплачено</span><strong>{money(dashboard.div_paid)}</strong></div>
         <div><span>Остаток кассы</span><strong>{money(balance)}</strong></div>
       </div>
     </section>
+    <section class="dashboard-section">
+      <h2>Заказы и зарплата</h2>
+      <div class="metrics management-metrics">
+        <div><span>Чеки</span><strong>{money(dashboard.gross_checks)}</strong></div>
+        <div><span>Оплаты</span><strong>{money(dashboard.live_money)}</strong></div>
+        <div><span>Бонусы списано</span><strong>{money(dashboard.bonuses_spent)}</strong><small>{percent(dashboard.bonus_loss_percent)} от чеков</small></div>
+        <div><span>Зарплата расчетная</span><strong>{money(dashboard.salary_total)}</strong><small>{percent(dashboard.salary_percent)} от чеков</small></div>
+      </div>
+    </section>
     <section class="charts grid-2">
-      <div><h2>Водопад прибыли</h2><canvas id="waterfallChart"></canvas></div>
-      <div><h2>Группы расходов</h2><canvas id="expenseGroupsChart"></canvas></div>
+      <div><h2>Кассовая прибыль</h2><canvas id="waterfallChart"></canvas></div>
+      <div><h2>Расходы по категориям</h2><canvas id="expenseGroupsChart"></canvas></div>
       <div><h2>Зарплата по мастерам</h2><canvas id="salaryByMasterChart"></canvas></div>
       <div><h2>Динамика</h2><canvas id="timeSeriesChart"></canvas></div>
     </section>
@@ -295,7 +302,7 @@ def render_management_dashboard(
       <p>Списано: {money(dashboard.bonuses_spent)}. Начислено: {money(dashboard.bonuses_earned)}. Потеря: {percent(dashboard.bonus_loss_percent)} от чеков.</p>
     </section>
     <section class="dashboard-section">
-      <h2>Группировка расходов</h2>
+      <h2>Расходы по категориям</h2>
       {_expense_group_table(dashboard.expense_groups)}
     </section>
     <section class="dashboard-section">

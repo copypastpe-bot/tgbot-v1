@@ -46,8 +46,12 @@ class AnalyticsTemplateTests(unittest.TestCase):
             salary_upsell=Decimal("500"),
             other_expenses=Decimal("1000"),
             operating_profit=Decimal("3200"),
+            cash_income=Decimal("8000"),
+            cash_expense=Decimal("4800"),
+            cash_profit=Decimal("3200"),
+            div_paid=Decimal("500"),
             charts={
-                "waterfall": {"labels": ["Чеки"], "values": [8000]},
+                "waterfall": {"labels": ["Доходы"], "values": [8000]},
                 "expense_groups": {"labels": [], "values": []},
                 "salary_by_master": {"labels": [], "values": []},
                 "time_series": {"labels": [], "datasets": []},
@@ -66,9 +70,10 @@ class AnalyticsTemplateTests(unittest.TestCase):
             extra_note="",
         )
 
-        self.assertIn("Управленческий обзор", html)
-        self.assertIn("Зарплата от чеков", html)
-        self.assertIn("Бонусная потеря", html)
+        self.assertIn("Кассовая прибыль", html)
+        self.assertIn("Заказы и зарплата", html)
+        self.assertIn("DIV выплачено", html)
+        self.assertIn("Зарплата расчетная", html)
         self.assertIn("Крупные расходы", html)
         self.assertIn('name="date_from"', html)
         self.assertIn('name="date_to"', html)
