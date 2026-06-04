@@ -5,7 +5,14 @@ from decimal import Decimal
 from typing import Any
 
 from .management import ExpenseRow, OrderMetricRow, PayrollMetricRow, build_management_dashboard
-from .money import CashbookRow, is_dividend, is_withdrawal, summarize_cashbook_rows, summarize_cleaning_rows
+from .money import (
+    CashbookRow,
+    is_dividend,
+    is_payroll_payout,
+    is_withdrawal,
+    summarize_cashbook_rows,
+    summarize_cleaning_rows,
+)
 
 
 def _decimal(value: Any) -> Decimal:
@@ -77,7 +84,7 @@ def _is_operating_expense(row: Any) -> bool:
         return False
     if _get(row, "order_id") is not None:
         return False
-    return not (is_withdrawal(cashbook_row) or is_dividend(cashbook_row))
+    return not (is_withdrawal(cashbook_row) or is_dividend(cashbook_row) or is_payroll_payout(cashbook_row))
 
 
 async def build_main_cash_dashboard(
@@ -175,6 +182,14 @@ async def build_main_cash_dashboard(
                   OR COALESCE(comment, '') ILIKE 'изъят%'
                   OR COALESCE(method, '') = 'DIV'
                   OR COALESCE(comment, '') ILIKE '[DIV]%'
+                  OR COALESCE(comment, '') ILIKE 'зп%'
+                  OR COALESCE(comment, '') ILIKE 'з/п%'
+                  OR COALESCE(comment, '') ILIKE 'з.п%'
+                  OR COALESCE(comment, '') ILIKE '%зарплат%'
+                  OR (
+                      COALESCE(comment, '') ILIKE '%выплат%'
+                      AND COALESCE(comment, '') ILIKE '%мастер%'
+                  )
               )
         ) scoped_rows
         ORDER BY row_sort ASC, happened_at DESC, id DESC

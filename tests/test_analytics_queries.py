@@ -147,6 +147,18 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
                         "order_id": None,
                         "master_id": None,
                         "is_deleted": False,
+                    },
+                    {
+                        "id": 8,
+                        "row_scope": "operating_expense",
+                        "happened_at": datetime(2026, 6, 3, tzinfo=ZoneInfo("UTC")),
+                        "kind": "expense",
+                        "method": "прочее",
+                        "amount": Decimal("9000"),
+                        "comment": "Зп Козлов",
+                        "order_id": None,
+                        "master_id": None,
+                        "is_deleted": False,
                     }
                 ],
             ],

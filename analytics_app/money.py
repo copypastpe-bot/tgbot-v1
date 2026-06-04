@@ -50,6 +50,19 @@ def is_dividend(row: CashbookRow) -> bool:
     return row.method == DIVIDEND_METHOD or comment.startswith("[div]")
 
 
+def is_payroll_payout(row: CashbookRow) -> bool:
+    comment = row.comment.lower().strip()
+    if row.kind != "expense":
+        return False
+    return (
+        comment.startswith("зп")
+        or comment.startswith("з/п")
+        or comment.startswith("з.п")
+        or "зарплат" in comment
+        or ("выплат" in comment and "мастер" in comment)
+    )
+
+
 def summarize_cashbook_rows(rows: list[CashbookRow]) -> MoneySummary:
     income = ZERO
     expense = ZERO
