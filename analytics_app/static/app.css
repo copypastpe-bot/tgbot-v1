@@ -11,14 +11,19 @@ h1 { margin: 0 0 4px; font-size: 28px; }
 h2 { margin: 0 0 12px; font-size: 18px; }
 p { margin: 0; color: #667085; }
 .filters { display: flex; gap: 8px; flex-wrap: wrap; }
+.date-filters input { border: 1px solid #ccd4e0; border-radius: 6px; padding: 8px 10px; min-height: 38px; }
 button { border: 0; background: #18202f; color: white; border-radius: 6px; padding: 9px 12px; cursor: pointer; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(160px, 1fr)); gap: 12px; margin-bottom: 12px; }
 .metrics div, .charts div, section { background: white; border: 1px solid #e1e6ef; border-radius: 8px; padding: 16px; }
 .metrics span { display: block; color: #667085; margin-bottom: 8px; }
 .metrics strong { font-size: 24px; }
+.metrics small { display: block; margin-top: 6px; color: #667085; line-height: 1.3; }
 .note { margin: 0 0 14px; }
 .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-canvas { max-height: 260px; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+.dashboard-section { margin-bottom: 12px; }
+.management-metrics { grid-template-columns: repeat(4, minmax(150px, 1fr)); }
+canvas { width: 100%; max-height: 260px; min-height: 220px; }
 .table-search { width: 100%; border: 1px solid #ccd4e0; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
 table { width: 100%; border-collapse: collapse; background: white; }
 th, td { border-bottom: 1px solid #edf0f5; padding: 10px 8px; text-align: left; vertical-align: top; }
@@ -36,5 +41,6 @@ label input { width: 100%; border: 1px solid #ccd4e0; border-radius: 6px; paddin
   .content { margin-left: 0; padding: 16px; }
   .topbar { display: block; }
   .filters { margin-top: 12px; }
-  .metrics, .charts { grid-template-columns: 1fr; }
+  .metrics, .charts, .grid-2, .management-metrics { grid-template-columns: 1fr; }
+  .date-filters input, .date-filters button { width: 100%; }
 }
