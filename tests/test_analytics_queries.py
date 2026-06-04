@@ -169,11 +169,27 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(conn.fetch_calls), 3)
         order_sql = conn.fetch_calls[0][0].lower()
         self.assertIn("order_payments", order_sql)
-        self.assertIn("coalesce(op.live_money, o.amount_cash, 0) as amount_cash", order_sql)
+        self.assertIn("wire_income", order_sql)
+        self.assertIn("method <> 'р/с'", order_sql)
         ledger_sql = conn.fetch_calls[2][0].lower()
         self.assertIn("row_scope", ledger_sql)
         self.assertIn("operating_expense", ledger_sql)
         self.assertIn("union all", ledger_sql)
+
+    async def test_main_dashboard_uses_linked_wire_cashbook_income_for_live_money(self):
+        conn = FakeConn(fetch_results=[[], [], []], fetchval_results=[Decimal("0")])
+
+        await build_main_cash_dashboard(
+            conn,
+            start_utc=datetime(2026, 5, 1, tzinfo=ZoneInfo("UTC")),
+            end_utc=datetime(2026, 6, 1, tzinfo=ZoneInfo("UTC")),
+        )
+
+        order_sql = conn.fetch_calls[0][0].lower()
+        self.assertIn("wire_income", order_sql)
+        self.assertIn("from cashbook_entries", order_sql)
+        self.assertIn("method = 'р/с'", order_sql)
+        self.assertIn("awaiting_order", order_sql)
 
 
 if __name__ == "__main__":

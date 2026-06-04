@@ -88,16 +88,32 @@ async def build_main_cash_dashboard(
         SELECT o.id, o.created_at, o.master_id,
                TRIM(COALESCE(s.first_name, '') || ' ' || COALESCE(s.last_name, '')) AS master_name,
                COALESCE(o.amount_total, 0) AS amount_total,
-               COALESCE(op.live_money, o.amount_cash, 0) AS amount_cash,
+               CASE
+                 WHEN COALESCE(op.payment_count, 0) > 0
+                   THEN COALESCE(op.non_wire_money, 0) + COALESCE(wire_income.live_money, 0)
+                 ELSE COALESCE(o.amount_cash, 0)
+               END AS amount_cash,
                COALESCE(o.bonus_spent, 0) AS bonus_spent,
                COALESCE(o.bonus_earned, 0) AS bonus_earned
         FROM orders o
         LEFT JOIN staff s ON s.id = o.master_id
         LEFT JOIN (
-            SELECT order_id, COALESCE(SUM(amount), 0) AS live_money
+            SELECT order_id,
+                   COUNT(*) AS payment_count,
+                   COALESCE(SUM(CASE WHEN method <> 'р/с' THEN amount ELSE 0 END), 0) AS non_wire_money
             FROM order_payments
             GROUP BY order_id
         ) op ON op.order_id = o.id
+        LEFT JOIN (
+            SELECT order_id, COALESCE(SUM(amount), 0) AS live_money
+            FROM cashbook_entries
+            WHERE kind = 'income'
+              AND method = 'р/с'
+              AND order_id IS NOT NULL
+              AND COALESCE(is_deleted, false) = false
+              AND COALESCE(awaiting_order, false) = false
+            GROUP BY order_id
+        ) wire_income ON wire_income.order_id = o.id
         WHERE o.created_at >= $1
           AND o.created_at <  $2
         ORDER BY o.created_at DESC, o.id DESC
