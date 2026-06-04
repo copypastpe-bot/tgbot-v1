@@ -201,7 +201,35 @@ async def build_main_cash_dashboard(
     }
 
 
-async def build_cleaning_dashboard(conn, *, start_utc: datetime, end_utc: datetime) -> dict[str, Any]:
+async def build_cleaning_dashboard(
+    conn, *, start_utc: datetime, end_utc: datetime, group_by: str = "day"
+) -> dict[str, Any]:
+    order_rows = await conn.fetch(
+        """
+        SELECT o.id,
+               o.happened_at AS created_at,
+               o.foreman_id AS master_id,
+               TRIM(COALESCE(f.fn, '') || ' ' || COALESCE(f.ln, '')) AS master_name,
+               COALESCE(o.total_amount, 0) AS amount_total,
+               COALESCE(op.live_money, o.total_amount - o.bonuses_used, 0) AS amount_cash,
+               COALESCE(o.bonuses_used, 0) AS bonus_spent,
+               COALESCE(o.bonuses_earned, 0) AS bonus_earned
+        FROM cleaning_orders o
+        LEFT JOIN cleaning_foremen f ON f.id = o.foreman_id
+        LEFT JOIN (
+            SELECT order_id, COALESCE(SUM(amount), 0) AS live_money
+            FROM cleaning_order_payments
+            WHERE method <> 'Подарочный сертификат'
+            GROUP BY order_id
+        ) op ON op.order_id = o.id
+        WHERE o.happened_at >= $1
+          AND o.happened_at <  $2
+          AND o.deleted_at IS NULL
+        ORDER BY o.happened_at DESC, o.id DESC
+        """,
+        start_utc,
+        end_utc,
+    )
     rows = await conn.fetch(
         """
         SELECT id, happened_at, kind, method, amount,
@@ -244,9 +272,21 @@ async def build_cleaning_dashboard(conn, *, start_utc: datetime, end_utc: dateti
         """
     )
     summary = summarize_cleaning_rows([_row_to_cashbook(row) for row in rows])
+    expense_rows = [
+        row
+        for row in rows
+        if _row_to_cashbook(row).kind == "expense" and not _row_to_cashbook(row).is_deleted
+    ]
+    management = build_management_dashboard(
+        orders=[_row_to_order_metric(row) for row in order_rows],
+        payroll=[],
+        expenses=[_row_to_expense_metric(row) for row in expense_rows],
+        group_by=group_by,
+    )
     return {
         "summary": summary,
         "balance": _decimal(balance),
         "gift_total": _decimal(gift_total),
         "ledger": rows,
+        "management": management,
     }

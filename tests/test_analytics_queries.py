@@ -68,7 +68,24 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(re.search(r"\bdelete\b", sql_text))
 
     async def test_cleaning_dashboard_returns_gift_total(self):
-        conn = FakeConn(rows=[], scalar=Decimal("500"))
+        conn = FakeConn(
+            fetch_results=[
+                [
+                    {
+                        "id": 1,
+                        "created_at": datetime(2026, 6, 1, tzinfo=ZoneInfo("UTC")),
+                        "master_id": 3,
+                        "master_name": "Иван",
+                        "amount_total": Decimal("6000"),
+                        "amount_cash": Decimal("5500"),
+                        "bonus_spent": Decimal("500"),
+                        "bonus_earned": Decimal("550"),
+                    }
+                ],
+                [],
+            ],
+            fetchval_results=[Decimal("500"), Decimal("4700")],
+        )
 
         dashboard = await build_cleaning_dashboard(
             conn,
@@ -77,6 +94,8 @@ class AnalyticsQueryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(dashboard["gift_total"], Decimal("500"))
+        self.assertEqual(dashboard["management"].gross_checks, Decimal("6000"))
+        self.assertEqual(dashboard["management"].live_money, Decimal("5500"))
 
     async def test_main_dashboard_fetches_orders_payroll_expenses_and_balance(self):
         conn = FakeConn(

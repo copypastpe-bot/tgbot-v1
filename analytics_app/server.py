@@ -11,7 +11,7 @@ from .auth import sign_session, unsign_session, verify_password
 from .config import AnalyticsConfig
 from .dates import resolve_date_range
 from .queries import build_cleaning_dashboard, build_main_cash_dashboard
-from .templates import render_dashboard, render_login
+from .templates import render_login, render_management_dashboard
 
 
 SESSION_COOKIE = "analytics_session"
@@ -26,11 +26,15 @@ class QueryService:
     def acquire(self):
         return self.pool.acquire()
 
-    async def main(self, conn, *, start_utc, end_utc):
-        return await build_main_cash_dashboard(conn, start_utc=start_utc, end_utc=end_utc)
+    async def main(self, conn, *, start_utc, end_utc, group_by):
+        return await build_main_cash_dashboard(
+            conn, start_utc=start_utc, end_utc=end_utc, group_by=group_by
+        )
 
-    async def cleaning(self, conn, *, start_utc, end_utc):
-        return await build_cleaning_dashboard(conn, start_utc=start_utc, end_utc=end_utc)
+    async def cleaning(self, conn, *, start_utc, end_utc, group_by):
+        return await build_cleaning_dashboard(
+            conn, start_utc=start_utc, end_utc=end_utc, group_by=group_by
+        )
 
 
 @web.middleware
@@ -87,18 +91,19 @@ async def main_cash(request: web.Request) -> web.Response:
     rng = resolve_date_range(request.query)
     query_service = request.app[QUERY_SERVICE_KEY]
     async with query_service.acquire() as conn:
-        data = await query_service.main(conn, start_utc=rng.start_utc, end_utc=rng.end_utc)
-    summary = data["summary"]
-    rendered = render_dashboard(
+        data = await query_service.main(
+            conn, start_utc=rng.start_utc, end_utc=rng.end_utc, group_by=rng.group_by
+        )
+    rendered = render_management_dashboard(
         title="Основная касса",
         active_section="main",
         period_label=_period_label(rng),
-        summary=summary,
+        date_from=f"{rng.start_date:%Y-%m-%d}",
+        date_to=f"{rng.end_date:%Y-%m-%d}",
         balance=data["balance"],
+        dashboard=data["management"],
         ledger=data["ledger"],
-        income_by_method=summary.income_by_method,
-        expense_by_group=summary.expense_by_group,
-        extra_note="Расходы основной кассы без строгих категорий: используйте поиск по комментарию.",
+        extra_note="",
     )
     return web.Response(text=rendered, content_type="text/html")
 
@@ -107,18 +112,19 @@ async def cleaning(request: web.Request) -> web.Response:
     rng = resolve_date_range(request.query)
     query_service = request.app[QUERY_SERVICE_KEY]
     async with query_service.acquire() as conn:
-        data = await query_service.cleaning(conn, start_utc=rng.start_utc, end_utc=rng.end_utc)
-    summary = data["summary"]
-    rendered = render_dashboard(
+        data = await query_service.cleaning(
+            conn, start_utc=rng.start_utc, end_utc=rng.end_utc, group_by=rng.group_by
+        )
+    rendered = render_management_dashboard(
         title="Клининг",
         active_section="cleaning",
         period_label=_period_label(rng),
-        summary=summary,
+        date_from=f"{rng.start_date:%Y-%m-%d}",
+        date_to=f"{rng.end_date:%Y-%m-%d}",
         balance=data["balance"],
+        dashboard=data["management"],
         ledger=data["ledger"],
-        income_by_method=summary.income_by_method,
-        expense_by_group=summary.expense_by_group,
-        extra_note=f"Подарочные сертификаты за период: {data['gift_total']} ₽.",
+        extra_note=f"Подарочные сертификаты за период: {data['gift_total']} ₽. Зарплатные данные клининга пока не подключены.",
     )
     return web.Response(text=rendered, content_type="text/html")
 

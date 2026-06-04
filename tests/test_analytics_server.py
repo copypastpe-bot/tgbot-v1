@@ -7,6 +7,7 @@ from aiohttp.test_utils import AioHTTPTestCase
 
 from analytics_app.auth import make_password_hash
 from analytics_app.config import AnalyticsConfig
+from analytics_app.management import ManagementDashboard
 from analytics_app.money import MoneySummary
 from analytics_app.server import create_app
 
@@ -24,6 +25,29 @@ class FakeAcquire:
         return None
 
 
+def fake_management_dashboard():
+    return ManagementDashboard(
+        gross_checks=Decimal("1000"),
+        live_money=Decimal("900"),
+        bonuses_spent=Decimal("100"),
+        bonuses_earned=Decimal("90"),
+        bonus_loss_percent=Decimal("0.10"),
+        salary_total=Decimal("300"),
+        salary_percent=Decimal("0.30"),
+        salary_base=Decimal("200"),
+        salary_fuel=Decimal("50"),
+        salary_upsell=Decimal("50"),
+        other_expenses=Decimal("100"),
+        operating_profit=Decimal("500"),
+        charts={
+            "waterfall": {"labels": ["Чеки"], "values": [1000]},
+            "expense_groups": {"labels": [], "values": []},
+            "salary_by_master": {"labels": [], "values": []},
+            "time_series": {"labels": [], "datasets": []},
+        },
+    )
+
+
 class FakeQueryService:
     def __init__(self):
         self.pool = FakePool()
@@ -31,10 +55,11 @@ class FakeQueryService:
     def acquire(self):
         return FakeAcquire()
 
-    async def main(self, conn, *, start_utc, end_utc):
+    async def main(self, conn, *, start_utc, end_utc, group_by):
         return {
             "summary": MoneySummary(income=Decimal("1000"), expense=Decimal("200"), profit=Decimal("800")),
             "balance": Decimal("500"),
+            "management": fake_management_dashboard(),
             "ledger": [
                 {
                     "happened_at": datetime(2026, 6, 1, tzinfo=ZoneInfo("UTC")),
@@ -46,11 +71,12 @@ class FakeQueryService:
             ],
         }
 
-    async def cleaning(self, conn, *, start_utc, end_utc):
+    async def cleaning(self, conn, *, start_utc, end_utc, group_by):
         return {
             "summary": MoneySummary(income=Decimal("2000"), expense=Decimal("500"), profit=Decimal("1500")),
             "balance": Decimal("1500"),
             "gift_total": Decimal("0"),
+            "management": fake_management_dashboard(),
             "ledger": [],
         }
 
@@ -86,6 +112,8 @@ class AnalyticsServerTests(AioHTTPTestCase):
 
         self.assertEqual(page.status, 200)
         self.assertIn("Основная касса", text)
+        self.assertIn("Управленческий обзор", text)
+        self.assertIn("Бонусная потеря", text)
 
     async def test_cleaning_requires_auth_and_renders_after_login(self):
         login = await self.client.post(
