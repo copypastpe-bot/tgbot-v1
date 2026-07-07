@@ -13465,11 +13465,15 @@ async def main():
         sent_retry_task = asyncio.create_task(
             retry_pending_sent_messages()
         )
-    if rewash_followup_task is None:
-        # Проверяем перемывы каждые 2 часа
-        rewash_followup_task = asyncio.create_task(
-            schedule_periodic_job(2 * 3600, run_rewash_followup_job, "rewash_followup")
-        )
+    # Клиентский follow-up по перемывам отключён (2026-07-07): клиенты им не пользуются,
+    # приёма ответа «1/2» в проекте нет, а джоба спамила клиента и служебный чат.
+    # Отметка перемыва мастером и счётчик rewash_counter_task ниже продолжают работать.
+    # Чтобы вернуть — раскомментировать блок и завести обработку ответов клиента (rewash_result).
+    # if rewash_followup_task is None:
+    #     # Проверяем перемывы каждые 2 часа
+    #     rewash_followup_task = asyncio.create_task(
+    #         schedule_periodic_job(2 * 3600, run_rewash_followup_job, "rewash_followup")
+    #     )
     if rewash_counter_task is None:
         # Проверяем счетчик перемывов раз в день в 10:00
         rewash_counter_task = asyncio.create_task(
