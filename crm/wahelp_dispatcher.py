@@ -86,9 +86,11 @@ _admin_ids_env = os.getenv("ADMIN_TG_IDS", "") or os.getenv("ADMIN_IDS", "")
 for part in re.split(r"[ ,;]+", _admin_ids_env.strip()):
     if part.isdigit():
         ADMIN_TG_IDS.add(int(part))
-SERVICE_WA_FOOTER_KEYS = {
+SERVICE_FOOTER_KEYS = {
     "order_completed_summary",
+    "cleaning_order_completed_summary",
     "order_rating_reminder",
+    "cleaning_order_rating_reminder",
     "order_rating_response_high_client",
     "order_rating_response_mid_client",
     "order_rating_response_low_client",
@@ -470,7 +472,7 @@ async def send_with_rules(
         try:
             if contact.recipient_kind == "client":
                 await _touch_channel_attempt(conn, contact.client_id, channel)
-            send_text = _with_wa_fallback(text, channel, event_key)
+            send_text = _with_contact_footer(text, channel, event_key)
             if attempt.address_kind == "user_id" and attempt.user_id is not None:
                 response = await send_text_message(channel, user_id=attempt.user_id, text=send_text)
             else:
@@ -525,7 +527,7 @@ async def send_via_channel(
         dead_channels = await _get_dead_channels(conn, contact)
         if channel in dead_channels:
             raise WahelpAPIError(0, f"Channel {channel} is marked as dead", None)
-    send_text = _with_wa_fallback(text, channel, event_key)
+    send_text = _with_contact_footer(text, channel, event_key)
     try:
         user_id = None
         if channel == WHATSAPP_CHANNEL:
@@ -709,10 +711,9 @@ def _is_rate_limit_error(error: WahelpAPIError) -> bool:
     return "слишком много попыток" in lowered or "too many requests" in lowered
 
 
-def _with_wa_fallback(text: str, channel: ChannelKind, event_key: str | None) -> str:
-    if channel != WHATSAPP_CHANNEL:
-        return text
-    if event_key not in SERVICE_WA_FOOTER_KEYS:
+def _with_contact_footer(text: str, channel: ChannelKind, event_key: str | None) -> str:
+    """Контакты в подвале сервисных сообщений. Канал не важен: клеим везде."""
+    if event_key not in SERVICE_FOOTER_KEYS:
         return text
     if WA_TG_FALLBACK_TEXT:
         return f"{text}\n\n{WA_TG_FALLBACK_TEXT}"
