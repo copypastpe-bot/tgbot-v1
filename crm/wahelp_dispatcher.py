@@ -1,9 +1,11 @@
 """
 Message routing rules for Wahelp channels.
 
-Current priority (MAX is disabled):
+Current priority:
 - If we already know Wahelp user_id for the channel, send directly via that user.
 - For clients, WhatsApp (clients_wa) has priority; Telegram (clients_tg) is fallback.
+- MAX (clients_max) is enabled by default (WAHELP_CLIENTS_MAX_ENABLED) and used as an extra
+  fallback; promo events are excluded from MAX unless WAHELP_CLIENTS_MAX_PROMO_ENABLED is on.
 - For leads, only the Telegram leads channel is available.
 - If neither channel returns a user_id (messenger not connected), mark the contact as requiring bot connection.
 """

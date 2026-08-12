@@ -35,7 +35,6 @@ class NotificationWorker:
         max_attempts: int = 5,
         promo_texts_fn=None,
         birthday_texts_fn=None,
-        tg_link: str = "",
         logs_chat_id: int | None = None,
     ) -> None:
         self.pool = pool
@@ -45,7 +44,6 @@ class NotificationWorker:
         self.max_attempts = max_attempts
         self.promo_texts_fn = promo_texts_fn
         self.birthday_texts_fn = birthday_texts_fn
-        self.tg_link = tg_link
         self.logs_chat_id = logs_chat_id
         self._task: asyncio.Task | None = None
         self._stopping = False
@@ -201,7 +199,6 @@ class NotificationWorker:
                         template
                         .replace("{BONUS_SUM}", "{{bonus}}")
                         .replace("{BONUS_EXPIRES_AT}", "{{expire_date}}")
-                        .replace("{TG_LINK}", self.tg_link or "")
                     )
             elif ek.startswith("birthday_congrats") and callable(self.birthday_texts_fn):
                 texts = self.birthday_texts_fn() or []
@@ -212,7 +209,6 @@ class NotificationWorker:
                         template
                         .replace("{BONUS_SUM}", "{{bonus_balance}}")
                         .replace("{BONUS_EXPIRES_AT}", "{{expire_date}}")
-                        .replace("{TG_LINK}", self.tg_link or "")
                     )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Sheet text fallback for %s failed: %s", ek, exc)
