@@ -71,7 +71,13 @@ TELEGRAM_API_IPS_RAW = (os.getenv("TELEGRAM_API_IPS") or "").strip()
 TELEGRAM_IP_PROBE_TIMEOUT_SEC = float(os.getenv("TELEGRAM_IP_PROBE_TIMEOUT_SEC", "1.5") or "1.5")
 TELEGRAM_IP_RECHECK_SEC = float(os.getenv("TELEGRAM_IP_RECHECK_SEC", "30") or "30")
 WA_TG_FALLBACK_TEXT = (os.getenv("WA_TG_FALLBACK_TEXT") or "").strip()
-TG_LINK = (os.getenv("TEXTS_TG_LINK") or "").strip()
+WA_CONTACT_MAX_LINK = (os.getenv("WA_CONTACT_MAX_LINK") or "https://clck.ru/3VCQEi").strip()
+WA_CONTACT_TG_LINK = (os.getenv("WA_CONTACT_TG_LINK") or "https://t.me/raketaclean").strip()
+WA_CONTACT_FOOTER = (
+    "Мы всегда на связи здесь:\n"
+    f"MAX: {WA_CONTACT_MAX_LINK}\n"
+    f"Telegram: {WA_CONTACT_TG_LINK}"
+)
 DAILY_SEND_LIMIT = int(os.getenv("DAILY_SEND_LIMIT", "60") or "60")
 DAILY_SEND_LIMIT_ALERT_JOB = "send_daily_limit_alert"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -710,9 +716,7 @@ def _with_wa_fallback(text: str, channel: ChannelKind, event_key: str | None) ->
         return text
     if WA_TG_FALLBACK_TEXT:
         return f"{text}\n\n{WA_TG_FALLBACK_TEXT}"
-    if TG_LINK:
-        return f"{text}\n\nПроблемы с whatsapp? Подпишитесь на наш телеграм {TG_LINK}"
-    return f"{text}\n\nПроблемы с whatsapp? Подпишитесь на наш телеграм"
+    return f"{text}\n\n{WA_CONTACT_FOOTER}"
 
 
 async def _fetch_client_channel_rows(
