@@ -51,3 +51,6 @@ scripts/fetch_lead_user_ids.py
 scripts/get_wahelp_user_id.py
 scripts/send_test_message_to_client_bot.py
 scripts/sync_wahelp_contacts.py
+
+# Recon (разведка) — не коммитить данные с ПД
+recon/data/
