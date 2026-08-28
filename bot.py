@@ -138,6 +138,13 @@ from notifications import (
     start_wahelp_webhook,
 )
 from notifications.amocrm import format_amocrm_admin_alert, normalize_amocrm_payload
+from notifications.amo_exchange import (
+    ExchangeDecision,
+    ExistingClient,
+    decide_exchange,
+    incoming_from_amo,
+    outcome_of_lead,
+)
 from notifications.amocrm_api import (
     AmoCRMAPIAuthError,
     AmoCRMAPIClient,
@@ -4707,6 +4714,84 @@ async def process_amocrm_csv(
 
     counters["skipped_no_phone"] = skipped_no_phone
     return counters, errors
+
+
+# ===== Автообмен amoCRM -> база бота =====
+# Тонкий слой: решение принимает notifications/amo_exchange.py, здесь только
+# чтение существующей записи и запись результата. Логика там, потому что её
+# можно проверить тестами без базы; тут — минимум кода в боевом файле.
+
+
+async def _exchange_find_existing(conn: asyncpg.Connection,
+                                  digits: str) -> ExistingClient | None:
+    """Найти запись клиента по цифрам телефона.
+
+    Сопоставление одно на весь обмен, поэтому вторая запись на того же человека
+    не появляется, даже если в CRM он записан под другим именем. Второе условие
+    ловит записи, заведённые до появления `phone_digits`.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, status, full_name, last_order_addr, last_service
+        FROM clients
+        WHERE phone_digits = $1
+           OR regexp_replace(COALESCE(phone, ''), '[^0-9]+', '', 'g') = $1
+        LIMIT 1
+        """,
+        digits,
+    )
+    if row is None:
+        return None
+    return ExistingClient(
+        client_id=int(row["id"]),
+        status=str(row["status"] or ""),
+        name=row["full_name"],
+        address=row["last_order_addr"],
+        service=row["last_service"],
+    )
+
+
+async def _exchange_apply(conn: asyncpg.Connection, decision: ExchangeDecision,
+                          existing: ExistingClient | None) -> str:
+    """Применить решение к базе. Возвращает, что произошло, — для отчёта.
+
+    `phone_digits` не пишем никогда: колонка вычисляемая, запись в неё роняет
+    запрос (см. docs/db_production_contract.md).
+    """
+    if decision.action == "skip":
+        return "skip"
+
+    fields = {name: value for name, value in decision.fields.items()
+              if value is not None}
+    if not fields:
+        return "skip"
+
+    if decision.action in ("create_lead", "create_client"):
+        columns = list(fields)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(columns)))
+        created = await conn.fetchval(
+            f"""
+            INSERT INTO clients ({", ".join(columns)}, created_at, last_updated)
+            VALUES ({placeholders}, NOW(), NOW())
+            ON CONFLICT (phone) DO NOTHING
+            RETURNING id
+            """,
+            *[fields[name] for name in columns],
+        )
+        # Конфликт означает, что запись с таким телефоном уже есть, а поиск её
+        # не нашёл — например, номер записан в другом виде. Молча ничего не
+        # делаем: дубль хуже пропуска.
+        return decision.action if created else "skip"
+
+    assignments = ", ".join(f"{name} = ${i + 1}" for i, name in enumerate(fields))
+    values = list(fields.values())
+    values.append(existing.client_id)
+    await conn.execute(
+        f"UPDATE clients SET {assignments}, last_updated = NOW() "
+        f"WHERE id = ${len(values)}",
+        *values,
+    )
+    return "update"
 
 
 async def _accrue_birthday_bonuses(conn: asyncpg.Connection) -> tuple[int, list[str], int]:
