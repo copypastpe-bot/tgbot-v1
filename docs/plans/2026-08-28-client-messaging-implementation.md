@@ -345,7 +345,10 @@ git commit -m "feat(messaging): правила подтверждения зак
 
 Run: `.venv-wahelp/bin/python -c "from notifications.rules import load_notification_rules as l; r = l('docs/notification_rules.json'); print(r.get_event('order_confirm_request').template[:60])"`
 
-**ВНИМАНИЕ:** на сервере лежит `docs/notification_rules.json.local` — проверить, какой файл читает прод (`NOTIFICATION_RULES_PATH`), и поправить тот же.
+**Проверено 2026-08-28:** путь к правилам зашит в коде (`bot.py:534`,
+`docs/notification_rules.json`), переменной окружения нет — прод читает тот же
+файл. Соседний `docs/notification_rules.json.local` не читает никто: это старая
+копия без клининговых событий. Правим только основной файл.
 
 **Step 4: Коммит**
 

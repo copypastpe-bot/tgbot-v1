@@ -20,13 +20,26 @@
       "timing": {
         "delay_minutes": 0
       },
-      "template": "Здравствуйте!\nВаш заказ принят ✅\n\n📅 Дата: {{date}}\n🕒 Время: {{time}}\n📍 Адрес: {{address}}\n\nМастер: {{master_name}} ({{master_phone}}). Мастер свяжется перед приездом.",
+      "template": "Здравствуйте!\nВаш заказ принят ✅\n\n📅 Дата: {{date}}\n🕒 Время: {{time}}\n📍 Адрес: {{address}}\n\nМастер свяжется с вами перед приездом.",
       "variables": [
         "date",
         "time",
-        "address",
-        "master_name",
-        "master_phone"
+        "address"
+      ]
+    },
+    {
+      "key": "order_confirm_request",
+      "name": "Вопрос за сутки до работы: подтверждаете заказ?",
+      "recipient": "client",
+      "condition": null,
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Здравствуйте! Напоминаем о заказе:\n\n📅 {{date}}, {{time}}\n📍 {{address}}\n\nВы подтверждаете заказ? Да/Нет\nОтветьте, пожалуйста, одним словом.",
+      "variables": [
+        "date",
+        "time",
+        "address"
       ]
     },
     {
