@@ -3,6 +3,7 @@ import unittest
 from notifications.amocrm_api import (
     AmoCRMAPIAuthError,
     AmoCRMAPIClient,
+    AmoCRMAPIError,
     AmoCRMAPIRateLimitError,
     AmoCRMAlert,
     AmoCRMLead,
@@ -107,9 +108,14 @@ class FakeHTTPSession:
     def __init__(self, response):
         self.response = response
         self.calls = []
+        self.patches = []
 
     def get(self, url, *, headers, params, timeout):
         self.calls.append((url, headers, params, timeout))
+        return self.response
+
+    def patch(self, url, *, headers, json, timeout):
+        self.patches.append((url, headers, json, timeout))
         return self.response
 
 
@@ -139,6 +145,26 @@ class AmoCRMApiClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(AmoCRMAPIRateLimitError):
             await client.get("/api/v4/events")
+
+    async def test_update_lead_status_sends_patch_with_status(self):
+        session = FakeHTTPSession(FakeHTTPResponse(200, {"id": 123}))
+        client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
+
+        await client.update_lead_status(123, 41463838)
+
+        url, headers, body, _timeout = session.patches[0]
+        self.assertEqual(url, "https://example.amocrm.ru/api/v4/leads/123")
+        self.assertEqual(headers["Authorization"], "Bearer token")
+        self.assertEqual(body, {"status_id": 41463838})
+
+    async def test_denied_write_is_not_swallowed(self):
+        """Нет прав на запись — вызывающий должен об этом узнать и сказать
+        владельцу: клиент подтвердил заказ, а в CRM этого не видно."""
+        session = FakeHTTPSession(FakeHTTPResponse(403, {"detail": "forbidden"}))
+        client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
+
+        with self.assertRaises(AmoCRMAPIError):
+            await client.update_lead_status(123, 41463838)
 
 
 class SequenceHTTPSession:

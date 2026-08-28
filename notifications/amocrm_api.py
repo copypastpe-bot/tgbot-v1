@@ -107,6 +107,42 @@ class AmoCRMAPIClient:
                 raise AmoCRMAPIError(resp.status, "unexpected non-object response")
             return payload
 
+    async def patch(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Единственная запись в CRM: перевод подтверждённой сделки на этап.
+
+        Права на запись у токена могут быть не выданы — тогда amoCRM отвечает
+        401/403, и вызывающий обязан сказать об этом владельцу вслух. Молчаливо
+        проглоченный отказ означал бы, что клиент подтвердил заказ, а в CRM
+        этого никто не увидел.
+        """
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+            self._owns_session = True
+        url = f"{self.api_base}{path}"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        async with self.session.patch(url, headers=headers, json=dict(payload),
+                                      timeout=self.timeout_sec) as resp:
+            try:
+                body = await resp.json()
+            except Exception:
+                body = {"text": await resp.text()}
+            if resp.status == 401:
+                raise AmoCRMAPIAuthError(resp.status, str(body))
+            if resp.status == 429:
+                raise AmoCRMAPIRateLimitError(resp.status, str(body))
+            if resp.status >= 400:
+                raise AmoCRMAPIError(resp.status, str(body))
+            return body if isinstance(body, dict) else {}
+
+    async def update_lead_status(self, lead_id: int, status_id: int) -> dict[str, Any]:
+        """Перевести сделку на другой этап."""
+        return await self.patch(f"/api/v4/leads/{int(lead_id)}",
+                                {"status_id": int(status_id)})
+
     async def fetch_events(
         self,
         *,
