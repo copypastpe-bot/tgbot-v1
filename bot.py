@@ -149,17 +149,19 @@ from notifications.amo_exchange import (
     outcome_of_event,
 )
 from notifications.client_messaging import (
+    AMO_PIPELINE_REALIZATION,
     AMO_STAGE_CONFIRMED,
     PENDING_TTL_AFTER_ORDER,
     SILENCE_LIMIT,
     ConfirmationPlan,
     OrderDetails,
+    child_deal_id,
     decide_on_answer,
-    is_order_created_event,
     letter_payload,
     order_from_lead,
     owner_alert_text,
     parse_answer,
+    pick_realization_deal,
     plan_confirmation,
     should_call_owner,
     should_move_deal,
@@ -1092,19 +1094,21 @@ async def ensure_amocrm_api_schema(conn: asyncpg.Connection) -> None:
 
 
 async def ensure_client_messaging_schema(conn: asyncpg.Connection) -> None:
-    """Ожидания подтверждения заказа: по одной строке на сделку.
+    """Ожидания подтверждения заказа: по одной строке на заказ.
 
-    Ключ — сделка amoCRM, а не клиент: у клиента бывает два заказа подряд,
-    и ответ «Да» должен подтвердить тот, о котором спросили последним.
+    Ключ — лид, а не клиент: у клиента бывает два заказа подряд, и ответ «Да»
+    должен подтвердить тот, о котором спросили последним. Рядом лежит `deal_id` —
+    дочерняя сделка воронки реализации, которую этот ответ и двигает.
 
-    Репетиция сюда не пишет. Строка означает «этой сделкой робот уже занялся»;
+    Репетиция сюда не пишет. Строка означает «этим заказом робот уже занялся»;
     появись она в репетиции — боевой запуск увидел бы её и промолчал, решив,
     что вопрос давно задан.
     """
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS order_confirmations (
-            lead_id      bigint PRIMARY KEY,      -- сделка воронки реализации
+            lead_id      bigint PRIMARY KEY,      -- лид воронки первичной обработки
+            deal_id      bigint,                  -- дочерняя сделка воронки реализации
             client_id    bigint,                  -- clients.id, если клиент найден
             phone_digits text NOT NULL,           -- по нему ищем ответ клиента
             order_at     timestamptz,             -- когда работа
@@ -1958,7 +1962,46 @@ async def run_weekly_leads_exchange() -> None:
 _client_messaging_rehearsal_cursor: int | None = None
 
 
+async def _confirmation_find_deal(client: AmoCRMAPIClient, lead_id: int,
+                                  order: OrderDetails) -> int | None:
+    """Найти сделку реализации, которую подтвердит ответ «Да».
+
+    Робот владельца заводит её той же минутой, что и лид, и amoCRM оставляет
+    в лиде примечание со ссылкой — это связь родитель-подчинённая, самая точная.
+    Если примечания нет, ищем открытую сделку с той же датой работы среди
+    заведённых рядом по времени. Не нашли — заказ всё равно обслуживаем,
+    просто сделку по «Да» подвинет человек.
+    """
+    try:
+        deal_id = child_deal_id(await client.fetch_lead_notes(lead_id))
+        if deal_id:
+            return deal_id
+    except Exception as exc:  # noqa: BLE001 — связь не критична для писем
+        logger.warning("Лид %s: не смог прочитать примечания: %s", lead_id, exc)
+
+    if not order.order_at_raw:
+        return None
+    try:
+        lead = await client.fetch_lead(lead_id)
+        created_at = int(lead.get("created_at") or 0)
+        if not created_at:
+            return None
+        payload = await client.get("/api/v4/leads", params={
+            "filter[pipeline_id]": AMO_PIPELINE_REALIZATION,
+            "filter[created_at][from]": created_at - 3600,
+            "filter[created_at][to]": created_at + 3600,
+            "with": "contacts",
+            "limit": 250,
+        })
+        deals = list(((payload.get("_embedded") or {}).get("leads") or []))
+        return pick_realization_deal(deals, order_at_raw=order.order_at_raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Лид %s: не смог подобрать сделку реализации: %s", lead_id, exc)
+        return None
+
+
 async def _confirmation_apply(conn: asyncpg.Connection, *, lead_id: int,
+                              deal_id: int | None,
                               incoming: IncomingClient, order: OrderDetails,
                               plan: ConfirmationPlan,
                               dry_run: bool) -> tuple[str, str]:
@@ -2015,12 +2058,14 @@ async def _confirmation_apply(conn: asyncpg.Connection, *, lead_id: int,
     await conn.execute(
         """
         INSERT INTO order_confirmations (
-            lead_id, client_id, phone_digits, order_at, status, outbox_id, asked_at
+            lead_id, deal_id, client_id, phone_digits, order_at, status,
+            outbox_id, asked_at
         )
-        VALUES ($1, $2, $3, $4, 'planned', $5, $6)
+        VALUES ($1, $2, $3, $4, $5, 'planned', $6, $7)
         ON CONFLICT (lead_id) DO NOTHING
         """,
         lead_id,
+        deal_id,
         int(client_row["id"]),
         incoming.digits,
         order.order_at,
@@ -2032,16 +2077,23 @@ async def _confirmation_apply(conn: asyncpg.Connection, *, lead_id: int,
 
 async def _confirmation_handle_lead(client: AmoCRMAPIClient, lead_id: int, *,
                                     dry_run: bool, journal_key: str) -> str:
-    """Разобрать одну оформленную сделку. Возвращает, что произошло."""
+    """Разобрать один оформленный заказ. Возвращает, что произошло.
+
+    Данные берём из лида: дату работы и адрес туда кладёт робот владельца,
+    когда переносит заказ из календаря в CRM. Сделка реализации нужна только
+    для того, чтобы её подвинул ответ «Да».
+    """
     lead = await client.fetch_lead(lead_id)
     contact = await _amocrm_fetch_first_contact(client, normalize_lead(lead).contact_ids)
     incoming = incoming_from_amo(lead, contact, normalize_phone=_amo_normalize_phone)
     order = order_from_lead(lead, tz=MOSCOW_TZ)
     plan = plan_confirmation(order_at=order.order_at, now=datetime.now(MOSCOW_TZ))
+    deal_id = (await _confirmation_find_deal(client, lead_id, order)
+               if plan.send_confirmation else None)
 
     async with pool.acquire() as conn:
         result, reason = await _confirmation_apply(
-            conn, lead_id=lead_id, incoming=incoming, order=order,
+            conn, lead_id=lead_id, deal_id=deal_id, incoming=incoming, order=order,
             plan=plan, dry_run=dry_run)
         if dry_run:
             logger.info("Разговор с клиентом (репетиция): сделка %s -> %s (%s)",
@@ -2094,7 +2146,12 @@ async def _amocrm_poll_confirmations_once(client: AmoCRMAPIClient, *,
         if not lead_id:
             continue
 
-        if not is_order_created_event(event):
+        # Триггер — «Передано в работу» в воронке лидов: именно в этот момент
+        # робот владельца переносит заказ из календаря в CRM и заводит сделку
+        # реализации. В саму «Заказ оформлен» сделка не переходит — она там
+        # рождается, поэтому события смены этапа туда не бывает (проверено
+        # на живом аккаунте 2026-08-28).
+        if outcome_of_event(event) != "won":
             count("не оформленный заказ")
             continue
 
@@ -2172,7 +2229,7 @@ async def run_confirmation_silence_watch() -> None:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT oc.lead_id, oc.order_at, oc.asked_at, oc.notified_at,
+            SELECT oc.lead_id, oc.deal_id, oc.order_at, oc.asked_at, oc.notified_at,
                    oc.phone_digits, c.full_name, c.phone
             FROM order_confirmations oc
             LEFT JOIN clients c ON c.id = oc.client_id
@@ -2199,7 +2256,7 @@ async def run_confirmation_silence_watch() -> None:
             phone=_confirmation_owner_phone(row),
             order_at=_confirmation_order_at_msk(row),
             answer_text=None,
-            lead_link=build_lead_link(AMOCRM_API_BASE, row["lead_id"]),
+            lead_link=_confirmation_link(row),
         ))
         async with pool.acquire() as conn:
             await conn.execute(
@@ -3288,6 +3345,13 @@ def _confirmation_owner_phone(pending: Mapping[str, Any]) -> str:
     return f"+{digits}" if digits else "неизвестен"
 
 
+def _confirmation_link(pending: Mapping[str, Any]) -> str | None:
+    """Ссылка для владельца — на сделку реализации: в ней заказ и живёт.
+    Связь не нашлась — даём лид, чтобы он всё равно попал в нужную карточку."""
+    return build_lead_link(AMOCRM_API_BASE,
+                           pending.get("deal_id") or pending.get("lead_id"))
+
+
 def _confirmation_order_at_msk(pending: Mapping[str, Any]) -> datetime | None:
     """Время работы в московском поясе: в базе оно лежит в UTC, а владелец
     читает часы своего города."""
@@ -3306,7 +3370,7 @@ async def _confirmation_pending_for(digits: str) -> asyncpg.Record | None:
     async with pool.acquire() as conn:
         return await conn.fetchrow(
             """
-            SELECT oc.lead_id, oc.client_id, oc.status, oc.order_at,
+            SELECT oc.lead_id, oc.deal_id, oc.client_id, oc.status, oc.order_at,
                    oc.phone_digits, oc.notified_at, c.full_name, c.phone
             FROM order_confirmations oc
             LEFT JOIN clients c ON c.id = oc.client_id
@@ -3322,30 +3386,37 @@ async def _confirmation_pending_for(digits: str) -> asyncpg.Record | None:
 
 
 async def _confirmation_accept(pending: Mapping[str, Any], answer_text: str) -> None:
-    """Клиент подтвердил заказ: двигаем сделку и молчим.
+    """Клиент подтвердил заказ: двигаем сделку реализации и молчим.
 
     Молчим по решению владельца — подтверждение проходит без его участия.
     Исключение одно: сделку не удалось подвинуть. Промолчать здесь значило бы
     оставить владельца в уверенности, что в CRM всё сошлось, когда это не так.
     """
     lead_id = int(pending["lead_id"])
+    deal_id = pending.get("deal_id")
     failure: str | None = None
 
     if CLIENT_MESSAGING_DRY_RUN:
-        logger.info("Разговор с клиентом (репетиция): подтвердил бы сделку %s", lead_id)
+        logger.info("Разговор с клиентом (репетиция): подтвердил бы сделку %s",
+                    deal_id or lead_id)
+    elif not deal_id:
+        # Связь с дочерней сделкой не нашлась при заведении ожидания. Двигать
+        # вслепую нельзя: у клиента в этой воронке десятки сделок.
+        failure = "не знаю, какую сделку двигать: дочерняя сделка не найдена"
+        logger.warning("Лид %s подтверждён, но сделка реализации неизвестна", lead_id)
     else:
         try:
             async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
-                lead = await client.fetch_lead(lead_id)
-                if should_move_deal(lead.get("status_id")):
-                    await client.update_lead_status(lead_id, AMO_STAGE_CONFIRMED)
+                deal = await client.fetch_lead(int(deal_id))
+                if should_move_deal(deal.get("status_id")):
+                    await client.update_lead_status(int(deal_id), AMO_STAGE_CONFIRMED)
                 else:
                     # Сделку уже двинул человек — его работу робот не откатывает.
                     logger.info("Сделка %s ушла с «Заказ оформлен» — не трогаю",
-                                lead_id)
+                                deal_id)
         except Exception as exc:  # noqa: BLE001
             failure = str(exc)[:300]
-            logger.exception("Не удалось подтвердить сделку %s: %s", lead_id, exc)
+            logger.exception("Не удалось подтвердить сделку %s: %s", deal_id, exc)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -3372,7 +3443,7 @@ async def _confirmation_accept(pending: Mapping[str, Any], answer_text: str) -> 
             lines.append(f"Работа: {order_at.strftime('%d.%m.%Y')} в "
                          f"{order_at.strftime('%H:%M')}")
         lines.append(f"Причина: {failure}")
-        link = build_lead_link(AMOCRM_API_BASE, lead_id)
+        link = _confirmation_link(pending)
         if link:
             lines.append(f"Сделка: {link}")
         await _confirmation_notify_owner("\n".join(lines))
@@ -3389,7 +3460,7 @@ async def _confirmation_call_owner(pending: Mapping[str, Any], *, answer: str,
         phone=_confirmation_owner_phone(pending),
         order_at=_confirmation_order_at_msk(pending),
         answer_text=answer_text,
-        lead_link=build_lead_link(AMOCRM_API_BASE, lead_id),
+        lead_link=_confirmation_link(pending),
     ))
     async with pool.acquire() as conn:
         await conn.execute(

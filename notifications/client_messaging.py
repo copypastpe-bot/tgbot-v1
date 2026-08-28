@@ -97,34 +97,79 @@ def should_call_owner(*, asked_at: Optional[datetime],
     return now - asked_at >= SILENCE_LIMIT
 
 
-def is_order_created_event(event: Mapping[str, Any]) -> bool:
-    """Сделка только что перешла в «Заказ оформлен» воронки реализации?
+def child_deal_id(notes: list[Mapping[str, Any]]) -> Optional[int]:
+    """Дочерняя сделка, заведённая роботом владельца, — по примечанию лида.
 
-    Смотрим само событие, не запрашивая карточку: событий смены этапа за сутки
-    сотни, и тянуть сделку по каждому значило бы жечь лимиты API впустую.
+    Когда робот переносит заказ из календаря в CRM, amoCRM оставляет в лиде
+    примечание `lead_auto_created` со ссылкой на созданную сделку реализации.
+    Это прямая связь родитель-подчинённая: она точнее любого подбора по дате
+    и не путается, когда у клиента два заказа подряд.
+
+    Примечаний может быть несколько — берём самое свежее.
     """
-    for item in event.get("value_after") or []:
-        status = (item or {}).get("lead_status") or {}
-        if int(status.get("pipeline_id") or 0) != AMO_PIPELINE_REALIZATION:
+    best: Optional[int] = None
+    best_at = -1
+    for note in notes:
+        if str(note.get("note_type") or "") != "lead_auto_created":
             continue
-        if int(status.get("id") or 0) == AMO_STAGE_ORDER_CREATED:
-            return True
-    return False
+        params = note.get("params") or {}
+        deal_id = params.get("lead_id") or (params.get("link") or {}).get("id")
+        if not deal_id:
+            continue
+        created_at = int(note.get("created_at") or 0)
+        if created_at >= best_at:
+            best, best_at = int(deal_id), created_at
+    return best
+
+
+def pick_realization_deal(deals: list[Mapping[str, Any]], *,
+                          order_at_raw: Optional[str],
+                          contact_ids: Optional[set[int]] = None) -> Optional[int]:
+    """Найти сделку реализации, парную только что оформленному заказу.
+
+    Робот владельца заводит её той же минутой, что и лид, с той же датой работы
+    (проверено на живых данных 2026-08-28). Её и двигают по ответу «Да».
+
+    Сходство по дате работы — главный признак: у постоянного клиента в этой
+    воронке десятки сделок, и «самая свежая» на второй заказ подряд указала бы
+    не на ту. Совпадения нет — не гадаем: пусть лучше сделку подвинет человек.
+    """
+    if not order_at_raw:
+        return None
+    for deal in deals:
+        if int(deal.get("pipeline_id") or 0) != AMO_PIPELINE_REALIZATION:
+            continue
+        if int(deal.get("status_id") or 0) != AMO_STAGE_ORDER_CREATED:
+            continue
+        if str(next(iter(field_values(dict(deal), AMO_FIELD_ORDER_DATETIME)), "")) != str(order_at_raw):
+            continue
+        if contact_ids:
+            linked = {int(contact.get("id") or 0)
+                      for contact in ((deal.get("_embedded") or {}).get("contacts") or [])}
+            if linked and not (linked & contact_ids):
+                continue
+        return int(deal["id"])
+    return None
 
 
 @dataclass(frozen=True)
 class OrderDetails:
-    """Что известно о работе из карточки сделки."""
+    """Что известно о работе из карточки лида."""
 
     order_at: Optional[datetime]
     address: Optional[str]
+    order_at_raw: Optional[str] = None    # как лежит в CRM — по нему ищем парную сделку
 
 
 def order_from_lead(lead: Mapping[str, Any], *, tz: tzinfo) -> OrderDetails:
-    """Дата работы и адрес из сделки.
+    """Дата работы и адрес из лида.
 
-    Дата приходит меткой времени. Испорченное значение (поле заполняли руками)
-    не роняет проход: письма без даты не будет, остальные заказы разберутся.
+    Оба поля заполняет робот владельца, когда переносит заказ из календаря
+    в CRM, — поэтому вторая сделка для письма клиенту не нужна.
+
+    Дата приходит меткой времени; сырое значение сохраняется, чтобы по нему
+    потом найти парную сделку реализации. Испорченное значение (поле правили
+    руками) не роняет проход: письма без даты не будет, остальные разберутся.
     """
     order_at: Optional[datetime] = None
     raw = next(iter(field_values(dict(lead), AMO_FIELD_ORDER_DATETIME)), None)
@@ -134,7 +179,7 @@ def order_from_lead(lead: Mapping[str, Any], *, tz: tzinfo) -> OrderDetails:
         except (TypeError, ValueError, OSError, OverflowError):
             order_at = None
     address = next(iter(field_values(dict(lead), AMO_FIELD_ADDRESS)), None)
-    return OrderDetails(order_at=order_at, address=address)
+    return OrderDetails(order_at=order_at, address=address, order_at_raw=raw)
 
 
 def letter_payload(*, order_at: Optional[datetime],
@@ -215,9 +260,10 @@ __all__ = [
     "SILENCE_LIMIT",
     "ConfirmationPlan",
     "OrderDetails",
+    "child_deal_id",
     "decide_on_answer",
-    "is_order_created_event",
     "letter_payload",
+    "pick_realization_deal",
     "order_from_lead",
     "parse_answer",
     "plan_confirmation",

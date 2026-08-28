@@ -21,10 +21,11 @@ from notifications.client_messaging import (
     AMO_STAGE_ORDER_CREATED,
     ASK_BEFORE,
     SILENCE_LIMIT,
+    child_deal_id,
     decide_on_answer,
-    is_order_created_event,
     letter_payload,
     order_from_lead,
+    pick_realization_deal,
     owner_alert_text,
     parse_answer,
     plan_confirmation,
@@ -130,28 +131,69 @@ class SilenceTests(unittest.TestCase):
                                            now=self.NOW))
 
 
-class OrderCreatedEventTests(unittest.TestCase):
-    def _event(self, pipeline_id, status_id):
-        return {"value_after": [{"lead_status": {"id": status_id,
-                                                 "pipeline_id": pipeline_id}}]}
+class ChildDealTests(unittest.TestCase):
+    """Связь лид → сделка реализации. Проверено на живых данных 2026-08-28:
+    робот владельца заводит сделку той же минутой, а amoCRM оставляет в лиде
+    примечание `lead_auto_created` со ссылкой на неё."""
 
-    def test_order_created_in_realization_is_ours(self):
-        self.assertTrue(is_order_created_event(
-            self._event(AMO_PIPELINE_REALIZATION, AMO_STAGE_ORDER_CREATED)))
+    def _note(self, deal_id, created_at=100):
+        return {"note_type": "lead_auto_created", "created_at": created_at,
+                "params": {"type": "child", "lead_type": "child",
+                           "lead_id": deal_id, "link": {"id": deal_id, "type": 2}}}
 
-    def test_other_stage_is_not_ours(self):
-        self.assertFalse(is_order_created_event(
-            self._event(AMO_PIPELINE_REALIZATION, AMO_STAGE_CONFIRMED)))
+    def test_finds_child_deal(self):
+        self.assertEqual(child_deal_id([self._note(31570357)]), 31570357)
 
-    def test_same_stage_number_in_another_pipeline_is_not_ours(self):
-        """Номера этапов в разных воронках свои: без проверки воронки робот
-        писал бы клиентам чужих сделок."""
-        self.assertFalse(is_order_created_event(
-            self._event(4482751, AMO_STAGE_ORDER_CREATED)))
+    def test_ignores_other_notes(self):
+        notes = [{"note_type": "call_out", "params": {"duration": 9}},
+                 {"note_type": "amomail_message", "params": {}},
+                 self._note(31570357)]
+        self.assertEqual(child_deal_id(notes), 31570357)
 
-    def test_event_without_status_is_not_ours(self):
-        self.assertFalse(is_order_created_event({}))
-        self.assertFalse(is_order_created_event({"value_after": [{}]}))
+    def test_takes_the_freshest_link(self):
+        """Заказ могли завести дважды — двигать надо последнюю сделку."""
+        notes = [self._note(111, created_at=100), self._note(222, created_at=200)]
+        self.assertEqual(child_deal_id(notes), 222)
+
+    def test_no_link_means_no_guess(self):
+        self.assertIsNone(child_deal_id([]))
+        self.assertIsNone(child_deal_id([{"note_type": "call_in", "params": {}}]))
+
+
+class PickRealizationDealTests(unittest.TestCase):
+    """Запасной путь, когда ссылки в примечании нет: открытая сделка с той же
+    датой работы."""
+
+    def _deal(self, deal_id, order_at_raw, status_id=AMO_STAGE_ORDER_CREATED,
+              pipeline_id=AMO_PIPELINE_REALIZATION):
+        return {"id": deal_id, "pipeline_id": pipeline_id, "status_id": status_id,
+                "custom_fields_values": [{"field_id": 18701,
+                                          "values": [{"value": order_at_raw}]}]}
+
+    def test_matches_by_order_datetime(self):
+        deals = [self._deal(1, "1787000000"), self._deal(2, "1788174000")]
+        self.assertEqual(pick_realization_deal(deals, order_at_raw="1788174000"), 2)
+
+    def test_ignores_deals_that_moved_on(self):
+        """Сделка уже подтверждена — значит это чужой, более ранний заказ."""
+        deals = [self._deal(1, "1788174000", status_id=AMO_STAGE_CONFIRMED)]
+        self.assertIsNone(pick_realization_deal(deals, order_at_raw="1788174000"))
+
+    def test_ignores_other_pipelines(self):
+        deals = [self._deal(1, "1788174000", pipeline_id=4482751)]
+        self.assertIsNone(pick_realization_deal(deals, order_at_raw="1788174000"))
+
+    def test_without_date_nothing_is_guessed(self):
+        """Нет даты — нет признака. Пусть сделку подвинет человек."""
+        deals = [self._deal(1, "1788174000")]
+        self.assertIsNone(pick_realization_deal(deals, order_at_raw=None))
+
+    def test_foreign_contact_is_skipped(self):
+        deal = self._deal(1, "1788174000")
+        deal["_embedded"] = {"contacts": [{"id": 999}]}
+        self.assertIsNone(pick_realization_deal(deals=[deal],
+                                                order_at_raw="1788174000",
+                                                contact_ids={37926153}))
 
 
 class OrderFromLeadTests(unittest.TestCase):
