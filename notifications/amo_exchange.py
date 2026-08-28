@@ -22,7 +22,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+# Воронка и этапы, за которыми следит обмен. «Передано в работу» — успешное
+# закрытие ПЕРВИЧНОЙ воронки: оно наступает в момент оформления заказа, а не
+# после работы. Успех воронки реализации был бы поздно.
+AMO_PIPELINE_PRIMARY = 4482751          # Воронка первичной обработки
+AMO_STATUS_WON = 142                    # «Передано в работу»
+AMO_STATUS_LOST = 143                   # «Закрыто и не реализовано»
+
+# Поля сделки. Берём по идентификаторам, а не по названиям колонок выгрузки:
+# правка шаблона выгрузки в CRM больше ни на что не влияет.
+AMO_FIELD_ADDRESS = 18639               # Адрес
+AMO_FIELD_SERVICE = 271915              # Услуга (множественный список)
 
 
 @dataclass(frozen=True)
@@ -101,9 +113,73 @@ def decide_exchange(*, outcome: str, incoming: IncomingClient,
     return ExchangeDecision("update", fields=updates, reason="дописал недостающее")
 
 
+def outcome_of_lead(lead: dict) -> Optional[str]:
+    """Чем закончилась сделка: `won`, `lost` или None.
+
+    None — сделка не из первичной воронки (реализация, ковры) либо ещё в работе.
+    Такие обмену не интересны.
+    """
+    if int(lead.get("pipeline_id") or 0) != AMO_PIPELINE_PRIMARY:
+        return None
+    status_id = int(lead.get("status_id") or 0)
+    if status_id == AMO_STATUS_WON:
+        return "won"
+    if status_id == AMO_STATUS_LOST:
+        return "lost"
+    return None
+
+
+def _field_values(entity: dict, field_id: int) -> list[str]:
+    """Значения поля сделки по его идентификатору. Пустые отбрасываем."""
+    for field_data in entity.get("custom_fields_values") or []:
+        if int(field_data.get("field_id") or 0) != field_id:
+            continue
+        return [str(value.get("value")) for value in field_data.get("values") or []
+                if value.get("value")]
+    return []
+
+
+def _contact_phone(contact: dict) -> str:
+    for field_data in (contact or {}).get("custom_fields_values") or []:
+        if field_data.get("field_code") != "PHONE":
+            continue
+        for value in field_data.get("values") or []:
+            if value.get("value"):
+                return str(value["value"])
+    return ""
+
+
+def incoming_from_amo(
+    lead: dict,
+    contact: Optional[dict],
+    *,
+    normalize_phone: Callable[[str], tuple[Optional[str], Optional[str]]],
+) -> IncomingClient:
+    """Собрать данные клиента из сделки и её контакта.
+
+    Нормализация телефона приходит параметром: канон телефонов в проекте один
+    (`bot._amo_normalize_phone`), и повторять его здесь нельзя — разошедшиеся
+    правила нормализации означают дубли записей на одного человека.
+    """
+    phone, digits = normalize_phone(_contact_phone(contact or {}))
+    services = _field_values(lead, AMO_FIELD_SERVICE)
+    return IncomingClient(
+        phone=phone,
+        digits=digits,
+        name=(contact or {}).get("name") or None,
+        address=next(iter(_field_values(lead, AMO_FIELD_ADDRESS)), None),
+        service=", ".join(services) if services else None,
+    )
+
+
 __all__ = [
+    "AMO_PIPELINE_PRIMARY",
+    "AMO_STATUS_LOST",
+    "AMO_STATUS_WON",
     "ExchangeDecision",
     "ExistingClient",
     "IncomingClient",
     "decide_exchange",
+    "incoming_from_amo",
+    "outcome_of_lead",
 ]

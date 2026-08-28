@@ -18,6 +18,8 @@ from notifications.amo_exchange import (
     ExistingClient,
     IncomingClient,
     decide_exchange,
+    incoming_from_amo,
+    outcome_of_lead,
 )
 
 
@@ -129,6 +131,89 @@ class DecideExchangeTests(unittest.TestCase):
                                    existing=None)
         self.assertNotIn("last_order_addr", decision.fields)
         self.assertNotIn("last_service", decision.fields)
+
+
+def _normalize_phone(raw: str):
+    """Заглушка нормализации для тестов.
+
+    Настоящая живёт в bot.py и передаётся разбору параметром: канон телефонов
+    в проекте один, а тесты по здешнему обычаю не тянут bot.py целиком.
+    """
+    digits = "".join(ch for ch in raw or "" if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 10:
+        digits = "7" + digits
+    return ("+" + digits, digits) if digits else (None, None)
+
+
+class ParseAmoTests(unittest.TestCase):
+    LEAD = {
+        "id": 31570885,
+        "pipeline_id": 4482751,
+        "status_id": 142,
+        "custom_fields_values": [
+            {"field_id": 18639, "values": [{"value": "Панина 7к2"}]},
+            {"field_id": 271915, "values": [{"value": "Чистка мебели"}]},
+        ],
+    }
+    CONTACT = {
+        "id": 55,
+        "name": "Дарья",
+        "custom_fields_values": [
+            {"field_code": "PHONE", "values": [{"value": "8 (900) 123-45-67"}]},
+        ],
+    }
+
+    def _parse(self, lead=None, contact=None):
+        return incoming_from_amo(lead or self.LEAD,
+                                 self.CONTACT if contact is None else contact,
+                                 normalize_phone=_normalize_phone)
+
+    def test_reads_phone_name_address_and_service(self):
+        incoming = self._parse()
+        self.assertEqual(incoming.digits, "79001234567")
+        self.assertEqual(incoming.phone, "+79001234567")
+        self.assertEqual(incoming.name, "Дарья")
+        self.assertEqual(incoming.address, "Панина 7к2")
+        self.assertEqual(incoming.service, "Чистка мебели")
+
+    def test_multiselect_services_are_joined(self):
+        lead = {**self.LEAD, "custom_fields_values": [
+            {"field_id": 271915, "values": [{"value": "Чистка мебели"},
+                                            {"value": "Мойка окон"}]},
+        ]}
+        self.assertEqual(self._parse(lead).service, "Чистка мебели, Мойка окон")
+
+    def test_contact_without_phone_gives_empty_digits(self):
+        incoming = self._parse(contact={"id": 55, "name": "Дарья"})
+        self.assertIsNone(incoming.digits)
+
+    def test_missing_contact_does_not_crash(self):
+        """Сделка без контакта — обычное дело, разбор не должен падать."""
+        incoming = self._parse(contact={})
+        self.assertIsNone(incoming.digits)
+        self.assertIsNone(incoming.name)
+
+    def test_empty_fields_become_none(self):
+        lead = {**self.LEAD, "custom_fields_values": [
+            {"field_id": 18639, "values": [{"value": ""}]},
+        ]}
+        incoming = self._parse(lead)
+        self.assertIsNone(incoming.address)
+        self.assertIsNone(incoming.service)
+
+    def test_outcome_won_and_lost(self):
+        self.assertEqual(outcome_of_lead(self.LEAD), "won")
+        self.assertEqual(outcome_of_lead({**self.LEAD, "status_id": 143}), "lost")
+
+    def test_other_pipeline_is_not_our_business(self):
+        """Воронка реализации и ковры обменом не занимаются."""
+        self.assertIsNone(outcome_of_lead({**self.LEAD, "pipeline_id": 7108250}))
+
+    def test_intermediate_status_is_not_an_outcome(self):
+        """«Новый лид» — сделка ещё в работе, закрытием это не считается."""
+        self.assertIsNone(outcome_of_lead({**self.LEAD, "status_id": 41463535}))
 
 
 if __name__ == "__main__":
