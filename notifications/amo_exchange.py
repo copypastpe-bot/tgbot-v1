@@ -146,8 +146,13 @@ def outcome_of_event(event: dict) -> Optional[str]:
     return None
 
 
-def _field_values(entity: dict, field_id: int) -> list[str]:
-    """Значения поля сделки по его идентификатору. Пустые отбрасываем."""
+def field_values(entity: dict, field_id: int) -> list[str]:
+    """Значения поля сделки по его идентификатору. Пустые отбрасываем.
+
+    Публичная намеренно: разбор полей сделки один на весь проект (им пользуется
+    и разговор с клиентом до работы). Две копии этого разбора рано или поздно
+    разошлись бы, и половина писем ушла бы без адреса.
+    """
     for field_data in entity.get("custom_fields_values") or []:
         if int(field_data.get("field_id") or 0) != field_id:
             continue
@@ -179,12 +184,12 @@ def incoming_from_amo(
     правила нормализации означают дубли записей на одного человека.
     """
     phone, digits = normalize_phone(_contact_phone(contact or {}))
-    services = _field_values(lead, AMO_FIELD_SERVICE)
+    services = field_values(lead, AMO_FIELD_SERVICE)
     return IncomingClient(
         phone=phone,
         digits=digits,
         name=(contact or {}).get("name") or None,
-        address=next(iter(_field_values(lead, AMO_FIELD_ADDRESS)), None),
+        address=next(iter(field_values(lead, AMO_FIELD_ADDRESS)), None),
         service=", ".join(services) if services else None,
     )
 
@@ -198,6 +203,7 @@ __all__ = [
     "IncomingClient",
     "decide_exchange",
     "WEEKLY_LEADS_PERIOD_DAYS",
+    "field_values",
     "incoming_from_amo",
     "is_weekly_leads_day",
     "outcome_of_event",
