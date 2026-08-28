@@ -1764,11 +1764,16 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
                                                 "error", error=str(exc)[:500])
             count("ошибка")
 
+    # Сдвигаем закладку на секунду дальше последнего события: amoCRM отдаёт
+    # события «с этого момента включительно», и без сдвига последнее событие
+    # возвращалось бы в каждом проходе. Для наших сделок это ловил журнал,
+    # а чужие пересчитывались каждые полминуты и засоряли лог.
+    next_cursor = max_created_at + 1 if events else max_created_at
     if dry_run:
-        _exchange_rehearsal_cursor = max_created_at
+        _exchange_rehearsal_cursor = next_cursor
     else:
         async with pool.acquire() as conn:
-            await _amocrm_set_cursor(conn, "exchange_events", max_created_at)
+            await _amocrm_set_cursor(conn, "exchange_events", next_cursor)
     return counters
 
 
