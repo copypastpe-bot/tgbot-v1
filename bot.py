@@ -1627,6 +1627,11 @@ async def _amocrm_poll_new_leads_once(client: AmoCRMAPIClient) -> None:
         await _amocrm_set_cursor(conn, "lead_events", max_created_at)
 
 
+# Закладка репетиции: живёт в памяти процесса и умирает вместе с ним. В базу её
+# писать нельзя — см. пояснение внутри поллера.
+_exchange_rehearsal_cursor: int | None = None
+
+
 async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
                                      dry_run: bool = True) -> dict[str, int]:
     """Один проход автообмена: закрывшиеся сделки первичной воронки → база бота.
@@ -1651,9 +1656,19 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
     def count(key: str) -> None:
         counters[key] = counters.get(key, 0) + 1
 
-    async with pool.acquire() as conn:
-        cursor = await _amocrm_get_cursor(conn, "exchange_events",
-                                          _amocrm_default_cursor())
+    global _exchange_rehearsal_cursor
+
+    if dry_run:
+        # В репетиции закладка живёт в памяти процесса. Записать её в базу —
+        # значит подарить боевому запуску «изменений нет»: он начнёт с того
+        # места, до которого репетиция досмотрела вхолостую, и молча пропустит
+        # всех клиентов. Ровно так 2026-08-26 репетиция съела письма партнёра.
+        cursor = (_exchange_rehearsal_cursor if _exchange_rehearsal_cursor is not None
+                  else _amocrm_default_cursor())
+    else:
+        async with pool.acquire() as conn:
+            cursor = await _amocrm_get_cursor(conn, "exchange_events",
+                                              _amocrm_default_cursor())
 
     events = await client.fetch_events(event_types=["lead_status_changed"],
                                        created_from=cursor)
@@ -1677,17 +1692,23 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
             count("не наша сделка")
             continue
 
+        # Ключи репетиции и боя не пересекаются намеренно: иначе просмотренное
+        # вхолостую событие боевой режим счёл бы уже обработанным и пропустил.
+        journal_key = f"{'exchange_rehearsal' if dry_run else 'exchange'}:{event_id}"
+        journal_type = "exchange_rehearsal" if dry_run else "exchange_status"
+
         async with pool.acquire() as conn:
             inserted = await conn.fetchval(
                 """
                 INSERT INTO amocrm_api_events (
                     event_id, event_type, entity_id, payload, action, created_at
                 )
-                VALUES ($1, 'exchange_status', $2, $3::jsonb, 'pending', $4)
+                VALUES ($1, $2, $3, $4::jsonb, 'pending', $5)
                 ON CONFLICT (event_id) DO NOTHING
                 RETURNING event_id
                 """,
-                f"exchange:{event_id}",
+                journal_key,
+                journal_type,
                 str(lead_id),
                 _amocrm_payload_json(event),
                 created_at,
@@ -1720,18 +1741,21 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
                     result = await _exchange_apply(conn, decision, existing)
                 # Отметка в журнале, а не в памяти: отчёт переживает перезапуск,
                 # и всегда видно, что робот сделал по каждой сделке.
-                await _amocrm_mark_event_action(conn, f"exchange:{event_id}",
+                await _amocrm_mark_event_action(conn, journal_key,
                                                 result, error=decision.reason or None)
             count(result)
         except Exception as exc:              # noqa: BLE001 — сделка не роняет проход
             logger.exception("Обмен: сделка %s не разобрана: %s", lead_id, exc)
             async with pool.acquire() as conn:
-                await _amocrm_mark_event_action(conn, f"exchange:{event_id}",
+                await _amocrm_mark_event_action(conn, journal_key,
                                                 "error", error=str(exc)[:500])
             count("ошибка")
 
-    async with pool.acquire() as conn:
-        await _amocrm_set_cursor(conn, "exchange_events", max_created_at)
+    if dry_run:
+        _exchange_rehearsal_cursor = max_created_at
+    else:
+        async with pool.acquire() as conn:
+            await _amocrm_set_cursor(conn, "exchange_events", max_created_at)
     return counters
 
 
@@ -5168,7 +5192,8 @@ async def build_exchange_daily_summary_text() -> str:
             """
             SELECT action, count(*) AS total
             FROM amocrm_api_events
-            WHERE event_type = 'exchange_status' AND processed_at >= $1
+            WHERE event_type IN ('exchange_status', 'exchange_rehearsal')
+              AND processed_at >= $1
             GROUP BY action
             ORDER BY count(*) DESC
             """,
