@@ -1623,6 +1623,99 @@ async def _amocrm_poll_new_leads_once(client: AmoCRMAPIClient) -> None:
         await _amocrm_set_cursor(conn, "lead_events", max_created_at)
 
 
+async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
+                                     dry_run: bool = True) -> dict[str, int]:
+    """Один проход автообмена: закрывшиеся сделки первичной воронки → база бота.
+
+    Устройство то же, что у соседнего опроса новых лидов, и по тем же причинам:
+
+    - **своя закладка** (поток `exchange_events`), поэтому обмен не мешает
+      другим опросам и переживает перезапуск;
+    - **закладка двигается в самом конце**, поэтому сбой означает «повторим»,
+      а не «пропустим»;
+    - **событие отмечается в журнале до обработки**, поэтому повторный проход
+      не заведёт клиента дважды;
+    - **одна плохая сделка не роняет проход**: остальные обрабатываются.
+
+    Возвращает счётчики для отчёта владельцу.
+    """
+    if pool is None:
+        return {}
+
+    counters: dict[str, int] = {}
+
+    def count(key: str) -> None:
+        counters[key] = counters.get(key, 0) + 1
+
+    async with pool.acquire() as conn:
+        cursor = await _amocrm_get_cursor(conn, "exchange_events",
+                                          _amocrm_default_cursor())
+
+    events = await client.fetch_events(event_types=["lead_status_changed"],
+                                       created_from=cursor)
+    max_created_at = cursor
+
+    for event in events:
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            continue
+        created_at = _amocrm_created_at(event, cursor)
+        max_created_at = max(max_created_at, created_at)
+        lead_id = extract_event_entity_id(event)
+        if not lead_id:
+            continue
+
+        async with pool.acquire() as conn:
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO amocrm_api_events (
+                    event_id, event_type, entity_id, payload, action, created_at
+                )
+                VALUES ($1, 'exchange_status', $2, $3::jsonb, 'pending', $4)
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id
+                """,
+                f"exchange:{event_id}",
+                str(lead_id),
+                _amocrm_payload_json(event),
+                created_at,
+            )
+        if not inserted:
+            continue                          # это событие уже разбирали
+
+        try:
+            lead = await client.fetch_lead(lead_id)
+            outcome = outcome_of_lead(lead)
+            if outcome is None:
+                count("не наша сделка")
+                continue
+
+            contact = await _amocrm_fetch_first_contact(
+                client, normalize_lead(lead).contact_ids)
+            incoming = incoming_from_amo(lead, contact,
+                                         normalize_phone=_amo_normalize_phone)
+
+            async with pool.acquire() as conn:
+                existing = (await _exchange_find_existing(conn, incoming.digits)
+                            if incoming.digits else None)
+                decision = decide_exchange(outcome=outcome, incoming=incoming,
+                                           existing=existing)
+                if dry_run:
+                    logger.info(
+                        "Обмен (репетиция): сделка %s, %s -> %s (%s)",
+                        lead_id, outcome, decision.action, decision.reason)
+                    count(f"репетиция: {decision.action}")
+                else:
+                    count(await _exchange_apply(conn, decision, existing))
+        except Exception as exc:              # noqa: BLE001 — сделка не роняет проход
+            logger.exception("Обмен: сделка %s не разобрана: %s", lead_id, exc)
+            count("ошибка")
+
+    async with pool.acquire() as conn:
+        await _amocrm_set_cursor(conn, "exchange_events", max_created_at)
+    return counters
+
+
 async def _amocrm_poll_unsorted_once(client: AmoCRMAPIClient) -> None:
     if pool is None:
         return
