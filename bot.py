@@ -142,16 +142,34 @@ from notifications.amo_exchange import (
     WEEKLY_LEADS_PERIOD_DAYS,
     ExchangeDecision,
     ExistingClient,
+    IncomingClient,
     decide_exchange,
     incoming_from_amo,
     is_weekly_leads_day,
     outcome_of_event,
+)
+from notifications.client_messaging import (
+    AMO_STAGE_CONFIRMED,
+    PENDING_TTL_AFTER_ORDER,
+    SILENCE_LIMIT,
+    ConfirmationPlan,
+    OrderDetails,
+    decide_on_answer,
+    is_order_created_event,
+    letter_payload,
+    order_from_lead,
+    owner_alert_text,
+    parse_answer,
+    plan_confirmation,
+    should_call_owner,
+    should_move_deal,
 )
 from notifications.amocrm_api import (
     AmoCRMAPIAuthError,
     AmoCRMAPIClient,
     AmoCRMAPIRateLimitError,
     AmoCRMAlert,
+    build_lead_link,
     build_new_lead_alert,
     build_unanswered_message_alert,
     build_unsorted_alert,
@@ -236,6 +254,12 @@ AMOCRM_EXCHANGE_DRY_RUN = _env_int("AMOCRM_EXCHANGE_DRY_RUN", 1) == 1
 # сделку. Опрос остаётся страховкой для того, что оформили мимо него —
 # заявка с сайта, звонок, сделка руками владельца.
 AMOCRM_EXCHANGE_INTERVAL_SEC = max(60, _env_int("AMOCRM_EXCHANGE_INTERVAL_SEC", 600))
+# Разговор с клиентом до работы: подтверждение заказа и вопрос за сутки.
+# Умолчания такие же осторожные: выключено, а включат — сперва репетиция,
+# в которой клиенту не уходит ни одного письма.
+CLIENT_MESSAGING_ENABLED = _env_int("CLIENT_MESSAGING_ENABLED", 0) == 1
+CLIENT_MESSAGING_DRY_RUN = _env_int("CLIENT_MESSAGING_DRY_RUN", 1) == 1
+CLIENT_MESSAGING_INTERVAL_SEC = max(60, _env_int("CLIENT_MESSAGING_INTERVAL_SEC", 600))
 ONLINEPBX_ALLOWED_IPS = {
     ip.strip()
     for ip in re.split(r"[ ,;]+", os.getenv("ONLINEPBX_ALLOWED_IPS", "").strip())
@@ -542,6 +566,8 @@ rewash_counter_task: asyncio.Task | None = None
 dead_channels_cleanup_task: asyncio.Task | None = None
 exchange_task: asyncio.Task | None = None          # обмен amoCRM -> база бота
 weekly_leads_task: asyncio.Task | None = None      # понедельничные лиды из amoCRM
+client_messaging_task: asyncio.Task | None = None  # письма клиенту до работы
+confirmation_watch_task: asyncio.Task | None = None  # сторож молчунов
 client_bot_health_task: asyncio.Task | None = None
 amocrm_api_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
@@ -1082,9 +1108,9 @@ async def ensure_client_messaging_schema(conn: asyncpg.Connection) -> None:
             client_id    bigint,                  -- clients.id, если клиент найден
             phone_digits text NOT NULL,           -- по нему ищем ответ клиента
             order_at     timestamptz,             -- когда работа
-            status       text NOT NULL,           -- planned|asked|confirmed|refused|owner_notified
-            outbox_id    bigint,                  -- письмо-вопрос в очереди: по нему видно, ушло ли оно
-            asked_at     timestamptz,             -- когда ушёл вопрос
+            status       text NOT NULL,           -- planned|confirmed|refused|owner_notified
+            outbox_id    bigint,                  -- письмо-вопрос в очереди
+            asked_at     timestamptz,             -- плановое время вопроса; NULL — вопроса нет
             answered_at  timestamptz,
             answer_text  text,
             notified_at  timestamptz,             -- когда позвали владельца
@@ -1924,6 +1950,272 @@ async def run_weekly_leads_exchange() -> None:
                 await bot.send_message(admin_id, "\n".join(lines))
             except Exception:                 # noqa: BLE001
                 logger.warning("Не удалось отправить отчёт по недельным лидам")
+
+
+# Закладка репетиции разговора с клиентом. Живёт в памяти процесса ровно по той
+# же причине, что и у обмена: записанная в базу, она подарила бы боевому запуску
+# «событий нет», и первые настоящие письма никуда бы не ушли.
+_client_messaging_rehearsal_cursor: int | None = None
+
+
+async def _confirmation_apply(conn: asyncpg.Connection, *, lead_id: int,
+                              incoming: IncomingClient, order: OrderDetails,
+                              plan: ConfirmationPlan,
+                              dry_run: bool) -> tuple[str, str]:
+    """Поставить письма клиенту и завести ожидание. Возвращает (отметка, причина).
+
+    В репетиции не пишется ничего: ни письма в очередь, ни строки ожидания.
+    Строка означает «этой сделкой робот занялся», и оставь её репетиция —
+    боевой запуск прошёл бы мимо клиента молча.
+    """
+    if not plan.send_confirmation:
+        return "not_needed", plan.reason
+    if not incoming.digits:
+        return "no_phone", "в сделке нет телефона"
+
+    client_row = await conn.fetchrow(
+        """
+        SELECT id, full_name
+        FROM clients
+        WHERE phone_digits = $1
+           OR regexp_replace(COALESCE(phone, ''), '[^0-9]+', '', 'g') = $1
+        LIMIT 1
+        """,
+        incoming.digits,
+    )
+    if client_row is None:
+        # Писать некому: очередь умеет отправлять только записям из `clients`.
+        # Это работа автообмена, а не наша — просто считаем и идём дальше.
+        return "no_client", "клиента нет в базе бота"
+
+    already = await conn.fetchval(
+        "SELECT 1 FROM order_confirmations WHERE lead_id = $1", lead_id)
+    if already:
+        # Сделку могли вернуть в «Заказ оформлен» руками. Второе письмо про
+        # тот же заказ клиенту не нужно.
+        return "already_planned", "по этой сделке клиенту уже писали"
+
+    result = "confirmation_sent" if plan.ask_at else "confirmation_only"
+    if dry_run:
+        return f"rehearsal_{result}", plan.reason
+
+    payload = letter_payload(order_at=order.order_at, address=order.address)
+    await enqueue_notification(conn, notification_rules, event_key="order_created",
+                               client_id=int(client_row["id"]), payload=payload)
+    outbox_id: int | None = None
+    if plan.ask_at is not None:
+        outbox_id = await enqueue_notification(
+            conn, notification_rules, event_key="order_confirm_request",
+            client_id=int(client_row["id"]), payload=payload,
+            scheduled_at=plan.ask_at)
+
+    # `asked_at` — плановое время вопроса, а не факт отправки: владелец решил,
+    # что причина молчания роли не играет. Не ушло письмо или клиент его
+    # проигнорировал — через три часа владелец узнает в обоих случаях.
+    await conn.execute(
+        """
+        INSERT INTO order_confirmations (
+            lead_id, client_id, phone_digits, order_at, status, outbox_id, asked_at
+        )
+        VALUES ($1, $2, $3, $4, 'planned', $5, $6)
+        ON CONFLICT (lead_id) DO NOTHING
+        """,
+        lead_id,
+        int(client_row["id"]),
+        incoming.digits,
+        order.order_at,
+        outbox_id,
+        plan.ask_at,
+    )
+    return result, plan.reason
+
+
+async def _confirmation_handle_lead(client: AmoCRMAPIClient, lead_id: int, *,
+                                    dry_run: bool, journal_key: str) -> str:
+    """Разобрать одну оформленную сделку. Возвращает, что произошло."""
+    lead = await client.fetch_lead(lead_id)
+    contact = await _amocrm_fetch_first_contact(client, normalize_lead(lead).contact_ids)
+    incoming = incoming_from_amo(lead, contact, normalize_phone=_amo_normalize_phone)
+    order = order_from_lead(lead, tz=MOSCOW_TZ)
+    plan = plan_confirmation(order_at=order.order_at, now=datetime.now(MOSCOW_TZ))
+
+    async with pool.acquire() as conn:
+        result, reason = await _confirmation_apply(
+            conn, lead_id=lead_id, incoming=incoming, order=order,
+            plan=plan, dry_run=dry_run)
+        if dry_run:
+            logger.info("Разговор с клиентом (репетиция): сделка %s -> %s (%s)",
+                        lead_id, result, reason)
+        # Отметка в журнале, а не в памяти: отчёт переживает перезапуск службы.
+        await _amocrm_mark_event_action(conn, journal_key, result,
+                                        error=reason or None)
+    return result
+
+
+async def _amocrm_poll_confirmations_once(client: AmoCRMAPIClient, *,
+                                          dry_run: bool = True) -> dict[str, int]:
+    """Один проход: оформленные заказы → письмо клиенту и ожидание ответа.
+
+    Устройство повторяет автообмен (своя закладка, журнал до обработки, сдвиг
+    закладки в самом конце) и повторяет намеренно: общий каркас появится, когда
+    обмен пройдёт проверку на живых данных. Сейчас трогать его — значит рисковать
+    работающей репетицией ради экономии полусотни строк.
+    """
+    if pool is None:
+        return {}
+
+    counters: dict[str, int] = {}
+
+    def count(key: str) -> None:
+        counters[key] = counters.get(key, 0) + 1
+
+    global _client_messaging_rehearsal_cursor
+
+    if dry_run:
+        cursor = (_client_messaging_rehearsal_cursor
+                  if _client_messaging_rehearsal_cursor is not None
+                  else _amocrm_default_cursor())
+    else:
+        async with pool.acquire() as conn:
+            cursor = await _amocrm_get_cursor(conn, "confirmation_events",
+                                              _amocrm_default_cursor())
+
+    events = await client.fetch_events(event_types=["lead_status_changed"],
+                                       created_from=cursor)
+    max_created_at = cursor
+
+    for event in events:
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            continue
+        created_at = _amocrm_created_at(event, cursor)
+        max_created_at = max(max_created_at, created_at)
+        lead_id = extract_event_entity_id(event)
+        if not lead_id:
+            continue
+
+        if not is_order_created_event(event):
+            count("не оформленный заказ")
+            continue
+
+        journal_key = (f"{'confirmation_rehearsal' if dry_run else 'confirmation'}"
+                       f":{event_id}")
+        journal_type = "confirmation_rehearsal" if dry_run else "confirmation_status"
+
+        async with pool.acquire() as conn:
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO amocrm_api_events (
+                    event_id, event_type, entity_id, payload, action, created_at
+                )
+                VALUES ($1, $2, $3, $4::jsonb, 'pending', $5)
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id
+                """,
+                journal_key,
+                journal_type,
+                str(lead_id),
+                _amocrm_payload_json(event),
+                created_at,
+            )
+        if not inserted:
+            continue                          # это событие уже разбирали
+
+        try:
+            count(await _confirmation_handle_lead(client, lead_id, dry_run=dry_run,
+                                                  journal_key=journal_key))
+        except Exception as exc:              # noqa: BLE001 — сделка не роняет проход
+            logger.exception("Разговор с клиентом: сделка %s не разобрана: %s",
+                             lead_id, exc)
+            async with pool.acquire() as conn:
+                await _amocrm_mark_event_action(conn, journal_key, "error",
+                                                error=str(exc)[:500])
+            count("ошибка")
+
+    next_cursor = max_created_at + 1 if events else max_created_at
+    if dry_run:
+        _client_messaging_rehearsal_cursor = next_cursor
+    else:
+        async with pool.acquire() as conn:
+            await _amocrm_set_cursor(conn, "confirmation_events", next_cursor)
+    return counters
+
+
+async def run_client_messaging_cycle() -> None:
+    """Проход разговора с клиентом: раз в 10 минут, как и обмен.
+
+    Задержка ни на что не влияет: письмо-подтверждение уходит в тот же день,
+    а вопрос — за сутки до работы, и его время задаёт очередь, а не этот проход.
+    """
+    if not CLIENT_MESSAGING_ENABLED or not _amocrm_api_enabled():
+        return
+    if notification_rules is None:
+        logger.warning("Разговор с клиентом: правила уведомлений не загружены")
+        return
+    async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+        counters = await _amocrm_poll_confirmations_once(
+            client, dry_run=CLIENT_MESSAGING_DRY_RUN)
+    if counters:
+        logger.info("Разговор с клиентом: %s", counters)
+
+
+async def run_confirmation_silence_watch() -> None:
+    """Клиент молчит три часа после вопроса — зовём владельца, ровно один раз.
+
+    Причина молчания роли не играет (решение владельца): не ответил, не увидел,
+    нет мессенджера — владельцу в любом случае нужно позвонить самому.
+    """
+    if not CLIENT_MESSAGING_ENABLED or pool is None:
+        return
+
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT oc.lead_id, oc.order_at, oc.asked_at, oc.notified_at,
+                   oc.phone_digits, c.full_name, c.phone
+            FROM order_confirmations oc
+            LEFT JOIN clients c ON c.id = oc.client_id
+            WHERE oc.status = 'planned'
+              AND oc.asked_at IS NOT NULL
+              AND oc.notified_at IS NULL
+              AND oc.asked_at <= $1
+            ORDER BY oc.asked_at
+            LIMIT 50
+            """,
+            now - SILENCE_LIMIT,
+        )
+
+    called = 0
+    for row in rows:
+        # Запрос уже сузил выборку, но решение принимает правило: разойдись
+        # они однажды — молчаливо победил бы SQL, а он тестами не покрыт.
+        if not should_call_owner(asked_at=row["asked_at"],
+                                 notified_at=row["notified_at"], now=now):
+            continue
+        await _confirmation_notify_owner(owner_alert_text(
+            kind="silence",
+            name=row["full_name"],
+            phone=_confirmation_owner_phone(row),
+            order_at=_confirmation_order_at_msk(row),
+            answer_text=None,
+            lead_link=build_lead_link(AMOCRM_API_BASE, row["lead_id"]),
+        ))
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE order_confirmations
+                SET status = 'owner_notified',
+                    notified_at = NOW(),
+                    updated_at = NOW()
+                WHERE lead_id = $1
+                """,
+                row["lead_id"],
+            )
+        called += 1
+
+    if called:
+        logger.info("Разговор с клиентом: позвал владельца к %s молчунам", called)
 
 
 async def _amocrm_poll_unsorted_once(client: AmoCRMAPIClient) -> None:
@@ -2976,6 +3268,146 @@ async def _process_promo_stage(conn: asyncpg.Connection, stage: int) -> int:
     return 0
 
 
+async def _confirmation_notify_owner(text: str) -> None:
+    """Сообщение владельцу. Он единственный получатель этого бота."""
+    for admin_id in ADMIN_TG_IDS:
+        try:
+            await bot.send_message(admin_id, text, disable_web_page_preview=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось написать владельцу %s о заказе: %s",
+                           admin_id, exc)
+
+
+def _confirmation_owner_phone(pending: Mapping[str, Any]) -> str:
+    """Телефон для владельца — целиком (его решение 2026-08-26): бот приватный,
+    и владельцу нужно позвонить клиенту, не открывая CRM."""
+    phone = pending.get("phone")
+    if phone:
+        return str(phone)
+    digits = str(pending.get("phone_digits") or "")
+    return f"+{digits}" if digits else "неизвестен"
+
+
+def _confirmation_order_at_msk(pending: Mapping[str, Any]) -> datetime | None:
+    """Время работы в московском поясе: в базе оно лежит в UTC, а владелец
+    читает часы своего города."""
+    order_at = pending.get("order_at")
+    return order_at.astimezone(MOSCOW_TZ) if order_at is not None else None
+
+
+async def _confirmation_pending_for(digits: str) -> asyncpg.Record | None:
+    """Живое ожидание подтверждения по телефону клиента.
+
+    Ожидание умирает через сутки после работы: «да», пришедшее через неделю,
+    подтверждать уже нечего — мастер либо съездил, либо нет.
+    """
+    if pool is None:
+        return None
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT oc.lead_id, oc.client_id, oc.status, oc.order_at,
+                   oc.phone_digits, oc.notified_at, c.full_name, c.phone
+            FROM order_confirmations oc
+            LEFT JOIN clients c ON c.id = oc.client_id
+            WHERE oc.phone_digits = $1
+              AND oc.status IN ('planned', 'owner_notified')
+              AND (oc.order_at IS NULL OR oc.order_at >= NOW() - $2::interval)
+            ORDER BY oc.created_at DESC
+            LIMIT 1
+            """,
+            digits,
+            PENDING_TTL_AFTER_ORDER,
+        )
+
+
+async def _confirmation_accept(pending: Mapping[str, Any], answer_text: str) -> None:
+    """Клиент подтвердил заказ: двигаем сделку и молчим.
+
+    Молчим по решению владельца — подтверждение проходит без его участия.
+    Исключение одно: сделку не удалось подвинуть. Промолчать здесь значило бы
+    оставить владельца в уверенности, что в CRM всё сошлось, когда это не так.
+    """
+    lead_id = int(pending["lead_id"])
+    failure: str | None = None
+
+    if CLIENT_MESSAGING_DRY_RUN:
+        logger.info("Разговор с клиентом (репетиция): подтвердил бы сделку %s", lead_id)
+    else:
+        try:
+            async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+                lead = await client.fetch_lead(lead_id)
+                if should_move_deal(lead.get("status_id")):
+                    await client.update_lead_status(lead_id, AMO_STAGE_CONFIRMED)
+                else:
+                    # Сделку уже двинул человек — его работу робот не откатывает.
+                    logger.info("Сделка %s ушла с «Заказ оформлен» — не трогаю",
+                                lead_id)
+        except Exception as exc:  # noqa: BLE001
+            failure = str(exc)[:300]
+            logger.exception("Не удалось подтвердить сделку %s: %s", lead_id, exc)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE order_confirmations
+            SET status = 'confirmed',
+                answered_at = NOW(),
+                answer_text = $2,
+                updated_at = NOW()
+            WHERE lead_id = $1
+            """,
+            lead_id,
+            answer_text[:1000],
+        )
+
+    if failure:
+        order_at = _confirmation_order_at_msk(pending)
+        lines = [
+            "⚠️ Клиент подтвердил заказ, но сделку подвинуть не удалось",
+            f"Клиент: {pending.get('full_name') or 'без имени'}",
+            f"Телефон: {_confirmation_owner_phone(pending)}",
+        ]
+        if order_at is not None:
+            lines.append(f"Работа: {order_at.strftime('%d.%m.%Y')} в "
+                         f"{order_at.strftime('%H:%M')}")
+        lines.append(f"Причина: {failure}")
+        link = build_lead_link(AMOCRM_API_BASE, lead_id)
+        if link:
+            lines.append(f"Сделка: {link}")
+        await _confirmation_notify_owner("\n".join(lines))
+
+
+async def _confirmation_call_owner(pending: Mapping[str, Any], *, answer: str,
+                                   answer_text: str) -> None:
+    """Позвать владельца к ответу клиента. Сделку робот при этом не трогает."""
+    lead_id = int(pending["lead_id"])
+    kind = "refused" if answer == "no" else "unclear"
+    await _confirmation_notify_owner(owner_alert_text(
+        kind=kind,
+        name=pending.get("full_name"),
+        phone=_confirmation_owner_phone(pending),
+        order_at=_confirmation_order_at_msk(pending),
+        answer_text=answer_text,
+        lead_link=build_lead_link(AMOCRM_API_BASE, lead_id),
+    ))
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE order_confirmations
+            SET status = $2,
+                answered_at = NOW(),
+                answer_text = $3,
+                notified_at = NOW(),
+                updated_at = NOW()
+            WHERE lead_id = $1
+            """,
+            lead_id,
+            "refused" if answer == "no" else "owner_notified",
+            answer_text[:1000],
+        )
+
+
 async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
     if pool is None:
         return False
@@ -3014,9 +3446,10 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
             rating_score = None
     is_stop = normalized_compact in {"stop", "стоп", "стоn", "стоp"}
     is_interest = normalized_lower.startswith("1")
-    if not (is_stop or is_interest):
-        if rating_score is None:
-            return False
+    # Сообщение, которое заберёт одна из давно работающих веток: оценка работы,
+    # отписка, отклик на промо. Раньше на этом месте стоял выход — теперь ждём,
+    # пока станет ясно, не подтверждения ли мы ждём от этого человека.
+    known_branch = is_stop or is_interest or rating_score is not None
 
     phone_value = None
     user_info = data.get("user")
@@ -3035,6 +3468,25 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
     digits_norm = only_digits(normalize_phone_for_db(phone_value))
     digits = digits_norm or digits_raw
     if not digits:
+        return False
+
+    # Ждём ли мы от этого клиента подтверждения заказа. Явные «да» и «нет»
+    # забираем сразу: с оценками и отпиской они не пересекаются. А вот непонятое
+    # сначала предлагаем старым веткам — клиент мог прислать «5» в ответ на
+    # просьбу оценить прошлый заказ, и терять оценку из-за нашего вопроса нельзя.
+    pending = await _confirmation_pending_for(digits) if CLIENT_MESSAGING_ENABLED else None
+    if pending is not None:
+        answer = parse_answer(normalized_text)
+        action = decide_on_answer(answer=answer, status=str(pending["status"]))
+        if action == "confirm":
+            await _confirmation_accept(pending, normalized_text)
+            return True
+        if action == "call_owner" and not known_branch:
+            await _confirmation_call_owner(pending, answer=answer,
+                                           answer_text=normalized_text)
+            return True
+
+    if not known_branch:
         return False
 
     async with pool.acquire() as conn:
@@ -5372,6 +5824,73 @@ async def build_exchange_daily_summary_text() -> str:
     return "\n".join(lines)
 
 
+# Отметки журнала разговора с клиентом → слова, понятные без объяснений.
+CLIENT_MESSAGING_ACTION_WORDS: dict[str, str] = {
+    "confirmation_sent": "заказов: подтверждение и вопрос за сутки",
+    "confirmation_only": "заказов меньше чем за сутки: только подтверждение",
+    "no_client": "заказов пропущено — клиента нет в базе бота",
+    "no_phone": "заказов без телефона в сделке",
+    "not_needed": "заказов без писем — нет даты или работа уже прошла",
+    "already_planned": "повторных заходов сделки — писать второй раз не стал",
+    "error": "ошибок — повторю",
+    "rehearsal_confirmation_sent": "репетиция: написал бы и спросил за сутки",
+    "rehearsal_confirmation_only": "репетиция: написал бы только подтверждение",
+}
+
+CONFIRMATION_STATUS_WORDS: dict[str, str] = {
+    "planned": "ждут ответа клиента",
+    "confirmed": "клиентов подтвердили заказ",
+    "refused": "клиентов отказались",
+    "owner_notified": "раз позвал вас — отказ, непонятный ответ или молчание",
+}
+
+
+async def build_client_messaging_daily_summary_text() -> str:
+    """Что робот наговорил клиентам за сутки и чем это кончилось.
+
+    Первая половина — по журналу событий (он переживает перезапуск службы),
+    вторая — по самим ожиданиям. В репетиции второй половины не будет: ожидания
+    там не заводятся, и это правильно.
+    """
+    if pool is None:
+        return ""
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    async with pool.acquire() as conn:
+        actions = await conn.fetch(
+            """
+            SELECT action, count(*) AS total
+            FROM amocrm_api_events
+            WHERE event_type IN ('confirmation_status', 'confirmation_rehearsal')
+              AND processed_at >= $1
+            GROUP BY action
+            ORDER BY count(*) DESC
+            """,
+            since,
+        )
+        answers = await conn.fetch(
+            """
+            SELECT status, count(*) AS total
+            FROM order_confirmations
+            WHERE updated_at >= $1
+            GROUP BY status
+            ORDER BY count(*) DESC
+            """,
+            since,
+        )
+
+    if not actions and not answers:
+        return "💬 Разговор с клиентами: за сутки оформленных заказов не было."
+
+    lines = ["💬 Разговор с клиентами за сутки:"]
+    for row in actions:
+        word = CLIENT_MESSAGING_ACTION_WORDS.get(row["action"], row["action"])
+        lines.append(f"   • {word}: {row['total']}")
+    for row in answers:
+        word = CONFIRMATION_STATUS_WORDS.get(row["status"], row["status"])
+        lines.append(f"   • {word}: {row['total']}")
+    return "\n".join(lines)
+
+
 async def send_daily_reports() -> None:
     if pool is None:
         return
@@ -5386,6 +5905,9 @@ async def send_daily_reports() -> None:
         orders_text = await build_daily_orders_admin_summary_text()
         if AMOCRM_EXCHANGE_ENABLED:
             orders_text = f"{orders_text}\n\n{await build_exchange_daily_summary_text()}"
+        if CLIENT_MESSAGING_ENABLED:
+            orders_text = (f"{orders_text}\n\n"
+                           f"{await build_client_messaging_daily_summary_text()}")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to build daily reports: %s", exc)
         return
@@ -13710,7 +14232,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Выберите действие на клавиатуре ниже.", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, exchange_task, weekly_leads_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, exchange_task, weekly_leads_task, client_messaging_task, confirmation_watch_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     dp["pool"] = pool
@@ -13782,6 +14304,19 @@ async def main():
         # понедельника: так расписание остаётся в одном месте с остальными.
         weekly_leads_task = asyncio.create_task(
             schedule_daily_job(10, 0, run_weekly_leads_exchange, "weekly_leads")
+        )
+    if client_messaging_task is None and CLIENT_MESSAGING_ENABLED:
+        client_messaging_task = asyncio.create_task(
+            schedule_periodic_job(CLIENT_MESSAGING_INTERVAL_SEC,
+                                  run_client_messaging_cycle, "client_messaging")
+        )
+    if confirmation_watch_task is None and CLIENT_MESSAGING_ENABLED:
+        # Тем же ритмом, что и опрос: сигнал о молчуне опаздывает максимум
+        # на десять минут, и это дешевле отдельного расписания.
+        confirmation_watch_task = asyncio.create_task(
+            schedule_periodic_job(CLIENT_MESSAGING_INTERVAL_SEC,
+                                  run_confirmation_silence_watch,
+                                  "confirmation_silence")
         )
     if client_bot_health_task is None:
         client_bot_health_task = asyncio.create_task(
