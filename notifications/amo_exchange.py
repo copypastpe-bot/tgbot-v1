@@ -104,7 +104,11 @@ def decide_exchange(*, outcome: str, incoming: IncomingClient,
         updates["status"] = "client"        # только вверх; вниз пути нет
     if incoming.name and not existing.name:
         updates["full_name"] = incoming.name
-    if incoming.address and not existing.address:
+    if incoming.address and incoming.address != existing.address:
+        # Колонка называется last_order_addr — «адрес последнего заказа», и по
+        # смыслу обновляется каждым новым. Прежнее «дописываем только пустое»
+        # превращало её в «адрес первого заказа»: 2026-08-28 в карточке годами
+        # лежало слово «адрес», и с ним ушло первое письмо клиенту.
         updates["last_order_addr"] = incoming.address
     if incoming.service and incoming.service != existing.service:
         updates["last_service"] = incoming.service
@@ -171,6 +175,30 @@ def _contact_phone(contact: dict) -> str:
     return ""
 
 
+def prefer_deal_fields(incoming: IncomingClient,
+                       deal: Optional[dict]) -> IncomingClient:
+    """Адрес и услугу берём из дочерней сделки: там данные заказа, а не клиента.
+
+    В лид адрес попадает автозаполнением из контакта — то есть с прошлого раза.
+    В дочернюю сделку его кладёт робот владельца прямо из календаря. Разницу
+    видно на живом примере 2026-08-28: в лиде «адрес», в сделке «Академика
+    Сахарова 109к2 кв 142».
+
+    Сделки нет — оставляем как было: половина данных лучше, чем ничего.
+    """
+    if deal is None:
+        return incoming
+    address = next(iter(field_values(deal, AMO_FIELD_ADDRESS)), None)
+    services = field_values(deal, AMO_FIELD_SERVICE)
+    return IncomingClient(
+        phone=incoming.phone,
+        digits=incoming.digits,
+        name=incoming.name,
+        address=address or incoming.address,
+        service=", ".join(services) if services else incoming.service,
+    )
+
+
 def incoming_from_amo(
     lead: dict,
     contact: Optional[dict],
@@ -207,4 +235,5 @@ __all__ = [
     "incoming_from_amo",
     "is_weekly_leads_day",
     "outcome_of_event",
+    "prefer_deal_fields",
 ]

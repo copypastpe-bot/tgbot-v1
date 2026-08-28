@@ -22,6 +22,7 @@ from notifications.amo_exchange import (
     incoming_from_amo,
     is_weekly_leads_day,
     outcome_of_event,
+    prefer_deal_fields,
 )
 
 
@@ -91,10 +92,20 @@ class DecideExchangeTests(unittest.TestCase):
                                    existing=existing)
         self.assertEqual(decision.fields["full_name"], "Дарья")
 
-    def test_address_filled_only_when_empty(self):
-        """Адрес заказа дописываем, чужой не переписываем (правила обмена)."""
+    def test_address_is_refreshed_by_every_order(self):
+        """Колонка называется «адрес последнего заказа» — она и обновляется
+        каждым заказом (решение владельца 2026-08-28, после того как в карточке
+        годами лежало слово «адрес» и с ним ушло первое письмо клиенту)."""
         existing = ExistingClient(client_id=7, status="client", name="Дарья",
                                   address="Старый адрес", service=None)
+        decision = decide_exchange(outcome="won", incoming=self._incoming(),
+                                   existing=existing)
+        self.assertEqual(decision.fields["last_order_addr"], "Панина 7к2")
+
+    def test_same_address_is_not_rewritten(self):
+        """Заказ на тот же адрес не должен выглядеть как изменение."""
+        existing = ExistingClient(client_id=7, status="client", name="Дарья",
+                                  address="Панина 7к2", service="Уборка")
         decision = decide_exchange(outcome="won", incoming=self._incoming(),
                                    existing=existing)
         self.assertNotIn("last_order_addr", decision.fields)
@@ -105,6 +116,27 @@ class DecideExchangeTests(unittest.TestCase):
         decision = decide_exchange(outcome="won", incoming=self._incoming(),
                                    existing=existing)
         self.assertEqual(decision.fields["last_service"], "Чистка мебели")
+
+    def test_deal_address_wins_over_lead_address(self):
+        """В лид адрес попадает автозаполнением из контакта — то есть с прошлого
+        раза. В дочернюю сделку его кладёт робот владельца из календаря."""
+        deal = {"custom_fields_values": [
+            {"field_id": 18639, "values": [{"value": "Академика Сахарова 109к2"}]},
+            {"field_id": 271915, "values": [{"value": "Химчистка ковра"}]},
+        ]}
+        enriched = prefer_deal_fields(self._incoming(address="адрес"), deal)
+        self.assertEqual(enriched.address, "Академика Сахарова 109к2")
+        self.assertEqual(enriched.service, "Химчистка ковра")
+        self.assertEqual(enriched.digits, "79001234567")
+
+    def test_without_deal_lead_data_is_kept(self):
+        enriched = prefer_deal_fields(self._incoming(), None)
+        self.assertEqual(enriched.address, "Панина 7к2")
+
+    def test_empty_deal_fields_do_not_erase_lead_data(self):
+        enriched = prefer_deal_fields(self._incoming(), {"custom_fields_values": []})
+        self.assertEqual(enriched.address, "Панина 7к2")
+        self.assertEqual(enriched.service, "Чистка мебели")
 
     def test_nothing_to_change_is_skipped(self):
         existing = ExistingClient(client_id=7, status="client", name="Дарья",

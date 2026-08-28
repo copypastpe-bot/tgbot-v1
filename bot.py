@@ -147,6 +147,7 @@ from notifications.amo_exchange import (
     incoming_from_amo,
     is_weekly_leads_day,
     outcome_of_event,
+    prefer_deal_fields,
 )
 from notifications.client_messaging import (
     AMO_PIPELINE_REALIZATION,
@@ -1713,6 +1714,20 @@ async def _amocrm_poll_new_leads_once(client: AmoCRMAPIClient) -> None:
 _exchange_rehearsal_cursor: int | None = None
 
 
+async def _exchange_fetch_deal(client: AmoCRMAPIClient, lead_id: int) -> dict | None:
+    """Дочерняя сделка лида — по ссылке, которую amoCRM кладёт в примечание.
+
+    Ошибка здесь не должна ронять обмен: не прочитали сделку — работаем по
+    данным лида, как раньше.
+    """
+    try:
+        deal_id = child_deal_id(await client.fetch_lead_notes(lead_id))
+        return await client.fetch_lead(int(deal_id)) if deal_id else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Обмен: дочерняя сделка лида %s не прочитана: %s", lead_id, exc)
+        return None
+
+
 async def _exchange_handle_lead(client: AmoCRMAPIClient, lead_id: int, outcome: str,
                                 *, dry_run: bool, journal_key: str) -> str:
     """Разобрать одну сделку и применить решение. Возвращает, что произошло.
@@ -1724,6 +1739,12 @@ async def _exchange_handle_lead(client: AmoCRMAPIClient, lead_id: int, outcome: 
     lead = await client.fetch_lead(lead_id)
     contact = await _amocrm_fetch_first_contact(client, normalize_lead(lead).contact_ids)
     incoming = incoming_from_amo(lead, contact, normalize_phone=_amo_normalize_phone)
+
+    if outcome == "won":
+        # Адрес и услугу берём из дочерней сделки: в лид адрес подставляет
+        # автозаполнение из контакта, то есть прошлый. У отказных сделки нет,
+        # да и адрес им не пишется.
+        incoming = prefer_deal_fields(incoming, await _exchange_fetch_deal(client, lead_id))
 
     async with pool.acquire() as conn:
         existing = (await _exchange_find_existing(conn, incoming.digits)
