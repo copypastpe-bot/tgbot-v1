@@ -232,6 +232,10 @@ AMOCRM_LOOKBACK_MINUTES = max(1, _env_int("AMOCRM_LOOKBACK_MINUTES", 30))
 # выключена, а если её включат — сперва репетиция, без единой записи в базу.
 AMOCRM_EXCHANGE_ENABLED = _env_int("AMOCRM_EXCHANGE_ENABLED", 0) == 1
 AMOCRM_EXCHANGE_DRY_RUN = _env_int("AMOCRM_EXCHANGE_DRY_RUN", 1) == 1
+# Раз в 10 минут: клиента почти всегда заводит сам робот, когда проводит
+# сделку. Опрос остаётся страховкой для того, что оформили мимо него —
+# заявка с сайта, звонок, сделка руками владельца.
+AMOCRM_EXCHANGE_INTERVAL_SEC = max(60, _env_int("AMOCRM_EXCHANGE_INTERVAL_SEC", 600))
 ONLINEPBX_ALLOWED_IPS = {
     ip.strip()
     for ip in re.split(r"[ ,;]+", os.getenv("ONLINEPBX_ALLOWED_IPS", "").strip())
@@ -536,6 +540,7 @@ wire_reminder_task: asyncio.Task | None = None
 leads_promo_task: asyncio.Task | None = None
 rewash_counter_task: asyncio.Task | None = None
 dead_channels_cleanup_task: asyncio.Task | None = None
+exchange_task: asyncio.Task | None = None          # обмен amoCRM -> база бота
 weekly_leads_task: asyncio.Task | None = None      # понедельничные лиды из amoCRM
 client_bot_health_task: asyncio.Task | None = None
 amocrm_api_task: asyncio.Task | None = None
@@ -1777,6 +1782,23 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
     return counters
 
 
+async def run_exchange_cycle() -> None:
+    """Проход обмена по своему расписанию, отдельно от общего опроса amoCRM.
+
+    Раз в 10 минут, а не раз в полминуты (решение владельца 2026-08-28):
+    клиента почти всегда заводит сам робот, когда проводит сделку, и искать
+    его в CRM ежеминутно незачем. На уведомления задержка не влияет — письмо
+    клиенту всё равно уходит за сутки до работы.
+    """
+    if not AMOCRM_EXCHANGE_ENABLED or not _amocrm_api_enabled():
+        return
+    async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+        counters = await _amocrm_poll_exchange_once(
+            client, dry_run=AMOCRM_EXCHANGE_DRY_RUN)
+    if counters:
+        logger.info("Обмен amoCRM: %s", counters)
+
+
 async def run_weekly_leads_exchange() -> None:
     """Понедельник, 10:00 МСК: заводим лидов из отказных сделок за неделю.
 
@@ -2174,11 +2196,6 @@ async def amocrm_api_polling_loop() -> None:
                 await _amocrm_poll_unsorted_once(client)
                 await _amocrm_poll_chat_events_once(client)
                 await _amocrm_notify_due_unanswered_once(client)
-                if AMOCRM_EXCHANGE_ENABLED:
-                    counters = await _amocrm_poll_exchange_once(
-                        client, dry_run=AMOCRM_EXCHANGE_DRY_RUN)
-                    if counters:
-                        logger.info("Обмен amoCRM: %s", counters)
             except AmoCRMAPIAuthError as exc:
                 logger.error("amoCRM API auth failed; polling stopped: %s", exc)
                 return
@@ -13651,7 +13668,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Выберите действие на клавиатуре ниже.", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, weekly_leads_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, exchange_task, weekly_leads_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     dp["pool"] = pool
@@ -13711,6 +13728,11 @@ async def main():
     if dead_channels_cleanup_task is None:
         dead_channels_cleanup_task = asyncio.create_task(
             schedule_periodic_job(7 * 24 * 3600, clear_dead_channels_weekly, "dead_channels_cleanup")
+        )
+    if exchange_task is None and AMOCRM_EXCHANGE_ENABLED:
+        exchange_task = asyncio.create_task(
+            schedule_periodic_job(AMOCRM_EXCHANGE_INTERVAL_SEC, run_exchange_cycle,
+                                  "amo_exchange")
         )
     if weekly_leads_task is None and AMOCRM_EXCHANGE_ENABLED:
         # Планируем ежедневно, а внутри задача сама пропускает всё, кроме
