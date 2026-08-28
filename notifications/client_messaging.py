@@ -182,6 +182,21 @@ def order_from_lead(lead: Mapping[str, Any], *, tz: tzinfo) -> OrderDetails:
     return OrderDetails(order_at=order_at, address=address, order_at_raw=raw)
 
 
+def prefer_deal_details(deal: OrderDetails, lead: OrderDetails) -> OrderDetails:
+    """Данные заказа: сначала из сделки реализации, лид — запасной вариант.
+
+    Истина по заказу живёт в сделке: её заводит робот владельца прямо из
+    календаря. В лид те же поля попадают из карточки клиента и приходят
+    испорченными — 2026-08-28 в лиде вместо адреса стояло слово «адрес»,
+    и клиент получил письмо с ним.
+    """
+    return OrderDetails(
+        order_at=deal.order_at or lead.order_at,
+        address=deal.address or lead.address,
+        order_at_raw=deal.order_at_raw or lead.order_at_raw,
+    )
+
+
 def letter_payload(*, order_at: Optional[datetime],
                    address: Optional[str]) -> dict[str, str]:
     """Переменные писем клиенту: дата, время, адрес."""
@@ -266,6 +281,7 @@ __all__ = [
     "pick_realization_deal",
     "order_from_lead",
     "parse_answer",
+    "prefer_deal_details",
     "plan_confirmation",
     "should_call_owner",
     "should_move_deal",

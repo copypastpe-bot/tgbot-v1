@@ -163,6 +163,7 @@ from notifications.client_messaging import (
     parse_answer,
     pick_realization_deal,
     plan_confirmation,
+    prefer_deal_details,
     should_call_owner,
     should_move_deal,
 )
@@ -2087,9 +2088,20 @@ async def _confirmation_handle_lead(client: AmoCRMAPIClient, lead_id: int, *,
     contact = await _amocrm_fetch_first_contact(client, normalize_lead(lead).contact_ids)
     incoming = incoming_from_amo(lead, contact, normalize_phone=_amo_normalize_phone)
     order = order_from_lead(lead, tz=MOSCOW_TZ)
+
+    # Данные для письма берём из дочерней сделки: её заводит робот владельца
+    # прямо из календаря. В лид те же поля попадают из карточки клиента и
+    # приходят испорченными — 2026-08-28 вместо адреса там стояло слово «адрес».
+    deal_id = await _confirmation_find_deal(client, lead_id, order)
+    if deal_id:
+        try:
+            deal = await client.fetch_lead(int(deal_id))
+            order = prefer_deal_details(order_from_lead(deal, tz=MOSCOW_TZ), order)
+        except Exception as exc:  # noqa: BLE001 — письмо уйдёт по данным лида
+            logger.warning("Сделка %s не прочитана, беру данные из лида: %s",
+                           deal_id, exc)
+
     plan = plan_confirmation(order_at=order.order_at, now=datetime.now(MOSCOW_TZ))
-    deal_id = (await _confirmation_find_deal(client, lead_id, order)
-               if plan.send_confirmation else None)
 
     async with pool.acquire() as conn:
         result, reason = await _confirmation_apply(

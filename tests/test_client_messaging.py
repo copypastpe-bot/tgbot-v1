@@ -29,6 +29,7 @@ from notifications.client_messaging import (
     owner_alert_text,
     parse_answer,
     plan_confirmation,
+    prefer_deal_details,
     should_call_owner,
     should_move_deal,
 )
@@ -220,6 +221,30 @@ class OrderFromLeadTests(unittest.TestCase):
             {"field_id": 18701, "values": [{"value": "завтра днём"}]},
         ), tz=MSK)
         self.assertIsNone(order.order_at)
+
+    def test_deal_details_win_over_the_lead(self):
+        """Адрес берём из сделки: 2026-08-28 в лиде вместо адреса стояло слово
+        «адрес», и клиент получил письмо с ним."""
+        lead = order_from_lead(self._lead(
+            {"field_id": 18701, "values": [{"value": 1788015600}]},
+            {"field_id": 18639, "values": [{"value": "адрес"}]},
+        ), tz=MSK)
+        deal = order_from_lead(self._lead(
+            {"field_id": 18701, "values": [{"value": 1788015600}]},
+            {"field_id": 18639, "values": [{"value": "Академика Сахарова 109к2"}]},
+        ), tz=MSK)
+        merged = prefer_deal_details(deal, lead)
+        self.assertEqual(merged.address, "Академика Сахарова 109к2")
+
+    def test_lead_fills_what_the_deal_lacks(self):
+        """Сделки нет или поле в ней пустое — письмо всё равно уходит."""
+        lead = order_from_lead(self._lead(
+            {"field_id": 18701, "values": [{"value": 1788015600}]},
+            {"field_id": 18639, "values": [{"value": "Панина 7к2"}]},
+        ), tz=MSK)
+        merged = prefer_deal_details(order_from_lead(self._lead(), tz=MSK), lead)
+        self.assertEqual(merged.address, "Панина 7к2")
+        self.assertEqual(merged.order_at, lead.order_at)
 
     def test_letter_payload_is_human_readable(self):
         payload = letter_payload(
