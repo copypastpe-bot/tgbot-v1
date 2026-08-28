@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 # Воронка и этапы, за которыми следит обмен. «Передано в работу» — успешное
@@ -113,6 +114,18 @@ def decide_exchange(*, outcome: str, incoming: IncomingClient,
     return ExchangeDecision("update", fields=updates, reason="дописал недостающее")
 
 
+# Отказные сделки заводятся пачкой по понедельникам (решение владельца
+# 2026-08-28). Им никто не пишет сообщений, значит срочности нет: пачку
+# владельцу проверять легче, чем ручеёк из двух-трёх записей в день.
+WEEKLY_LEADS_WEEKDAY = 0                # понедельник
+WEEKLY_LEADS_PERIOD_DAYS = 7
+
+
+def is_weekly_leads_day(now: datetime) -> bool:
+    """Сегодня ли день, когда заводим лидов за прошедшую неделю."""
+    return now.weekday() == WEEKLY_LEADS_WEEKDAY
+
+
 def outcome_of_event(event: dict) -> Optional[str]:
     """Чем закончилась сделка — по самому событию, без запроса в CRM.
 
@@ -184,6 +197,8 @@ __all__ = [
     "ExistingClient",
     "IncomingClient",
     "decide_exchange",
+    "WEEKLY_LEADS_PERIOD_DAYS",
     "incoming_from_amo",
+    "is_weekly_leads_day",
     "outcome_of_event",
 ]

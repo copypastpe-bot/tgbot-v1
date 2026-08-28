@@ -139,10 +139,12 @@ from notifications import (
 )
 from notifications.amocrm import format_amocrm_admin_alert, normalize_amocrm_payload
 from notifications.amo_exchange import (
+    WEEKLY_LEADS_PERIOD_DAYS,
     ExchangeDecision,
     ExistingClient,
     decide_exchange,
     incoming_from_amo,
+    is_weekly_leads_day,
     outcome_of_event,
 )
 from notifications.amocrm_api import (
@@ -534,6 +536,7 @@ wire_reminder_task: asyncio.Task | None = None
 leads_promo_task: asyncio.Task | None = None
 rewash_counter_task: asyncio.Task | None = None
 dead_channels_cleanup_task: asyncio.Task | None = None
+weekly_leads_task: asyncio.Task | None = None      # понедельничные лиды из amoCRM
 client_bot_health_task: asyncio.Task | None = None
 amocrm_api_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
@@ -1632,6 +1635,35 @@ async def _amocrm_poll_new_leads_once(client: AmoCRMAPIClient) -> None:
 _exchange_rehearsal_cursor: int | None = None
 
 
+async def _exchange_handle_lead(client: AmoCRMAPIClient, lead_id: int, outcome: str,
+                                *, dry_run: bool, journal_key: str) -> str:
+    """Разобрать одну сделку и применить решение. Возвращает, что произошло.
+
+    Общая часть двух проходов: ежеминутного (успешные сделки) и понедельничного
+    (отказные). Карточка запрашивается только ради полей заказа — чем сделка
+    закончилась, уже сказало событие.
+    """
+    lead = await client.fetch_lead(lead_id)
+    contact = await _amocrm_fetch_first_contact(client, normalize_lead(lead).contact_ids)
+    incoming = incoming_from_amo(lead, contact, normalize_phone=_amo_normalize_phone)
+
+    async with pool.acquire() as conn:
+        existing = (await _exchange_find_existing(conn, incoming.digits)
+                    if incoming.digits else None)
+        decision = decide_exchange(outcome=outcome, incoming=incoming, existing=existing)
+        if dry_run:
+            logger.info("Обмен (репетиция): сделка %s, %s -> %s (%s)",
+                        lead_id, outcome, decision.action, decision.reason)
+            result = f"rehearsal_{decision.action}"
+        else:
+            result = await _exchange_apply(conn, decision, existing)
+        # Отметка в журнале, а не в памяти: отчёт переживает перезапуск,
+        # и всегда видно, что робот сделал по каждой сделке.
+        await _amocrm_mark_event_action(conn, journal_key, result,
+                                        error=decision.reason or None)
+    return result
+
+
 async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
                                      dry_run: bool = True) -> dict[str, int]:
     """Один проход автообмена: закрывшиеся сделки первичной воронки → база бота.
@@ -1691,6 +1723,12 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
         if outcome is None:
             count("не наша сделка")
             continue
+        if outcome == "lost":
+            # Отказные потоком не заводим: их собирает понедельничный проход
+            # (решение владельца 2026-08-28). Сообщений им никто не пишет,
+            # значит срочности нет, а пачку проверять легче, чем ручеёк.
+            count("отказ — ждёт понедельника")
+            continue
 
         # Ключи репетиции и боя не пересекаются намеренно: иначе просмотренное
         # вхолостую событие боевой режим счёл бы уже обработанным и пропустил.
@@ -1717,33 +1755,8 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
             continue                          # это событие уже разбирали
 
         try:
-            # Карточка нужна только ради полей заказа: чем закончилась сделка,
-            # уже сказало событие. Проверять статус ещё и здесь нельзя — сделку
-            # могли передвинуть дальше, но заказ-то оформлялся, и клиент должен
-            # попасть в базу.
-            lead = await client.fetch_lead(lead_id)
-            contact = await _amocrm_fetch_first_contact(
-                client, normalize_lead(lead).contact_ids)
-            incoming = incoming_from_amo(lead, contact,
-                                         normalize_phone=_amo_normalize_phone)
-
-            async with pool.acquire() as conn:
-                existing = (await _exchange_find_existing(conn, incoming.digits)
-                            if incoming.digits else None)
-                decision = decide_exchange(outcome=outcome, incoming=incoming,
-                                           existing=existing)
-                if dry_run:
-                    logger.info(
-                        "Обмен (репетиция): сделка %s, %s -> %s (%s)",
-                        lead_id, outcome, decision.action, decision.reason)
-                    result = f"rehearsal_{decision.action}"
-                else:
-                    result = await _exchange_apply(conn, decision, existing)
-                # Отметка в журнале, а не в памяти: отчёт переживает перезапуск,
-                # и всегда видно, что робот сделал по каждой сделке.
-                await _amocrm_mark_event_action(conn, journal_key,
-                                                result, error=decision.reason or None)
-            count(result)
+            count(await _exchange_handle_lead(client, lead_id, outcome,
+                                              dry_run=dry_run, journal_key=journal_key))
         except Exception as exc:              # noqa: BLE001 — сделка не роняет проход
             logger.exception("Обмен: сделка %s не разобрана: %s", lead_id, exc)
             async with pool.acquire() as conn:
@@ -1757,6 +1770,91 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
         async with pool.acquire() as conn:
             await _amocrm_set_cursor(conn, "exchange_events", max_created_at)
     return counters
+
+
+async def run_weekly_leads_exchange() -> None:
+    """Понедельник, 10:00 МСК: заводим лидов из отказных сделок за неделю.
+
+    Почему пачкой, а не потоком (решение владельца 2026-08-28): отказным никто
+    не пишет сообщений, значит срочности нет. Пачку из двух десятков записей
+    владелец проверяет одним взглядом, а ручеёк по две записи в день —
+    никогда. Скорость обмена равна скорости потребности, а не источника.
+    """
+    if not AMOCRM_EXCHANGE_ENABLED or pool is None:
+        return
+    if not _amocrm_api_enabled():
+        logger.info("Обмен: недельные лиды пропущены — опрос amoCRM выключен")
+        return
+
+    now_msk = datetime.now(MOSCOW_TZ)
+    if not is_weekly_leads_day(now_msk):
+        return
+
+    since = int((now_msk - timedelta(days=WEEKLY_LEADS_PERIOD_DAYS)).timestamp())
+    counters: dict[str, int] = {}
+
+    def count(key: str) -> None:
+        counters[key] = counters.get(key, 0) + 1
+
+    async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+        events = await client.fetch_events(event_types=["lead_status_changed"],
+                                           created_from=since, limit=250)
+        for event in events:
+            event_id = str(event.get("id") or "")
+            lead_id = extract_event_entity_id(event)
+            if not event_id or not lead_id:
+                continue
+            if outcome_of_event(event) != "lost":
+                continue
+
+            # Ключ свой: успешные ходят под `exchange:`, репетиция под
+            # `exchange_rehearsal:`. Пересечение означало бы, что один проход
+            # незаметно съедает работу другого.
+            prefix = ("weekly_leads_rehearsal" if AMOCRM_EXCHANGE_DRY_RUN
+                      else "weekly_leads")
+            journal_key = f"{prefix}:{event_id}"
+            async with pool.acquire() as conn:
+                inserted = await conn.fetchval(
+                    """
+                    INSERT INTO amocrm_api_events (
+                        event_id, event_type, entity_id, payload, action, created_at
+                    )
+                    VALUES ($1, $2, $3, $4::jsonb, 'pending', $5)
+                    ON CONFLICT (event_id) DO NOTHING
+                    RETURNING event_id
+                    """,
+                    journal_key,
+                    "exchange_weekly_leads",
+                    str(lead_id),
+                    _amocrm_payload_json(event),
+                    _amocrm_created_at(event, since),
+                )
+            if not inserted:
+                continue                      # эту сделку уже заводили
+
+            try:
+                count(await _exchange_handle_lead(
+                    client, lead_id, "lost",
+                    dry_run=AMOCRM_EXCHANGE_DRY_RUN, journal_key=journal_key))
+            except Exception as exc:          # noqa: BLE001 — сделка не роняет проход
+                logger.exception("Недельные лиды: сделка %s не разобрана: %s",
+                                 lead_id, exc)
+                async with pool.acquire() as conn:
+                    await _amocrm_mark_event_action(conn, journal_key, "error",
+                                                    error=str(exc)[:500])
+                count("ошибка")
+
+    logger.info("Обмен, недельные лиды за %s дней: %s",
+                WEEKLY_LEADS_PERIOD_DAYS, counters or "ничего не было")
+    if counters and ADMIN_TG_IDS:
+        lines = ["🔄 Лиды из amoCRM за неделю:"]
+        for action, total in sorted(counters.items(), key=lambda item: -item[1]):
+            lines.append(f"   • {EXCHANGE_ACTION_WORDS.get(action, action)}: {total}")
+        for admin_id in ADMIN_TG_IDS:
+            try:
+                await bot.send_message(admin_id, "\n".join(lines))
+            except Exception:                 # noqa: BLE001
+                logger.warning("Не удалось отправить отчёт по недельным лидам")
 
 
 async def _amocrm_poll_unsorted_once(client: AmoCRMAPIClient) -> None:
@@ -5192,7 +5290,8 @@ async def build_exchange_daily_summary_text() -> str:
             """
             SELECT action, count(*) AS total
             FROM amocrm_api_events
-            WHERE event_type IN ('exchange_status', 'exchange_rehearsal')
+            WHERE event_type IN ('exchange_status', 'exchange_rehearsal',
+                                 'exchange_weekly_leads')
               AND processed_at >= $1
             GROUP BY action
             ORDER BY count(*) DESC
@@ -13547,7 +13646,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Выберите действие на клавиатуре ниже.", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, weekly_leads_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     dp["pool"] = pool
@@ -13607,6 +13706,12 @@ async def main():
     if dead_channels_cleanup_task is None:
         dead_channels_cleanup_task = asyncio.create_task(
             schedule_periodic_job(7 * 24 * 3600, clear_dead_channels_weekly, "dead_channels_cleanup")
+        )
+    if weekly_leads_task is None and AMOCRM_EXCHANGE_ENABLED:
+        # Планируем ежедневно, а внутри задача сама пропускает всё, кроме
+        # понедельника: так расписание остаётся в одном месте с остальными.
+        weekly_leads_task = asyncio.create_task(
+            schedule_daily_job(10, 0, run_weekly_leads_exchange, "weekly_leads")
         )
     if client_bot_health_task is None:
         client_bot_health_task = asyncio.create_task(

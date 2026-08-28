@@ -13,12 +13,14 @@
 """
 
 import unittest
+from datetime import datetime, timedelta
 
 from notifications.amo_exchange import (
     ExistingClient,
     IncomingClient,
     decide_exchange,
     incoming_from_amo,
+    is_weekly_leads_day,
     outcome_of_event,
 )
 
@@ -238,6 +240,18 @@ class OutcomeFromEventTests(unittest.TestCase):
 
     def test_broken_event_does_not_crash(self):
         self.assertIsNone(outcome_of_event({"value_after": [None, {}]}))
+
+
+class WeeklyLeadsDayTests(unittest.TestCase):
+    """Отказные заводятся пачкой по понедельникам — решение владельца."""
+
+    def test_monday_is_the_day(self):
+        self.assertTrue(is_weekly_leads_day(datetime(2026, 8, 31)))   # понедельник
+
+    def test_other_days_are_not(self):
+        for day in range(1, 7):                                       # вт–вс
+            moment = datetime(2026, 8, 31) + timedelta(days=day)
+            self.assertFalse(is_weekly_leads_day(moment), moment.strftime("%A"))
 
 
 if __name__ == "__main__":
