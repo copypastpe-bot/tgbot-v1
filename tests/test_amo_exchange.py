@@ -19,7 +19,7 @@ from notifications.amo_exchange import (
     IncomingClient,
     decide_exchange,
     incoming_from_amo,
-    outcome_of_lead,
+    outcome_of_event,
 )
 
 
@@ -203,17 +203,41 @@ class ParseAmoTests(unittest.TestCase):
         self.assertIsNone(incoming.address)
         self.assertIsNone(incoming.service)
 
-    def test_outcome_won_and_lost(self):
-        self.assertEqual(outcome_of_lead(self.LEAD), "won")
-        self.assertEqual(outcome_of_lead({**self.LEAD, "status_id": 143}), "lost")
 
-    def test_other_pipeline_is_not_our_business(self):
-        """Воронка реализации и ковры обменом не занимаются."""
-        self.assertIsNone(outcome_of_lead({**self.LEAD, "pipeline_id": 7108250}))
+class OutcomeFromEventTests(unittest.TestCase):
+    """Разбор события смены этапа.
 
-    def test_intermediate_status_is_not_an_outcome(self):
-        """«Новый лид» — сделка ещё в работе, закрытием это не считается."""
-        self.assertIsNone(outcome_of_lead({**self.LEAD, "status_id": 41463535}))
+    Форма события взята с живого аккаунта 2026-08-28: amoCRM кладёт в
+    `value_after` новый статус вместе с воронкой, поэтому чужие сделки видно
+    сразу, без запроса карточки.
+    """
+
+    def _event(self, status_id, pipeline_id=4482751):
+        return {
+            "id": "abc",
+            "type": "lead_status_changed",
+            "entity_id": 31570885,
+            "value_after": [{"lead_status": {"id": status_id,
+                                             "pipeline_id": pipeline_id}}],
+        }
+
+    def test_won_is_recognised(self):
+        self.assertEqual(outcome_of_event(self._event(142)), "won")
+
+    def test_lost_is_recognised(self):
+        self.assertEqual(outcome_of_event(self._event(143)), "lost")
+
+    def test_other_pipeline_is_ignored(self):
+        self.assertIsNone(outcome_of_event(self._event(142, pipeline_id=7108250)))
+
+    def test_intermediate_status_is_ignored(self):
+        self.assertIsNone(outcome_of_event(self._event(41463535)))
+
+    def test_event_without_value_after_is_ignored(self):
+        self.assertIsNone(outcome_of_event({"id": "abc", "entity_id": 1}))
+
+    def test_broken_event_does_not_crash(self):
+        self.assertIsNone(outcome_of_event({"value_after": [None, {}]}))
 
 
 if __name__ == "__main__":

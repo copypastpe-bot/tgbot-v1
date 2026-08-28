@@ -113,19 +113,23 @@ def decide_exchange(*, outcome: str, incoming: IncomingClient,
     return ExchangeDecision("update", fields=updates, reason="дописал недостающее")
 
 
-def outcome_of_lead(lead: dict) -> Optional[str]:
-    """Чем закончилась сделка: `won`, `lost` или None.
+def outcome_of_event(event: dict) -> Optional[str]:
+    """Чем закончилась сделка — по самому событию, без запроса в CRM.
 
-    None — сделка не из первичной воронки (реализация, ковры) либо ещё в работе.
-    Такие обмену не интересны.
+    amoCRM присылает в событии смены этапа новый статус и воронку, поэтому
+    чужие сделки отсеиваются даром. Это не оптимизация ради красоты: событий
+    смены этапа за сутки сотни (каждое движение каждой сделки), и запрашивать
+    по каждому карточку значило бы жечь лимиты API впустую.
     """
-    if int(lead.get("pipeline_id") or 0) != AMO_PIPELINE_PRIMARY:
-        return None
-    status_id = int(lead.get("status_id") or 0)
-    if status_id == AMO_STATUS_WON:
-        return "won"
-    if status_id == AMO_STATUS_LOST:
-        return "lost"
+    for item in event.get("value_after") or []:
+        status = (item or {}).get("lead_status") or {}
+        if int(status.get("pipeline_id") or 0) != AMO_PIPELINE_PRIMARY:
+            continue
+        status_id = int(status.get("id") or 0)
+        if status_id == AMO_STATUS_WON:
+            return "won"
+        if status_id == AMO_STATUS_LOST:
+            return "lost"
     return None
 
 
@@ -181,5 +185,5 @@ __all__ = [
     "IncomingClient",
     "decide_exchange",
     "incoming_from_amo",
-    "outcome_of_lead",
+    "outcome_of_event",
 ]

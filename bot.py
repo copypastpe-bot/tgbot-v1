@@ -143,7 +143,7 @@ from notifications.amo_exchange import (
     ExistingClient,
     decide_exchange,
     incoming_from_amo,
-    outcome_of_lead,
+    outcome_of_event,
 )
 from notifications.amocrm_api import (
     AmoCRMAPIAuthError,
@@ -1669,6 +1669,14 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
         if not lead_id:
             continue
 
+        # Чужие сделки отсеиваем по самому событию: в нём уже есть новый статус
+        # и воронка. Событий смены этапа за сутки сотни, и тянуть карточку по
+        # каждому значило бы жечь лимиты API впустую.
+        outcome = outcome_of_event(event)
+        if outcome is None:
+            count("не наша сделка")
+            continue
+
         async with pool.acquire() as conn:
             inserted = await conn.fetchval(
                 """
@@ -1688,15 +1696,11 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
             continue                          # это событие уже разбирали
 
         try:
+            # Карточка нужна только ради полей заказа: чем закончилась сделка,
+            # уже сказало событие. Проверять статус ещё и здесь нельзя — сделку
+            # могли передвинуть дальше, но заказ-то оформлялся, и клиент должен
+            # попасть в базу.
             lead = await client.fetch_lead(lead_id)
-            outcome = outcome_of_lead(lead)
-            if outcome is None:
-                async with pool.acquire() as conn:
-                    await _amocrm_mark_event_action(conn, f"exchange:{event_id}",
-                                                    "ignored")
-                count("не наша сделка")
-                continue
-
             contact = await _amocrm_fetch_first_contact(
                 client, normalize_lead(lead).contact_ids)
             incoming = incoming_from_amo(lead, contact,
