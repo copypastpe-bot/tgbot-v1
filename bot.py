@@ -1065,6 +1065,48 @@ async def ensure_amocrm_api_schema(conn: asyncpg.Connection) -> None:
     )
 
 
+async def ensure_client_messaging_schema(conn: asyncpg.Connection) -> None:
+    """Ожидания подтверждения заказа: по одной строке на сделку.
+
+    Ключ — сделка amoCRM, а не клиент: у клиента бывает два заказа подряд,
+    и ответ «Да» должен подтвердить тот, о котором спросили последним.
+
+    Репетиция сюда не пишет. Строка означает «этой сделкой робот уже занялся»;
+    появись она в репетиции — боевой запуск увидел бы её и промолчал, решив,
+    что вопрос давно задан.
+    """
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_confirmations (
+            lead_id      bigint PRIMARY KEY,      -- сделка воронки реализации
+            client_id    bigint,                  -- clients.id, если клиент найден
+            phone_digits text NOT NULL,           -- по нему ищем ответ клиента
+            order_at     timestamptz,             -- когда работа
+            status       text NOT NULL,           -- planned|asked|confirmed|refused|owner_notified
+            outbox_id    bigint,                  -- письмо-вопрос в очереди: по нему видно, ушло ли оно
+            asked_at     timestamptz,             -- когда ушёл вопрос
+            answered_at  timestamptz,
+            answer_text  text,
+            notified_at  timestamptz,             -- когда позвали владельца
+            created_at   timestamptz NOT NULL DEFAULT NOW(),
+            updated_at   timestamptz NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_confirmations_phone
+        ON order_confirmations(phone_digits, status);
+        """
+    )
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_confirmations_asked
+        ON order_confirmations(status, asked_at);
+        """
+    )
+
+
 async def _amocrm_get_cursor(conn: asyncpg.Connection, stream: str, default_created_at: int) -> int:
     value = await conn.fetchval(
         "SELECT cursor_created_at FROM amocrm_api_state WHERE stream=$1",
@@ -13691,6 +13733,7 @@ async def main():
         await ensure_onlinepbx_schema(_conn)
         await ensure_amocrm_webhook_schema(_conn)
         await ensure_amocrm_api_schema(_conn)
+        await ensure_client_messaging_schema(_conn)
         await ensure_cleaning_schema(_conn)
     await set_commands()
     if daily_reports_task is None:
