@@ -226,6 +226,10 @@ AMOCRM_NEW_LEAD_STATUS_ID = _env_int("AMOCRM_NEW_LEAD_STATUS_ID", 0)
 AMOCRM_POLL_INTERVAL_SEC = max(10, _env_int("AMOCRM_POLL_INTERVAL_SEC", 30))
 AMOCRM_UNANSWERED_DELAY_SEC = max(60, _env_int("AMOCRM_UNANSWERED_DELAY_SEC", 600))
 AMOCRM_LOOKBACK_MINUTES = max(1, _env_int("AMOCRM_LOOKBACK_MINUTES", 30))
+# Автообмен amoCRM -> база бота. Умолчания намеренно осторожные: функция
+# выключена, а если её включат — сперва репетиция, без единой записи в базу.
+AMOCRM_EXCHANGE_ENABLED = _env_int("AMOCRM_EXCHANGE_ENABLED", 0) == 1
+AMOCRM_EXCHANGE_DRY_RUN = _env_int("AMOCRM_EXCHANGE_DRY_RUN", 1) == 1
 ONLINEPBX_ALLOWED_IPS = {
     ip.strip()
     for ip in re.split(r"[ ,;]+", os.getenv("ONLINEPBX_ALLOWED_IPS", "").strip())
@@ -1687,6 +1691,9 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
             lead = await client.fetch_lead(lead_id)
             outcome = outcome_of_lead(lead)
             if outcome is None:
+                async with pool.acquire() as conn:
+                    await _amocrm_mark_event_action(conn, f"exchange:{event_id}",
+                                                    "ignored")
                 count("не наша сделка")
                 continue
 
@@ -1704,11 +1711,19 @@ async def _amocrm_poll_exchange_once(client: AmoCRMAPIClient, *,
                     logger.info(
                         "Обмен (репетиция): сделка %s, %s -> %s (%s)",
                         lead_id, outcome, decision.action, decision.reason)
-                    count(f"репетиция: {decision.action}")
+                    result = f"rehearsal_{decision.action}"
                 else:
-                    count(await _exchange_apply(conn, decision, existing))
+                    result = await _exchange_apply(conn, decision, existing)
+                # Отметка в журнале, а не в памяти: отчёт переживает перезапуск,
+                # и всегда видно, что робот сделал по каждой сделке.
+                await _amocrm_mark_event_action(conn, f"exchange:{event_id}",
+                                                result, error=decision.reason or None)
+            count(result)
         except Exception as exc:              # noqa: BLE001 — сделка не роняет проход
             logger.exception("Обмен: сделка %s не разобрана: %s", lead_id, exc)
+            async with pool.acquire() as conn:
+                await _amocrm_mark_event_action(conn, f"exchange:{event_id}",
+                                                "error", error=str(exc)[:500])
             count("ошибка")
 
     async with pool.acquire() as conn:
@@ -2028,6 +2043,11 @@ async def amocrm_api_polling_loop() -> None:
                 await _amocrm_poll_unsorted_once(client)
                 await _amocrm_poll_chat_events_once(client)
                 await _amocrm_notify_due_unanswered_once(client)
+                if AMOCRM_EXCHANGE_ENABLED:
+                    counters = await _amocrm_poll_exchange_once(
+                        client, dry_run=AMOCRM_EXCHANGE_DRY_RUN)
+                    if counters:
+                        logger.info("Обмен amoCRM: %s", counters)
             except AmoCRMAPIAuthError as exc:
                 logger.error("amoCRM API auth failed; polling stopped: %s", exc)
                 return
@@ -5115,6 +5135,51 @@ async def _mark_daily_job_run(conn: asyncpg.Connection, job_name: str, now_utc: 
     )
 
 
+# Внутренние отметки журнала обмена → слова, понятные без объяснений.
+EXCHANGE_ACTION_WORDS: dict[str, str] = {
+    "create_client": "заведено клиентов",
+    "create_lead": "заведено лидов",
+    "update": "дописано в карточки",
+    "skip": "без изменений",
+    "ignored": "сделки не нашей воронки",
+    "error": "ошибок — повторю",
+    "rehearsal_create_client": "репетиция: завёл бы клиентов",
+    "rehearsal_create_lead": "репетиция: завёл бы лидов",
+    "rehearsal_update": "репетиция: дописал бы в карточки",
+    "rehearsal_skip": "репетиция: без изменений",
+}
+
+
+async def build_exchange_daily_summary_text() -> str:
+    """Что автообмен сделал с базой за сутки.
+
+    Считаем по журналу событий, а не по счётчикам в памяти: отчёт переживает
+    перезапуск службы и не врёт после сбоя.
+    """
+    if pool is None:
+        return ""
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT action, count(*) AS total
+            FROM amocrm_api_events
+            WHERE event_type = 'exchange_status' AND processed_at >= $1
+            GROUP BY action
+            ORDER BY count(*) DESC
+            """,
+            since,
+        )
+    if not rows:
+        return "🔄 Обмен с amoCRM: закрытых сделок за сутки не было."
+
+    lines = ["🔄 Обмен с amoCRM за сутки:"]
+    for row in rows:
+        word = EXCHANGE_ACTION_WORDS.get(row["action"], row["action"])
+        lines.append(f"   • {word}: {row['total']}")
+    return "\n".join(lines)
+
+
 async def send_daily_reports() -> None:
     if pool is None:
         return
@@ -5127,6 +5192,8 @@ async def send_daily_reports() -> None:
         cash_text = await build_daily_cash_summary_text()
         profit_text = await build_profit_summary_text()
         orders_text = await build_daily_orders_admin_summary_text()
+        if AMOCRM_EXCHANGE_ENABLED:
+            orders_text = f"{orders_text}\n\n{await build_exchange_daily_summary_text()}"
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to build daily reports: %s", exc)
         return
