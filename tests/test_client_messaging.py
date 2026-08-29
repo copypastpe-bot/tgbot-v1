@@ -14,6 +14,7 @@
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from notifications.client_messaging import (
     AMO_PIPELINE_REALIZATION,
@@ -335,6 +336,34 @@ class OwnerAlertTests(unittest.TestCase):
         heads = {self._text(kind).splitlines()[0]
                  for kind in ("refused", "unclear", "silence")}
         self.assertEqual(len(heads), 3)
+
+
+class LetterTextsTests(unittest.TestCase):
+    """Ключи писем, которые бот ставит в очередь, должны существовать в файле
+    текстов. Разойдись они — робот падал бы прямо в разговоре с клиентом,
+    и узнали бы мы об этом от клиента, а не от тестов."""
+
+    KEYS = ("order_created", "order_confirm_request", "order_confirmed_thanks")
+
+    def test_all_letters_exist(self):
+        from notifications.rules import load_notification_rules
+
+        rules = load_notification_rules(
+            Path(__file__).resolve().parent.parent / "docs" / "notification_rules.json")
+        for key in self.KEYS:
+            event = rules.get_event(key)
+            self.assertTrue(event.template.strip(), key)
+            self.assertEqual(event.recipient, "client", key)
+
+    def test_confirmation_letter_asks_for_one_word(self):
+        """Разбор ответа читает первое слово — письмо обязано об этом просить."""
+        from notifications.rules import load_notification_rules
+
+        rules = load_notification_rules(
+            Path(__file__).resolve().parent.parent / "docs" / "notification_rules.json")
+        template = rules.get_event("order_confirm_request").template.lower()
+        self.assertIn("одним словом", template)
+        self.assertIn("да/нет", template)
 
 
 if __name__ == "__main__":

@@ -3464,6 +3464,19 @@ async def _confirmation_accept(pending: Mapping[str, Any], answer_text: str) -> 
             lead_id,
             answer_text[:1000],
         )
+        # Клиент написал человеку — человек отвечает. Молчание в ответ на «Да»
+        # выглядит как «не дошло», и клиент пишет снова. Идёт независимо от CRM:
+        # сделка — наша забота, а он свою часть выполнил.
+        if not CLIENT_MESSAGING_DRY_RUN and notification_rules is not None \
+                and pending.get("client_id"):
+            try:
+                await enqueue_notification(conn, notification_rules,
+                                           event_key="order_confirmed_thanks",
+                                           client_id=int(pending["client_id"]),
+                                           payload={})
+            except Exception as exc:  # noqa: BLE001 — подтверждение уже принято
+                logger.warning("Не отправил клиенту благодарность по лиду %s: %s",
+                               lead_id, exc)
 
     if failure:
         order_at = _confirmation_order_at_msk(pending)

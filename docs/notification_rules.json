@@ -43,6 +43,17 @@
       ]
     },
     {
+      "key": "order_confirmed_thanks",
+      "name": "Ответ клиенту на подтверждение заказа",
+      "recipient": "client",
+      "condition": null,
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Спасибо. Специалист позвонит за 30 минут до приезда.",
+      "variables": []
+    },
+    {
       "key": "order_completed_wire_pending",
       "name": "Заказ выполнен (ожидает оплату по р/с)",
       "recipient": "client",
