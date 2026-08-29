@@ -20,6 +20,19 @@ Infra map (canonical, token-light): /Users/evgenijpastusenko/Projects/agent1/doc
 8. `notifications/`
 9. `crm/wahelp_service.py`
 
+## Related Project
+
+`raketa-admin-bot` (`~/Projects/raketa-admin-bot`) is a separate owner-only admin bot:
+its own repository, its own systemd service on the same VPS, its own rules — notably
+"never write to this bot's tables". Its context lives at
+`/Users/evgenijpastusenko/Projects/agent1/project_ai_context/raketa-admin-bot/`.
+
+**Start the session in the directory of the project you are about to change.** The working
+directory decides which project rules load, where git commands land, and which context
+files get updated at session close. `tgbot-v1` is the main project; work on the admin bot
+belongs in its own session, not here. Do not merge the two memories: their rules differ,
+and mixing them will eventually put a rule where it does not belong.
+
 ## Central Context
 
 This project uses central agent memory outside the current repository.
