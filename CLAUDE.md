@@ -20,7 +20,11 @@ Infra map (canonical, token-light): /Users/evgenijpastusenko/Projects/agent1/doc
 8. `notifications/`
 9. `crm/wahelp_service.py`
 
-## Related Project
+## Related Projects
+
+`smm-autopost` (`~/Projects/smm-autopost`) — third project, created 2026-08-29: auto-posting
+of media from cleaning jobs to social networks. Different server (Contabo), no shared data
+with this bot. Context: `agent1/project_ai_context/smm-autopost/`.
 
 `raketa-admin-bot` (`~/Projects/raketa-admin-bot`) is a separate owner-only admin bot:
 its own repository, its own systemd service on the same VPS, its own rules — notably
