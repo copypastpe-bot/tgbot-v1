@@ -283,6 +283,53 @@ class AmoCRMAlertRulesTests(unittest.TestCase):
             )
         )
 
+    def test_skips_placed_order(self):
+        """Заказ, перенесённый роботом из календаря, — не заявка: звать
+        владельца некого. За неделю до 2026-08-29 такие сделки давали
+        30 уведомлений из 57."""
+        lead = AmoCRMLead(
+            lead_id=123,
+            name="Заказ 29.08 — Дмитрий",
+            pipeline_id=55,
+            status_id=777,
+            created_at=100,
+            contact_ids=[10],
+            payload={},
+        )
+
+        self.assertTrue(
+            should_skip_new_lead_alert(
+                lead,
+                target_pipeline_id=55,
+                new_lead_status_id=777,
+                notes=[],
+                order_placed=True,
+            )
+        )
+
+    def test_placed_order_is_skipped_even_after_the_stage_moved(self):
+        """Робот двигает лид в «Передано в работу» за секунду: к моменту опроса
+        статус уже не «Новый лид», и старая проверка звонка тут не спасала."""
+        lead = AmoCRMLead(
+            lead_id=123,
+            name="Заказ 29.08 — Дмитрий",
+            pipeline_id=55,
+            status_id=142,
+            created_at=100,
+            contact_ids=[10],
+            payload={},
+        )
+
+        self.assertTrue(
+            should_skip_new_lead_alert(
+                lead,
+                target_pipeline_id=55,
+                new_lead_status_id=777,
+                notes=[],
+                order_placed=True,
+            )
+        )
+
     def test_formats_unanswered_message_alert(self):
         alert = AmoCRMAlert(
             alert_type="unanswered_message",

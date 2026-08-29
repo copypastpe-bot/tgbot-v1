@@ -144,12 +144,14 @@ from notifications.amo_exchange import (
     ExistingClient,
     IncomingClient,
     decide_exchange,
+    field_values,
     incoming_from_amo,
     is_weekly_leads_day,
     outcome_of_event,
     prefer_deal_fields,
 )
 from notifications.client_messaging import (
+    AMO_FIELD_ORDER_DATETIME,
     AMO_PIPELINE_REALIZATION,
     AMO_STAGE_CONFIRMED,
     PENDING_TTL_AFTER_ORDER,
@@ -1679,14 +1681,22 @@ async def _amocrm_poll_new_leads_once(client: AmoCRMAPIClient) -> None:
                     await _amocrm_mark_event_action(conn, event_id, "ignored", error="lead already notified")
                     continue
             notes = await client.fetch_lead_notes(lead.lead_id) if lead.status_id == AMOCRM_NEW_LEAD_STATUS_ID else []
+            # Оформленный заказ узнаём по дате работы в лиде и по дочерней
+            # сделке: и то, и другое ставит робот владельца, когда переносит
+            # запись из календаря. Такому лиду хозяин уже нашёлся.
+            order_placed = bool(field_values(lead_payload, AMO_FIELD_ORDER_DATETIME)) \
+                or child_deal_id(notes) is not None
             if should_skip_new_lead_alert(
                 lead,
                 target_pipeline_id=AMOCRM_PIPELINE_ID,
                 new_lead_status_id=AMOCRM_NEW_LEAD_STATUS_ID,
                 notes=notes,
+                order_placed=order_placed,
             ):
                 async with pool.acquire() as conn:
-                    await _amocrm_mark_event_action(conn, event_id, "ignored")
+                    await _amocrm_mark_event_action(
+                        conn, event_id, "ignored",
+                        error="оформленный заказ, а не заявка" if order_placed else None)
                 continue
 
             contact = await _amocrm_fetch_first_contact(client, lead.contact_ids)

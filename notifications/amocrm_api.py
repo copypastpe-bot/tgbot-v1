@@ -314,8 +314,18 @@ def should_skip_new_lead_alert(
     new_lead_status_id: int,
     notes: list[Mapping[str, Any]],
     accepted_call_min_duration_sec: int | None = None,
+    order_placed: bool = False,
 ) -> bool:
+    """Звать ли владельца к этой сделке.
+
+    `order_placed` — в лиде уже стоит дата работы или заведена дочерняя сделка.
+    Значит это не заявка, а оформленный заказ, который робот перенёс из
+    календаря: звать к нему некого и незачем. За неделю до 2026-08-29 такие
+    сделки давали 30 уведомлений из 57 — больше половины шума.
+    """
     if lead.pipeline_id != target_pipeline_id:
+        return True
+    if order_placed:
         return True
     if lead.status_id != new_lead_status_id:
         return False
