@@ -6332,8 +6332,14 @@ async def run_birthday_jobs() -> None:
         if not await _should_run_daily_job(conn, "birthday_jobs", now_utc):
             logger.info("birthday_jobs already run today, skipping")
             return
-        accrued, accrual_errors, refresh_expired = await _accrue_birthday_bonuses(conn)
+        # Сгорание идёт ПЕРВЫМ, и менять порядок нельзя. Начисление подарка тут же
+        # берёт баланс для поздравления, а сгорание меняет его через доли секунды:
+        # при обратном порядке письмо уносило цифру, прожившую 80 миллисекунд.
+        # Так 329 клиентов получили поздравления с завышенным балансом — Дарья
+        # (клиент 1268) увидела в письме 560 вместо 300 и пришла спрашивать,
+        # куда делись 260 бонусов (2026-08-29).
         expired, expire_errors = await _expire_old_bonuses(conn)
+        accrued, accrual_errors, refresh_expired = await _accrue_birthday_bonuses(conn)
         yesterday = datetime.now(MOSCOW_TZ).date() - timedelta(days=1)
         start_local = datetime.combine(yesterday, time.min, tzinfo=MOSCOW_TZ)
         end_local = start_local + timedelta(days=1)
