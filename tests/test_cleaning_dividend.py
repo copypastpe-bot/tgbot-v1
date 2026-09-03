@@ -55,8 +55,10 @@ class SplitTests(unittest.TestCase):
         """Копейка, потерянная при делении, — это расхождение кассы с чатом."""
         self.assertIsNone(split_equally(Decimal("10000"), 3))
 
-    def test_largest_divisible_not_above(self):
-        self.assertEqual(largest_divisible_not_above(Decimal("10000"), 3), Decimal("9999.99"))
+    def test_hint_is_in_whole_roubles(self):
+        """Подсказка идёт на руки наличными — копейки в ней бесполезны."""
+        self.assertEqual(largest_divisible_not_above(Decimal("10000"), 3), Decimal("9999"))
+        self.assertEqual(largest_divisible_not_above(Decimal("10000.50"), 3), Decimal("9999"))
         self.assertEqual(largest_divisible_not_above(Decimal("9999"), 3), Decimal("9999"))
         self.assertEqual(largest_divisible_not_above(Decimal("0.01"), 3), Decimal("0"))
 

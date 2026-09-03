@@ -56,12 +56,13 @@ def split_equally(total: Decimal, count: int) -> list[Decimal] | None:
 def largest_divisible_not_above(total: Decimal, count: int) -> Decimal:
     """Ближайшая сумма не больше введённой, которая делится нацело.
 
-    Нужна для подсказки: «введите 9 999» понятнее, чем «сумма не делится».
+    Считаем в целых рублях: деньги выдаются наличными, и подсказка
+    «9 999» полезнее, чем «9 999.99» — копейки на руки никто не выдаёт.
     """
-    if count <= 0:
+    if count <= 0 or total <= 0:
         return Decimal("0")
-    kopecks = _to_kopecks(total)
-    return (Decimal(kopecks - kopecks % count) / 100).quantize(KOPECKS)
+    rubles = int(total)
+    return Decimal(rubles - rubles % count)
 
 
 def check_payout(
