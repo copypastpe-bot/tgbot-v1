@@ -36,6 +36,7 @@ from notifications.client_messaging import (
     prefer_deal_details,
     should_call_owner,
     should_move_deal,
+    should_report_unasked,
 )
 
 MSK = timezone(timedelta(hours=3))
@@ -426,11 +427,58 @@ class OwnerAlertTests(unittest.TestCase):
         self.assertIn("не ответил", text.lower())
         self.assertIn("+79001234567", text)
 
+    def test_unasked_alert_says_the_question_never_went_out(self):
+        """Разница со «сторожем молчунов» принципиальная: там клиент молчит,
+        здесь его никто и не спрашивал. Спутай робот эти две беды — владелец
+        стал бы звонить клиенту с претензией на пустом месте."""
+        text = owner_alert_text(kind="not_asked", name="Дарья",
+                                phone="+79001234567", order_at=self.ORDER_AT,
+                                answer_text=None, lead_link=None,
+                                reason="amoCRM не ответила")
+        self.assertIn("не ушёл", text)
+        self.assertIn("amoCRM не ответила", text)
+        self.assertIn("+79001234567", text)
+
     def test_kinds_are_distinguishable(self):
         """Владелец должен с первой строки понимать, что случилось."""
         heads = {self._text(kind).splitlines()[0]
-                 for kind in ("refused", "unclear", "silence")}
-        self.assertEqual(len(heads), 3)
+                 for kind in ("refused", "unclear", "silence", "not_asked")}
+        self.assertEqual(len(heads), 4)
+
+
+class UnaskedQuestionTests(unittest.TestCase):
+    """Письмо-вопрос может умереть, так и не уйдя: CRM молчала все попытки
+    или мессенджер не принял письмо. Раньше владелец узнавал об этом через
+    сторож молчунов — с враньём в тексте («клиент не ответил»). Теперь
+    отдельный сигнал, и говорит он правду."""
+
+    def test_dead_letter_calls_the_owner(self):
+        self.assertTrue(should_report_unasked(letter_status="failed",
+                                              asked_sent_at=None, notified_at=None))
+
+    def test_letter_still_trying_is_not_a_reason_to_call(self):
+        for status in ("pending", "sending", "sent"):
+            self.assertFalse(should_report_unasked(letter_status=status,
+                                                   asked_sent_at=None,
+                                                   notified_at=None), status)
+
+    def test_cancelled_letter_is_not_a_reason_to_call(self):
+        """Отменённое письмо — осознанное решение робота: заказа больше нет.
+        Звать владельца к несостоявшемуся событию он не должен."""
+        self.assertFalse(should_report_unasked(letter_status="cancelled",
+                                               asked_sent_at=None, notified_at=None))
+
+    def test_sent_question_is_not_this_branch(self):
+        sent_at = datetime(2026, 9, 7, 10, 0, tzinfo=MSK)
+        self.assertFalse(should_report_unasked(letter_status="failed",
+                                               asked_sent_at=sent_at,
+                                               notified_at=None))
+
+    def test_owner_is_called_only_once(self):
+        called_at = datetime(2026, 9, 7, 10, 0, tzinfo=MSK)
+        self.assertFalse(should_report_unasked(letter_status="failed",
+                                               asked_sent_at=None,
+                                               notified_at=called_at))
 
 
 class LetterTextsTests(unittest.TestCase):

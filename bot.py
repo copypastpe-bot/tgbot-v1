@@ -171,6 +171,7 @@ from notifications.client_messaging import (
     prefer_deal_details,
     should_call_owner,
     should_move_deal,
+    should_report_unasked,
 )
 from notifications.amocrm_api import (
     AmoCRMAPIAuthError,
@@ -501,6 +502,7 @@ exchange_task: asyncio.Task | None = None          # обмен amoCRM -> баз
 weekly_leads_task: asyncio.Task | None = None      # понедельничные лиды из amoCRM
 client_messaging_task: asyncio.Task | None = None  # письма клиенту до работы
 confirmation_watch_task: asyncio.Task | None = None  # сторож молчунов
+unasked_watch_task: asyncio.Task | None = None       # сторож незаданных вопросов
 client_bot_health_task: asyncio.Task | None = None
 amocrm_api_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
@@ -2321,6 +2323,76 @@ async def _confirmation_after_send(conn: asyncpg.Connection,
         """,
         entry.id,
     )
+
+
+async def run_unasked_question_watch() -> None:
+    """Письмо-вопрос умерло, так и не уйдя клиенту — зовём владельца.
+
+    Заказ остаётся неподтверждённым, и робот по нему больше ничего не сделает:
+    ждать ответа не на что, сторож молчунов такие заказы не видит (вопроса
+    не было). Промолчать здесь значило бы оставить владельца в уверенности,
+    что робот заказ ведёт.
+
+    Отменённые письма сюда не попадают: отмена — осознанное решение робота
+    («заказа больше нет в CRM»), и владельца к ней не зовут.
+
+    Ходит тем же ритмом, что и сторож молчунов: сигнал опаздывает максимум
+    на десять минут.
+    """
+    if not CLIENT_MESSAGING_ENABLED or pool is None:
+        return
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT oc.lead_id, oc.deal_id, oc.order_at, oc.asked_sent_at,
+                   oc.notified_at, oc.phone_digits, o.status AS letter_status,
+                   o.last_error, c.full_name, c.phone
+            FROM order_confirmations oc
+            JOIN notification_outbox o ON o.id = oc.outbox_id
+            LEFT JOIN clients c ON c.id = oc.client_id
+            WHERE oc.status = 'planned'
+              AND oc.asked_sent_at IS NULL
+              AND oc.notified_at IS NULL
+              AND o.status = 'failed'
+            ORDER BY oc.asked_at
+            LIMIT 50
+            """
+        )
+
+    called = 0
+    for row in rows:
+        # Запрос уже сузил выборку, но решение принимает правило: разойдись
+        # они однажды — молчаливо победил бы SQL, а он тестами не покрыт.
+        if not should_report_unasked(letter_status=str(row["letter_status"]),
+                                     asked_sent_at=row["asked_sent_at"],
+                                     notified_at=row["notified_at"]):
+            continue
+        await _confirmation_notify_owner(owner_alert_text(
+            kind="not_asked",
+            name=row["full_name"],
+            phone=_confirmation_owner_phone(row),
+            order_at=_confirmation_order_at_msk(row),
+            answer_text=None,
+            lead_link=_confirmation_link(row),
+            reason=(row["last_error"] or "письмо не удалось отправить"),
+        ))
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE order_confirmations
+                SET status = 'owner_notified',
+                    notified_at = NOW(),
+                    updated_at = NOW()
+                WHERE lead_id = $1
+                """,
+                row["lead_id"],
+            )
+        called += 1
+
+    if called:
+        logger.info("Разговор с клиентом: позвал владельца к %s незаданным вопросам",
+                    called)
 
 
 async def run_confirmation_silence_watch() -> None:
@@ -14446,7 +14518,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Выберите действие на клавиатуре ниже.", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, exchange_task, weekly_leads_task, client_messaging_task, confirmation_watch_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, exchange_task, weekly_leads_task, client_messaging_task, confirmation_watch_task, unasked_watch_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     dp["pool"] = pool
@@ -14531,6 +14603,12 @@ async def main():
             schedule_periodic_job(CLIENT_MESSAGING_INTERVAL_SEC,
                                   run_confirmation_silence_watch,
                                   "confirmation_silence")
+        )
+    if unasked_watch_task is None and CLIENT_MESSAGING_ENABLED:
+        unasked_watch_task = asyncio.create_task(
+            schedule_periodic_job(CLIENT_MESSAGING_INTERVAL_SEC,
+                                  run_unasked_question_watch,
+                                  "confirmation_unasked")
         )
     if client_bot_health_task is None:
         client_bot_health_task = asyncio.create_task(

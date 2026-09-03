@@ -107,6 +107,26 @@ def should_call_owner(*, asked_sent_at: Optional[datetime],
     return now - asked_sent_at >= SILENCE_LIMIT
 
 
+def should_report_unasked(*, letter_status: str,
+                          asked_sent_at: Optional[datetime],
+                          notified_at: Optional[datetime]) -> bool:
+    """Пора ли сказать владельцу, что вопрос клиенту задать не удалось.
+
+    Письмо-вопрос может умереть, так и не уйдя: amoCRM молчала все попытки
+    проверки или мессенджер не принял письмо. Молчать здесь нельзя — заказ
+    остаётся неподтверждённым, а робот больше ничего по нему не сделает.
+
+    Отменённое письмо (`cancelled`) сюда не относится: это осознанное решение
+    робота — заказа больше нет в CRM, и звать владельца к несостоявшемуся
+    событию он не должен (решение владельца 2026-09-03).
+
+    Зовём ровно один раз, как и к молчунам.
+    """
+    if asked_sent_at is not None or notified_at is not None:
+        return False
+    return letter_status == "failed"
+
+
 def child_deal_id(notes: list[Mapping[str, Any]]) -> Optional[int]:
     """Дочерняя сделка, заведённая роботом владельца, — по примечанию лида.
 
@@ -294,18 +314,23 @@ _ALERT_HEADS = {
     "refused": "❗️ Клиент отказался от заказа",
     "unclear": "❓ Клиент ответил не «да» и не «нет»",
     "silence": "🔕 Клиент не ответил на подтверждение",
+    "not_asked": "⚠️ Вопрос клиенту задать не удалось",
 }
 
 
 def owner_alert_text(*, kind: str, name: Optional[str], phone: Optional[str],
                      order_at: Optional[datetime], answer_text: Optional[str],
-                     lead_link: Optional[str]) -> str:
+                     lead_link: Optional[str], reason: Optional[str] = None) -> str:
     """Сообщение владельцу: что случилось, с кем и куда звонить.
 
     Телефон целиком и дата заказа — решение владельца 2026-08-26: бот приватный,
     получатель у него один, и ему нужно позвонить клиенту, не открывая CRM.
     Ответ клиента приводится дословно: пересказ непонятого и есть то самое
     угадывание, которого робот избегает.
+
+    «Клиент молчит» и «вопрос не ушёл» — разные беды, и путать их нельзя:
+    в первом случае владелец звонит клиенту, во втором клиент вообще не в курсе,
+    что его о чём-то спрашивали.
     """
     lines = [_ALERT_HEADS.get(kind, "❗️ Заказ требует внимания")]
     lines.append(f"Клиент: {name or 'без имени'}")
@@ -318,6 +343,11 @@ def owner_alert_text(*, kind: str, name: Optional[str], phone: Optional[str],
     if kind == "silence":
         lines.append(f"Молчит {int(SILENCE_LIMIT.total_seconds() // 3600)} часа "
                      f"после вопроса.")
+    if kind == "not_asked":
+        lines.append("Вопрос-подтверждение так и не ушёл клиенту — "
+                     "подтвердите заказ сами.")
+        if reason:
+            lines.append(f"Причина: {reason}")
     if lead_link:
         lines.append(f"Сделка: {lead_link}")
     return "\n".join(lines)
@@ -346,4 +376,5 @@ __all__ = [
     "plan_confirmation",
     "should_call_owner",
     "should_move_deal",
+    "should_report_unasked",
 ]
