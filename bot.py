@@ -4221,6 +4221,7 @@ PERMISSIONS_CANON = [
     "cleaning_view_reports",
     "cleaning_manage_cash",
     "cleaning_cancel_orders",
+    "cleaning_pay_dividend",
 ]
 
 ROLE_MATRIX = {
@@ -4251,6 +4252,7 @@ ROLE_MATRIX = {
         "cleaning_view_reports",
         "cleaning_manage_cash",
         "cleaning_cancel_orders",
+        "cleaning_pay_dividend",
     ],
     "master": [
         "create_orders_clients",
@@ -4262,6 +4264,8 @@ ROLE_MATRIX = {
         "cleaning_view_balance",
         "cleaning_view_clients",
         "cleaning_record_expense",
+        # Деньги у неё в руках, она же их и раздаёт получателям.
+        "cleaning_pay_dividend",
     ],
 }
 
