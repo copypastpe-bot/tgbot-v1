@@ -107,24 +107,49 @@ def should_call_owner(*, asked_sent_at: Optional[datetime],
     return now - asked_sent_at >= SILENCE_LIMIT
 
 
-def should_report_unasked(*, letter_status: str,
+# Почему письмо так и не ушло — словами, понятными владельцу. Технические
+# строки пишет работник очереди, и читать их владельцу незачем.
+_LETTER_FAILURE_WORDS = {
+    "wahelp requires connection": "клиент не писал нам первым — "
+                                  "робот не может начать разговор",
+    "client phone missing": "в карточке клиента нет телефона",
+    "notifications disabled": "клиенту отключены уведомления",
+    "missing client": "клиента нет в базе бота",
+}
+
+
+def letter_failure_words(reason: Optional[str]) -> str:
+    """Причина, по которой вопрос не ушёл, — человеческими словами."""
+    text = (reason or "").strip()
+    if not text:
+        return "письмо не удалось отправить"
+    return _LETTER_FAILURE_WORDS.get(text, text)
+
+
+def should_report_unasked(*, pending_status: str, letter_status: str,
                           asked_sent_at: Optional[datetime],
                           notified_at: Optional[datetime]) -> bool:
     """Пора ли сказать владельцу, что вопрос клиенту задать не удалось.
 
-    Письмо-вопрос может умереть, так и не уйдя: amoCRM молчала все попытки
-    проверки или мессенджер не принял письмо. Молчать здесь нельзя — заказ
-    остаётся неподтверждённым, а робот больше ничего по нему не сделает.
+    Письмо-вопрос умирает двумя способами, и оба означают одно: клиент вопроса
+    не получил, заказ остался неподтверждённым, а робот по нему больше ничего
+    не сделает. Либо кончились попытки (`failed`) — amoCRM молчала или
+    мессенджер не принял письмо. Либо работник очереди отменил письмо сам
+    (`cancelled`) — например, клиент не писал нам первым, и начинать разговор
+    робот не вправе. Живой случай на проде 2026-09-03: заказ на завтра, письмо
+    отменено ещё утром, клиент ни о чём не знает.
 
-    Отменённое письмо (`cancelled`) сюда не относится: это осознанное решение
-    робота — заказа больше нет в CRM, и звать владельца к несостоявшемуся
-    событию он не должен (решение владельца 2026-09-03).
+    Единственная отмена, к которой владельца звать не надо, — та, что робот
+    сделал осознанно: заказа больше нет в CRM. Она узнаётся не по тексту
+    причины, а по статусу самого ожидания — `dropped`.
 
     Зовём ровно один раз, как и к молчунам.
     """
     if asked_sent_at is not None or notified_at is not None:
         return False
-    return letter_status == "failed"
+    if pending_status != "planned":
+        return False                      # dropped — робот сам отменил вопрос
+    return letter_status in ("failed", "cancelled")
 
 
 def child_deal_id(notes: list[Mapping[str, Any]]) -> Optional[int]:
@@ -367,6 +392,7 @@ __all__ = [
     "child_deal_id",
     "decide_on_answer",
     "is_question_letter",
+    "letter_failure_words",
     "letter_payload",
     "may_ask_question",
     "pick_realization_deal",

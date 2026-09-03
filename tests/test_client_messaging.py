@@ -26,6 +26,7 @@ from notifications.client_messaging import (
     child_deal_id,
     decide_on_answer,
     is_question_letter,
+    letter_failure_words,
     letter_payload,
     may_ask_question,
     order_from_lead,
@@ -447,38 +448,59 @@ class OwnerAlertTests(unittest.TestCase):
 
 
 class UnaskedQuestionTests(unittest.TestCase):
-    """Письмо-вопрос может умереть, так и не уйдя: CRM молчала все попытки
-    или мессенджер не принял письмо. Раньше владелец узнавал об этом через
-    сторож молчунов — с враньём в тексте («клиент не ответил»). Теперь
-    отдельный сигнал, и говорит он правду."""
+    """Письмо-вопрос может умереть, так и не уйдя. Раньше владелец узнавал
+    об этом через сторож молчунов — с враньём в тексте («клиент не ответил»),
+    хотя клиент вопроса и не получал. Теперь отдельный сигнал, и говорит правду."""
+
+    def _call(self, **over):
+        args = {"pending_status": "planned", "letter_status": "failed",
+                "asked_sent_at": None, "notified_at": None}
+        args.update(over)
+        return should_report_unasked(**args)
 
     def test_dead_letter_calls_the_owner(self):
-        self.assertTrue(should_report_unasked(letter_status="failed",
-                                              asked_sent_at=None, notified_at=None))
+        self.assertTrue(self._call(letter_status="failed"))
+
+    def test_cancelled_letter_calls_the_owner_too(self):
+        """Живой случай 2026-09-03: письмо отменено ещё утром («клиент не писал
+        нам первым»), работа завтра, клиент ни о чём не знает. Молчать нельзя."""
+        self.assertTrue(self._call(letter_status="cancelled"))
 
     def test_letter_still_trying_is_not_a_reason_to_call(self):
         for status in ("pending", "sending", "sent"):
-            self.assertFalse(should_report_unasked(letter_status=status,
-                                                   asked_sent_at=None,
-                                                   notified_at=None), status)
+            self.assertFalse(self._call(letter_status=status), status)
 
-    def test_cancelled_letter_is_not_a_reason_to_call(self):
-        """Отменённое письмо — осознанное решение робота: заказа больше нет.
-        Звать владельца к несостоявшемуся событию он не должен."""
-        self.assertFalse(should_report_unasked(letter_status="cancelled",
-                                               asked_sent_at=None, notified_at=None))
+    def test_deliberate_drop_is_not_a_reason_to_call(self):
+        """Робот сам отменил вопрос, потому что заказа больше нет в CRM.
+        Это несостоявшееся событие, а не беда: владельца не тревожим."""
+        self.assertFalse(self._call(pending_status="dropped",
+                                    letter_status="cancelled"))
 
     def test_sent_question_is_not_this_branch(self):
-        sent_at = datetime(2026, 9, 7, 10, 0, tzinfo=MSK)
-        self.assertFalse(should_report_unasked(letter_status="failed",
-                                               asked_sent_at=sent_at,
-                                               notified_at=None))
+        self.assertFalse(self._call(
+            asked_sent_at=datetime(2026, 9, 7, 10, 0, tzinfo=MSK)))
 
     def test_owner_is_called_only_once(self):
-        called_at = datetime(2026, 9, 7, 10, 0, tzinfo=MSK)
-        self.assertFalse(should_report_unasked(letter_status="failed",
-                                               asked_sent_at=None,
-                                               notified_at=called_at))
+        self.assertFalse(self._call(
+            notified_at=datetime(2026, 9, 7, 10, 0, tzinfo=MSK)))
+
+
+class LetterFailureWordsTests(unittest.TestCase):
+    """Причину владелец читает глазами, а пишет её работник очереди —
+    по-английски и своими словами. Между ними нужен перевод."""
+
+    def test_technical_reason_becomes_human(self):
+        text = letter_failure_words("wahelp requires connection")
+        self.assertIn("не писал нам первым", text)
+
+    def test_unknown_reason_is_shown_as_is(self):
+        """Незнакомую причину не проглатываем: полуправда хуже английского."""
+        self.assertEqual(letter_failure_words("amoCRM не ответила"),
+                         "amoCRM не ответила")
+
+    def test_missing_reason_still_says_something(self):
+        for value in (None, "", "   "):
+            self.assertTrue(letter_failure_words(value))
 
 
 class LetterTextsTests(unittest.TestCase):

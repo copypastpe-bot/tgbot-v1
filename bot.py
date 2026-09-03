@@ -161,6 +161,7 @@ from notifications.client_messaging import (
     child_deal_id,
     decide_on_answer,
     is_question_letter,
+    letter_failure_words,
     letter_payload,
     may_ask_question,
     order_from_lead,
@@ -2333,8 +2334,9 @@ async def run_unasked_question_watch() -> None:
     не было). Промолчать здесь значило бы оставить владельца в уверенности,
     что робот заказ ведёт.
 
-    Отменённые письма сюда не попадают: отмена — осознанное решение робота
-    («заказа больше нет в CRM»), и владельца к ней не зовут.
+    Отменённое письмо сюда тоже попадает: клиент вопроса не получил, а почему —
+    ему всё равно. Не попадает единственная отмена — та, что робот сделал
+    осознанно, узнав, что заказа больше нет в CRM (ожидание в статусе `dropped`).
 
     Ходит тем же ритмом, что и сторож молчунов: сигнал опаздывает максимум
     на десять минут.
@@ -2346,15 +2348,16 @@ async def run_unasked_question_watch() -> None:
         rows = await conn.fetch(
             """
             SELECT oc.lead_id, oc.deal_id, oc.order_at, oc.asked_sent_at,
-                   oc.notified_at, oc.phone_digits, o.status AS letter_status,
-                   o.last_error, c.full_name, c.phone
+                   oc.notified_at, oc.phone_digits, oc.status,
+                   o.status AS letter_status, o.last_error,
+                   c.full_name, c.phone
             FROM order_confirmations oc
             JOIN notification_outbox o ON o.id = oc.outbox_id
             LEFT JOIN clients c ON c.id = oc.client_id
             WHERE oc.status = 'planned'
               AND oc.asked_sent_at IS NULL
               AND oc.notified_at IS NULL
-              AND o.status = 'failed'
+              AND o.status IN ('failed', 'cancelled')
             ORDER BY oc.asked_at
             LIMIT 50
             """
@@ -2364,7 +2367,8 @@ async def run_unasked_question_watch() -> None:
     for row in rows:
         # Запрос уже сузил выборку, но решение принимает правило: разойдись
         # они однажды — молчаливо победил бы SQL, а он тестами не покрыт.
-        if not should_report_unasked(letter_status=str(row["letter_status"]),
+        if not should_report_unasked(pending_status=str(row["status"]),
+                                     letter_status=str(row["letter_status"]),
                                      asked_sent_at=row["asked_sent_at"],
                                      notified_at=row["notified_at"]):
             continue
@@ -2375,7 +2379,7 @@ async def run_unasked_question_watch() -> None:
             order_at=_confirmation_order_at_msk(row),
             answer_text=None,
             lead_link=_confirmation_link(row),
-            reason=(row["last_error"] or "письмо не удалось отправить"),
+            reason=letter_failure_words(row["last_error"]),
         ))
         async with pool.acquire() as conn:
             await conn.execute(
