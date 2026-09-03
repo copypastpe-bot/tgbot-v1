@@ -62,11 +62,13 @@ async def record_expense(
 
 async def record_dividend(
     conn: asyncpg.Connection, *, amount: Decimal, comment: str
-) -> None:
-    await conn.execute(
+) -> int:
+    """Возвращает id строки: по нему администратор отменяет ошибочную выплату."""
+    return await conn.fetchval(
         """
         INSERT INTO cleaning_cashbook (kind, method, amount, comment)
         VALUES ($1, $2, $3, $4)
+        RETURNING id
         """,
         CASHBOOK_KIND_DIVIDEND,
         CLEANING_DIVIDEND_METHOD,

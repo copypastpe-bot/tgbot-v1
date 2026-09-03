@@ -13,6 +13,7 @@ import asyncpg
 
 from .constants import (
     CASHBOOK_KIND_DEPOSIT,
+    CASHBOOK_KIND_DIVIDEND,
     CASHBOOK_KIND_EXPENSE,
     CASHBOOK_KIND_WITHDRAWAL,
     CLEANING_DIVIDEND_METHOD,
@@ -160,3 +161,39 @@ async def cancel_order(
         "bonuses_earned": earned,
         "cashbook_rows_deleted": int(cb_affected or 0),
     }
+
+
+async def list_recent_dividends(
+    conn: asyncpg.Connection, *, limit: int = 5
+) -> list[asyncpg.Record]:
+    """Последние выплаты — чтобы администратор нашёл id ошибочной."""
+    return await conn.fetch(
+        """
+        SELECT id, amount, happened_at
+        FROM cleaning_cashbook
+        WHERE kind = $1 AND deleted_at IS NULL
+        ORDER BY id DESC
+        LIMIT $2
+        """,
+        CASHBOOK_KIND_DIVIDEND,
+        limit,
+    )
+
+
+async def cancel_dividend(conn: asyncpg.Connection, *, payout_id: int) -> Decimal | None:
+    """Мягко удаляет строку выплаты. None, если её нет или уже отменена.
+
+    Отменяем только выплаты: перепутать id с расходом или заказом нельзя,
+    иначе одна опечатка администратора тихо развернёт чужую операцию.
+    """
+    return await conn.fetchval(
+        """
+        UPDATE cleaning_cashbook
+        SET deleted_at = $1
+        WHERE id = $2 AND kind = $3 AND deleted_at IS NULL
+        RETURNING amount
+        """,
+        datetime.now(timezone.utc),
+        payout_id,
+        CASHBOOK_KIND_DIVIDEND,
+    )

@@ -23,7 +23,10 @@ class CleaningOrderFSM(StatesGroup):
 
 class CleaningDividendFSM(StatesGroup):
     amount = State()
-    comment = State()
+    confirm = State()
+
+
+class CleaningDividendCancelFSM(StatesGroup):
     confirm = State()
 
 

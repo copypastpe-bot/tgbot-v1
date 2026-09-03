@@ -19,7 +19,6 @@ from cleaning.orders import (
     validate_payment_parts,
 )
 from cleaning.format import (
-    format_dividend_alert,
     format_order_provided_alert,
 )
 
@@ -118,16 +117,6 @@ class AlertFormatterTests(unittest.TestCase):
         self.assertIn("5 800", text)       # прибыль
         self.assertIn("87 540", text)      # баланс
 
-    def test_format_dividend_alert(self):
-        text = format_dividend_alert(
-            amount=D("25000"),
-            recipient="Иван",
-            balance_after=D("62540"),
-        )
-        self.assertIn("DIV", text)
-        self.assertIn("25 000", text)
-        self.assertIn("Иван", text)
-        self.assertIn("62 540", text)
 
 
 class ConstantsContractTests(unittest.TestCase):

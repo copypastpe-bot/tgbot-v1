@@ -45,14 +45,38 @@ def format_order_provided_alert(
     return "\n".join(lines)
 
 
-def format_dividend_alert(
-    *, amount: Decimal, recipient: str, balance_after: Decimal
+def format_dividend_payout_alert(
+    *, recipients: list[str], shares: list[Decimal], balance_after: Decimal
+) -> str:
+    """Сообщение в кассовый чат: кто сколько получил и что осталось."""
+    lines = ["Выплата прибыли:"]
+    lines += [f"{name} — {_money(share)}₽" for name, share in zip(recipients, shares)]
+    lines.append(f"Остаток в кассе: {_money(balance_after)}₽")
+    return "\n".join(lines)
+
+
+def format_dividend_payout_confirm(
+    *,
+    total: Decimal,
+    recipients: list[str],
+    shares: list[Decimal],
+    balance: Decimal,
+) -> str:
+    """Что человек видит перед подтверждением: деньги живые, показываем всё."""
+    lines = [f"Выплата прибыли {_money(total)}₽:"]
+    lines += [f"{name} — {_money(share)}₽" for name, share in zip(recipients, shares)]
+    lines.append(f"В кассе {_money(balance)}₽, останется {_money(balance - total)}₽.")
+    lines.append("Подтвердить?")
+    return "\n".join(lines)
+
+
+def format_dividend_cancel_alert(
+    *, payout_id: int, amount: Decimal, balance_after: Decimal
 ) -> str:
     return (
-        "💸 DIV клининг\n"
+        f"↩️ Отменена выплата прибыли #{payout_id}\n"
         f"Сумма: {_money(amount)}₽\n"
-        f"Получатель: {recipient}\n"
-        f"Остаток кассы клининга: {_money(balance_after)}₽"
+        f"Остаток в кассе: {_money(balance_after)}₽"
     )
 
 

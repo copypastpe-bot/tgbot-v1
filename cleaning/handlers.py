@@ -23,7 +23,9 @@ from .admin_ops import (
     add_cash_expense,
     add_cash_income,
     add_cash_withdrawal,
+    cancel_dividend,
     cancel_order,
+    list_recent_dividends,
 )
 from .cashbook import (
     get_cleaning_balance,
@@ -45,7 +47,9 @@ from .format import (
     format_cancel_order_alert,
     format_cash_op_alert,
     format_cash_report,
-    format_dividend_alert,
+    format_dividend_cancel_alert,
+    format_dividend_payout_alert,
+    format_dividend_payout_confirm,
     format_order_provided_alert,
     format_orders_list,
 )
@@ -85,12 +89,23 @@ def _period_bounds(kind: str) -> tuple[datetime, datetime, str]:
     else:
         raise ValueError(f"unknown period: {kind}")
     return start_msk.astimezone(timezone.utc), end_msk.astimezone(timezone.utc), label
+from .dividend import (
+    PAYOUT_BAD_AMOUNT,
+    PAYOUT_NOT_DIVISIBLE,
+    PAYOUT_NOT_ENOUGH,
+    PAYOUT_OK,
+    check_payout,
+    configured_recipients,
+    dividend_comment,
+    largest_divisible_not_above,
+)
 from .fsm import (
     CleaningCancelOrderFSM,
     CleaningCashAddFSM,
     CleaningCashExpenseFSM,
     CleaningCashWithdrawalFSM,
     CleaningClientLookupFSM,
+    CleaningDividendCancelFSM,
     CleaningDividendFSM,
     CleaningForemanExpenseFSM,
     CleaningOrderFSM,
@@ -172,6 +187,7 @@ def cleaning_main_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🧹 Провести уборку")],
             [KeyboardButton(text="🔍 Клиент"), KeyboardButton(text="💰 Баланс")],
             [KeyboardButton(text="➖ Добавить расход")],
+            [KeyboardButton(text="💸 Выплата")],
         ],
         resize_keyboard=True,
     )
@@ -276,6 +292,7 @@ async def start_cleaning_order(msg: Message, state: FSMContext, **data) -> None:
         CleaningCancelOrderFSM,
         CleaningClientLookupFSM,
         CleaningForemanExpenseFSM,
+        CleaningDividendCancelFSM,
     ),
     F.text.in_({"Отмена", "Отменить"}),
 )
@@ -910,7 +927,22 @@ async def foreman_expense_confirm(msg: Message, state: FSMContext, **kw) -> None
     )
 
 
-# ---------- /cleaning_dividend ----------
+# ---------- выплата прибыли ----------
+# Клинер держит наличные и раздаёт их получателям поровну. У неё кнопка,
+# у администраторов та же операция командой: кнопок в их меню и так много,
+# а пользуются этим в основном в поле.
+
+
+async def _start_dividend(msg: Message, state: FSMContext, pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        balance = await get_cleaning_balance(conn)
+    await state.clear()
+    await state.set_state(CleaningDividendFSM.amount)
+    await msg.answer(
+        f"Выплата прибыли. В кассе {_money_str(balance)}₽.\n"
+        "Какую сумму хотите выдать?",
+        reply_markup=cancel_kb,
+    )
 
 
 @router.message(Command("cleaning_dividend"))
@@ -919,33 +951,56 @@ async def start_cleaning_dividend(msg: Message, state: FSMContext, **kw) -> None
     if not await _has_permission(pool, msg.from_user.id, "cleaning_manage_cash"):
         await msg.answer("Команда доступна только администраторам.")
         return
-    await state.clear()
-    await state.set_state(CleaningDividendFSM.amount)
-    await msg.answer("DIV-выплата клининга.\nВведите сумму (руб):", reply_markup=cancel_kb)
+    await _start_dividend(msg, state, pool)
+
+
+@router.message(F.text == "💸 Выплата")
+async def start_cleaning_payout_button(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_pay_dividend"):
+        await msg.answer("Команда доступна только клинерам и администраторам.")
+        return
+    await _start_dividend(msg, state, pool)
 
 
 @router.message(CleaningDividendFSM.amount, F.text)
-async def div_amount(msg: Message, state: FSMContext) -> None:
+async def div_amount(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
     amount = parse_amount(msg.text)
-    if amount is None or amount <= 0:
-        await msg.answer("Нужно число > 0.", reply_markup=cancel_kb)
+    if amount is None:
+        await msg.answer("Нужно число. Введите сумму или нажмите «Отмена».", reply_markup=cancel_kb)
         return
+
+    recipients = configured_recipients()
+    async with pool.acquire() as conn:
+        balance = await get_cleaning_balance(conn)
+    status, shares = check_payout(amount=amount, balance=balance, recipients=recipients)
+
+    if status == PAYOUT_BAD_AMOUNT:
+        await msg.answer("Сумма должна быть больше нуля.", reply_markup=cancel_kb)
+        return
+    if status == PAYOUT_NOT_ENOUGH:
+        await msg.answer(
+            f"В кассе {_money_str(balance)}₽ — на {_money_str(amount)}₽ не хватает.\n"
+            "Введите другую сумму или нажмите «Отмена».",
+            reply_markup=cancel_kb,
+        )
+        return
+    if status == PAYOUT_NOT_DIVISIBLE:
+        hint = largest_divisible_not_above(amount, len(recipients))
+        text = f"{_money_str(amount)}₽ не делится поровну на {len(recipients)}."
+        if hint > 0:
+            text += f"\nБлижайшая подходящая сумма: {_money_str(hint)}₽."
+        text += "\nВведите другую сумму или нажмите «Отмена»."
+        await msg.answer(text, reply_markup=cancel_kb)
+        return
+
     await state.update_data(amount=str(amount))
-    await state.set_state(CleaningDividendFSM.comment)
-    await msg.answer("Кому выплачено (комментарий, обязательно):", reply_markup=cancel_kb)
-
-
-@router.message(CleaningDividendFSM.comment, F.text)
-async def div_comment(msg: Message, state: FSMContext) -> None:
-    comment = msg.text.strip()
-    if not comment:
-        await msg.answer("Комментарий обязателен.", reply_markup=cancel_kb)
-        return
-    await state.update_data(comment=comment)
-    data = await state.get_data()
     await state.set_state(CleaningDividendFSM.confirm)
     await msg.answer(
-        f"Подтвердить выплату {_money_str(Decimal(data['amount']))}₽ — {comment}?",
+        format_dividend_payout_confirm(
+            total=amount, recipients=recipients, shares=shares, balance=balance
+        ),
         reply_markup=_confirm_kb(),
     )
 
@@ -956,18 +1011,109 @@ async def div_provesti(msg: Message, state: FSMContext, **kw) -> None:
     bot = kw["bot"]
     data = await state.get_data()
     amount = Decimal(data["amount"])
-    comment = data["comment"]
+    recipients = configured_recipients()
+
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await record_dividend(conn, amount=amount, comment=comment)
-            balance_after = await get_cleaning_balance(conn)
-    text = format_dividend_alert(amount=amount, recipient=comment, balance_after=balance_after)
-    await send_cleaning_money_flow(bot, text)
+            # Между вводом суммы и подтверждением касса могла измениться:
+            # клинер мог провести заказ или расход с другого устройства.
+            balance = await get_cleaning_balance(conn)
+            status, shares = check_payout(
+                amount=amount, balance=balance, recipients=recipients
+            )
+            if status != PAYOUT_OK:
+                payout_id = None
+            else:
+                payout_id = await record_dividend(
+                    conn, amount=amount, comment=dividend_comment()
+                )
+                balance = await get_cleaning_balance(conn)
+
+    await state.clear()
+    if payout_id is None:
+        await msg.answer(
+            f"Касса изменилась, выплата не проведена. Сейчас в кассе {_money_str(balance)}₽.\n"
+            "Начните заново.",
+            reply_markup=cleaning_main_kb(),
+        )
+        return
+
+    await send_cleaning_money_flow(
+        bot,
+        format_dividend_payout_alert(
+            recipients=recipients, shares=shares, balance_after=balance
+        ),
+    )
     await msg.answer(
-        f"DIV проведён. Касса клининга: {_money_str(balance_after)}₽",
+        f"Выплата #{payout_id} проведена. Касса клининга: {_money_str(balance)}₽",
+        reply_markup=cleaning_main_kb(),
+    )
+
+
+# ---------- /cleaning_dividend_cancel N ----------
+
+
+@router.message(Command("cleaning_dividend_cancel"))
+async def start_dividend_cancel(
+    msg: Message, state: FSMContext, command: CommandObject = None, **kw
+) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    if not await _has_permission(pool, msg.from_user.id, "cleaning_manage_cash"):
+        await msg.answer("Команда доступна только администраторам.")
+        return
+    arg = ((command.args if command else "") or "").strip()
+    if not arg.isdigit():
+        async with pool.acquire() as conn:
+            rows = await list_recent_dividends(conn)
+        if not rows:
+            await msg.answer("Выплат пока не было.")
+            return
+        lines = ["Последние выплаты:"]
+        lines += [
+            f"#{r['id']} — {_money_str(Decimal(r['amount']))}₽, "
+            f"{r['happened_at'].astimezone(MOSCOW_TZ):%d.%m %H:%M}"
+            for r in rows
+        ]
+        lines.append("Отмена: /cleaning_dividend_cancel N")
+        await msg.answer("\n".join(lines))
+        return
+
+    await state.clear()
+    await state.update_data(cancel_payout_id=int(arg))
+    await state.set_state(CleaningDividendCancelFSM.confirm)
+    await msg.answer(
+        f"Отменить выплату #{arg}? Деньги вернутся в кассу.",
+        reply_markup=_confirm_kb(),
+    )
+
+
+@router.message(CleaningDividendCancelFSM.confirm, F.text == "Провести")
+async def dividend_cancel_confirmed(msg: Message, state: FSMContext, **kw) -> None:
+    pool: asyncpg.Pool = kw["pool"]
+    bot = kw["bot"]
+    data = await state.get_data()
+    payout_id = int(data["cancel_payout_id"])
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            amount = await cancel_dividend(conn, payout_id=payout_id)
+            balance_after = await get_cleaning_balance(conn)
+    await state.clear()
+    if amount is None:
+        await msg.answer(
+            f"Выплата #{payout_id} не найдена или уже отменена.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    await send_cleaning_money_flow(
+        bot,
+        format_dividend_cancel_alert(
+            payout_id=payout_id, amount=Decimal(amount), balance_after=balance_after
+        ),
+    )
+    await msg.answer(
+        f"Выплата #{payout_id} отменена. Касса клининга: {_money_str(balance_after)}₽",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await state.clear()
 
 
 # ---------- /cleaning_cash_add (manual income / deposit) ----------
