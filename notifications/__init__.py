@@ -2,7 +2,9 @@
 
 from .rules import NotificationEvent, NotificationRules, load_notification_rules
 from .outbox import (
+    PRE_SEND_OK,
     NotificationOutboxEntry,
+    PreSendVerdict,
     apply_provider_status_update,
     cancel_outbox_entry,
     ensure_notification_schema,
@@ -21,6 +23,8 @@ __all__ = [
     "NotificationRules",
     "NotificationOutboxEntry",
     "NotificationWorker",
+    "PreSendVerdict",
+    "PRE_SEND_OK",
     "load_notification_rules",
     "ensure_notification_schema",
     "enqueue_notification",

@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Mapping
+from typing import Awaitable, Callable, Mapping
 
 import asyncpg
 
 from crm import ClientContact, DailySendLimitReached, send_with_rules
 from .outbox import (
+    PRE_SEND_OK,
     NotificationOutboxEntry,
+    PreSendVerdict,
     cancel_outbox_entry,
     extract_provider_message_id,
     mark_outbox_failure,
@@ -36,7 +38,23 @@ class NotificationWorker:
         promo_texts_fn=None,
         birthday_texts_fn=None,
         logs_chat_id: int | None = None,
+        before_send: Callable[[NotificationOutboxEntry],
+                              Awaitable[PreSendVerdict]] | None = None,
+        after_send: Callable[[asyncpg.Connection, NotificationOutboxEntry],
+                             Awaitable[None]] | None = None,
+        precheck_retry_minutes: int = 15,
     ) -> None:
+        """Работник очереди — курьер: он умеет доставлять письма и больше ничего.
+
+        `before_send` и `after_send` — две точки подключения для тех, кто знает
+        про письмо больше курьера. Их заполняет `bot.py`: сам работник ничего
+        не знает ни про amoCRM, ни про ожидания подтверждения, и знать не должен.
+
+        * `before_send` спрашивает «можно ли ещё слать?» — так письмо-вопрос
+          не уходит по заказу, которого в CRM уже нет.
+        * `after_send` получает ту же связь с базой, что и отметка «отправлено»,
+          и пишет в неё факт отправки одной транзакцией с ней.
+        """
         self.pool = pool
         self.rules = rules
         self.poll_interval = poll_interval
@@ -45,6 +63,9 @@ class NotificationWorker:
         self.promo_texts_fn = promo_texts_fn
         self.birthday_texts_fn = birthday_texts_fn
         self.logs_chat_id = logs_chat_id
+        self.before_send = before_send
+        self.after_send = after_send
+        self.precheck_retry_minutes = precheck_retry_minutes
         self._task: asyncio.Task | None = None
         self._stopping = False
 
@@ -108,6 +129,34 @@ class NotificationWorker:
             async with self.pool.acquire() as conn:
                 await cancel_outbox_entry(conn, entry, "client phone missing")
             return
+
+        # Последнее слово перед отправкой — за тем, кто знает смысл письма.
+        # Дешёвые проверки выше уже отсеяли лишнее: незачем ходить в CRM ради
+        # письма, которое и так отменится.
+        if self.before_send is not None:
+            verdict = await self.before_send(entry)
+            if verdict.action == "cancel":
+                logger.info("Письмо %s отменено перед отправкой: %s",
+                            entry.id, verdict.reason)
+                async with self.pool.acquire() as conn:
+                    await cancel_outbox_entry(conn, entry, verdict.reason)
+                return
+            if verdict.action == "retry":
+                # Проверить не удалось. Молча отменить письмо здесь значило бы
+                # наказать живого клиента за чужую сетевую заминку. Пауза длиннее
+                # обычной: попыток всего пять, и тратить их за полчаса на одну
+                # и ту же недоступную CRM бессмысленно.
+                logger.warning("Письмо %s отложено: %s", entry.id, verdict.reason)
+                async with self.pool.acquire() as conn:
+                    await mark_outbox_failure(
+                        conn,
+                        entry,
+                        error_message=verdict.reason,
+                        attempts=entry.attempts,
+                        max_attempts=self.max_attempts,
+                        retry_delay_minutes=self.precheck_retry_minutes,
+                    )
+                return
 
         contact = ClientContact(
             client_id=entry.client_id,
@@ -175,14 +224,20 @@ class NotificationWorker:
                 result.response if isinstance(result.response, Mapping) else None
             )
             provider_message_id = extract_provider_message_id(provider_payload)
-            await mark_outbox_sent(
-                conn,
-                entry,
-                channel=result.channel,
-                message_text=message_text,
-                provider_payload=provider_payload,
-                provider_message_id=provider_message_id,
-            )
+            # Одной транзакцией: разойдись отметка «отправлено» и то, что пишет
+            # `after_send`, — робот получил бы отправленный вопрос, про который
+            # не помнит, что задавал его, и ответ клиента пропал бы впустую.
+            async with conn.transaction():
+                await mark_outbox_sent(
+                    conn,
+                    entry,
+                    channel=result.channel,
+                    message_text=message_text,
+                    provider_payload=provider_payload,
+                    provider_message_id=provider_message_id,
+                )
+                if self.after_send is not None:
+                    await self.after_send(conn, entry)
 
     def _build_message_text(self, entry: NotificationOutboxEntry) -> str:
         template = entry.template

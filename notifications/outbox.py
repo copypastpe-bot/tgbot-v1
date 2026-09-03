@@ -51,6 +51,27 @@ class NotificationOutboxEntry:
     preferred_contact: str | None = None
 
 
+@dataclass(frozen=True)
+class PreSendVerdict:
+    """Ответ на вопрос «можно ли слать это письмо прямо сейчас».
+
+    Ответов три, и путать их нельзя:
+
+    * `send`   — слать;
+    * `cancel` — письмо больше не нужно (заказ исчез): отменяем навсегда;
+    * `retry`  — проверить не удалось (CRM не ответила): откладываем.
+
+    Разница между двумя последними — вся суть. Прими робот сетевую заминку
+    за «заказа нет», и живой клиент остался бы без вопроса.
+    """
+
+    action: str            # send | cancel | retry
+    reason: str = ""       # человеческими словами: уходит в журнал письма
+
+
+PRE_SEND_OK = PreSendVerdict("send")
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -744,6 +765,8 @@ async def apply_provider_status_update(
 
 __all__ = [
     "NotificationOutboxEntry",
+    "PreSendVerdict",
+    "PRE_SEND_OK",
     "ensure_notification_schema",
     "enqueue_notification",
     "pick_ready_batch",
