@@ -21,10 +21,13 @@ from notifications.client_messaging import (
     AMO_STAGE_CONFIRMED,
     AMO_STAGE_ORDER_CREATED,
     ASK_BEFORE,
+    CONFIRM_REQUEST_EVENT,
     SILENCE_LIMIT,
     child_deal_id,
     decide_on_answer,
+    is_question_letter,
     letter_payload,
+    may_ask_question,
     order_from_lead,
     pick_realization_deal,
     owner_alert_text,
@@ -109,27 +112,34 @@ class PlanConfirmationTests(unittest.TestCase):
 
 
 class SilenceTests(unittest.TestCase):
+    """Три часа тишины считаются от факта отправки вопроса.
+
+    Плановое время сюда не годится: заказ на 8 сентября заводится 3 сентября,
+    и по плановому времени робот позвал бы владельца к «молчанию» задолго до
+    того, как вопрос вообще ушёл клиенту.
+    """
+
     NOW = datetime(2026, 8, 28, 12, 0, tzinfo=MSK)
 
     def test_owner_is_called_after_three_hours(self):
-        asked_at = self.NOW - SILENCE_LIMIT - timedelta(minutes=1)
-        self.assertTrue(should_call_owner(asked_at=asked_at, notified_at=None,
+        sent_at = self.NOW - SILENCE_LIMIT - timedelta(minutes=1)
+        self.assertTrue(should_call_owner(asked_sent_at=sent_at, notified_at=None,
                                           now=self.NOW))
 
     def test_owner_is_not_called_too_early(self):
-        asked_at = self.NOW - timedelta(hours=1)
-        self.assertFalse(should_call_owner(asked_at=asked_at, notified_at=None,
+        sent_at = self.NOW - timedelta(hours=1)
+        self.assertFalse(should_call_owner(asked_sent_at=sent_at, notified_at=None,
                                            now=self.NOW))
 
     def test_owner_is_called_only_once(self):
-        asked_at = self.NOW - timedelta(hours=5)
-        self.assertFalse(should_call_owner(asked_at=asked_at,
+        sent_at = self.NOW - timedelta(hours=5)
+        self.assertFalse(should_call_owner(asked_sent_at=sent_at,
                                            notified_at=self.NOW - timedelta(hours=1),
                                            now=self.NOW))
 
     def test_unasked_order_never_calls_owner(self):
         """Вопрос ещё не ушёл — молчания нет, звать не о чем."""
-        self.assertFalse(should_call_owner(asked_at=None, notified_at=None,
+        self.assertFalse(should_call_owner(asked_sent_at=None, notified_at=None,
                                            now=self.NOW))
 
 
@@ -257,31 +267,116 @@ class OrderFromLeadTests(unittest.TestCase):
 
 
 class DecideOnAnswerTests(unittest.TestCase):
+    """Ответом считается только то, что пришло ПОСЛЕ отправленного вопроса.
+
+    Живой случай 2026-09-03: клиент написал по своему делу («нам нужен акт»)
+    за пять дней до того, как робот собирался задать вопрос, — и робот принял
+    это за ответ. Напиши клиент «да, спасибо», сделка уехала бы в «Заказ
+    подтвержден» без всякого вопроса.
+    """
+
+    SENT_AT = datetime(2026, 9, 3, 10, 0, tzinfo=MSK)
+
     def test_yes_confirms_the_order(self):
-        self.assertEqual(decide_on_answer(answer="yes", status="planned"), "confirm")
+        self.assertEqual(decide_on_answer(answer="yes", status="planned",
+                                          asked_sent_at=self.SENT_AT), "confirm")
 
     def test_late_yes_still_confirms(self):
         """Решение владельца 7: «Да» после сигнала всё равно двигает сделку."""
-        self.assertEqual(decide_on_answer(answer="yes", status="owner_notified"),
-                         "confirm")
+        self.assertEqual(decide_on_answer(answer="yes", status="owner_notified",
+                                          asked_sent_at=self.SENT_AT), "confirm")
 
     def test_no_calls_owner(self):
-        self.assertEqual(decide_on_answer(answer="no", status="planned"), "call_owner")
+        self.assertEqual(decide_on_answer(answer="no", status="planned",
+                                          asked_sent_at=self.SENT_AT), "call_owner")
 
     def test_unclear_calls_owner(self):
-        self.assertEqual(decide_on_answer(answer="unclear", status="planned"),
-                         "call_owner")
+        self.assertEqual(decide_on_answer(answer="unclear", status="planned",
+                                          asked_sent_at=self.SENT_AT), "call_owner")
 
     def test_owner_is_not_called_twice_about_one_order(self):
         """Владельца уже позвали — дальше он разговаривает сам."""
         for answer in ("no", "unclear"):
-            self.assertEqual(decide_on_answer(answer=answer, status="owner_notified"),
+            self.assertEqual(decide_on_answer(answer=answer, status="owner_notified",
+                                              asked_sent_at=self.SENT_AT),
                              "ignore", answer)
 
     def test_settled_order_ignores_anything(self):
         for status in ("confirmed", "refused"):
-            self.assertEqual(decide_on_answer(answer="yes", status=status),
+            self.assertEqual(decide_on_answer(answer="yes", status=status,
+                                              asked_sent_at=self.SENT_AT),
                              "ignore", status)
+
+    def test_nothing_counts_before_the_question_was_sent(self):
+        """Решение владельца 1: нет вопроса — нет ожидания. Никогда.
+
+        Ни «да», ни «нет», ни непонятное: пока письмо не ушло, клиент отвечает
+        не нам, а по своему делу — такие письма владелец читает в Wahelp.
+        """
+        for answer in ("yes", "no", "unclear"):
+            for status in ("planned", "owner_notified"):
+                self.assertEqual(
+                    decide_on_answer(answer=answer, status=status, asked_sent_at=None),
+                    "ignore", f"{answer}/{status}")
+
+
+class QuestionGuardTests(unittest.TestCase):
+    """Проверка за секунду до вопроса: заказ ещё жив?
+
+    Между планированием и отправкой проходят сутки. За эти сутки сделку могли
+    удалить (так и случилось 2026-09-03), отменить или довести до конца —
+    решение владельца 2: по закрытой сделке вопросов не задаём.
+    """
+
+    def _deal(self, **over):
+        deal = {"id": 31583273, "pipeline_id": AMO_PIPELINE_REALIZATION,
+                "status_id": AMO_STAGE_ORDER_CREATED}
+        deal.update(over)
+        return deal
+
+    def test_live_order_gets_its_question(self):
+        allowed, reason = may_ask_question(self._deal())
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "")
+
+    def test_missing_deal_stops_the_question(self):
+        """Сделку удалили — спрашивать не о чем и некуда двигать."""
+        allowed, reason = may_ask_question(None)
+        self.assertFalse(allowed)
+        self.assertTrue(reason)
+
+    def test_empty_answer_from_crm_is_a_missing_deal(self):
+        """На удалённую сделку amoCRM отвечает пустым телом, а не ошибкой.
+
+        Прочитай робот такой ответ как «сделка не в той воронке» — причина
+        в журнале была бы враньём, и разбор следующего случая ушёл бы не туда.
+        """
+        allowed, reason = may_ask_question({"text": ""})
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "заказа больше нет в CRM")
+
+    def test_deal_that_left_order_created_stops_the_question(self):
+        allowed, reason = may_ask_question(self._deal(status_id=AMO_STAGE_CONFIRMED))
+        self.assertFalse(allowed)
+        self.assertTrue(reason)
+
+    def test_deal_that_left_the_realization_pipeline_stops_the_question(self):
+        allowed, reason = may_ask_question(self._deal(pipeline_id=1))
+        self.assertFalse(allowed)
+        self.assertTrue(reason)
+
+    def test_every_refusal_explains_itself(self):
+        """Причина уходит в отмену письма: без неё потом не разобрать, что было."""
+        for deal in (None, self._deal(status_id=AMO_STAGE_CONFIRMED),
+                     self._deal(pipeline_id=1)):
+            self.assertTrue(may_ask_question(deal)[1])
+
+    def test_only_the_question_is_checked(self):
+        """Письмо «заказ принят» проверкой не затрагивается: оно уходит сразу
+        при оформлении, проверять там нечего."""
+        self.assertTrue(is_question_letter(CONFIRM_REQUEST_EVENT))
+        for event_key in ("order_created", "order_confirmed_thanks", "birthday_congrats"):
+            self.assertFalse(is_question_letter(event_key), event_key)
 
 
 class MoveDealTests(unittest.TestCase):

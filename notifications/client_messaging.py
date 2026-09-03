@@ -33,6 +33,11 @@ AMO_STAGE_CONFIRMED = 41463838          # «Заказ подтвержден, �
 
 AMO_FIELD_ORDER_DATETIME = 18701        # Дата и время заказа (unix)
 
+# Письмо-вопрос «подтвердите заказ». Единственное письмо, которое уходит
+# не сразу, а через сутки после планирования, — потому и проверяется перед
+# отправкой отдельно от всех прочих.
+CONFIRM_REQUEST_EVENT = "order_confirm_request"
+
 # Ответ клиента владельцу показывается целиком, а не пересказом. Предел стоит
 # только против случайной простыни на сотни строк: телеграм её всё равно
 # не примет, а реальные ответы короче одной строки.
@@ -84,17 +89,22 @@ def plan_confirmation(*, order_at: Optional[datetime],
     return ConfirmationPlan(True, ask_at, "вопрос за сутки до работы")
 
 
-def should_call_owner(*, asked_at: Optional[datetime],
+def should_call_owner(*, asked_sent_at: Optional[datetime],
                       notified_at: Optional[datetime], now: datetime) -> bool:
     """Пора ли звать владельца к молчащему клиенту. Зовём ровно один раз.
 
-    `asked_at` пуст, когда вопроса не было (заказ меньше чем за сутки): молчать
-    там не о чем. `notified_at` заполнен — владельца уже позвали, второй раз
-    не тревожим.
+    Три часа отсчитываются от **факта отправки** вопроса, а не от планового
+    времени. Разница видна на живом примере: заказ на 8 сентября заводится
+    3-го, вопрос уходит 7-го. По плановому времени робот позвал бы владельца
+    к «молчанию» ещё 3 сентября — за четыре дня до самого вопроса.
+
+    `asked_sent_at` пуст, когда вопрос ещё не ушёл или его вовсе не будет
+    (заказ меньше чем за сутки): молчать там не о чем. `notified_at` заполнен —
+    владельца уже позвали, второй раз не тревожим.
     """
-    if asked_at is None or notified_at is not None:
+    if asked_sent_at is None or notified_at is not None:
         return False
-    return now - asked_at >= SILENCE_LIMIT
+    return now - asked_sent_at >= SILENCE_LIMIT
 
 
 def child_deal_id(notes: list[Mapping[str, Any]]) -> Optional[int]:
@@ -207,13 +217,24 @@ def letter_payload(*, order_at: Optional[datetime],
     }
 
 
-def decide_on_answer(*, answer: str, status: str) -> str:
+def decide_on_answer(*, answer: str, status: str,
+                     asked_sent_at: Optional[datetime]) -> str:
     """Что делать с ответом клиента: `confirm`, `call_owner` или `ignore`.
+
+    Первое правило — решение владельца 2026-09-03: **нет вопроса — нет
+    ожидания, никогда.** Ожидание заводится в момент оформления заказа, а
+    вопрос уходит за сутки до работы; всё, что клиент пишет между этими
+    моментами, — его собственное дело, а не ответ нам. 2026-09-03 клиент
+    написал «нам необходим акт» за пять дней до вопроса, и робот принял это
+    за ответ. Напиши он «да, спасибо» — сделка уехала бы в «Заказ подтвержден»
+    сама собой, без единого заданного вопроса.
 
     `owner_notified` означает, что владелец уже в разговоре: второй раз его
     об одном заказе не тревожим. Но «да» принимаем и после сигнала — решение
     владельца 7: клиент подтвердил, значит сделке место в подтверждённых.
     """
+    if asked_sent_at is None:
+        return "ignore"                       # вопроса не было — отвечать не на что
     if status not in ("planned", "owner_notified"):
         return "ignore"                       # с этим заказом всё уже решено
     if answer == "yes":
@@ -221,6 +242,43 @@ def decide_on_answer(*, answer: str, status: str) -> str:
     if status == "owner_notified":
         return "ignore"
     return "call_owner"                       # «нет» и всё непонятое — владельцу
+
+
+def is_question_letter(event_key: str) -> bool:
+    """То самое письмо-вопрос «подтвердите заказ» — или какое-то другое.
+
+    От этого зависят обе новые проверки. Только у вопроса между
+    планированием и отправкой проходят сутки, за которые заказ мог
+    исчезнуть, — и только у вопроса факт отправки включает ожидание
+    ответа. Письмо «заказ принят» уходит в момент оформления: там нечего
+    проверять и нечего ждать.
+    """
+    return event_key == CONFIRM_REQUEST_EVENT
+
+
+def may_ask_question(deal: Optional[Mapping[str, Any]]) -> tuple[bool, str]:
+    """Жив ли ещё заказ, по которому робот собрался задать вопрос.
+
+    Решение владельца 2026-09-03: никаких вопросов по закрытой сделке. Проверка
+    делается за секунду до отправки, а не при планировании: за сутки всё могло
+    измениться. 2026-09-03 сделку удалили совсем — заказ завёлся по ошибке
+    из дублированной записи календаря, — и клиент чуть не получил вопрос
+    о работе, которой уже нет.
+
+    `deal` пуст, когда сделки в CRM не нашлось. Причина отказа возвращается
+    человеческими словами: она уходит в отмену письма, и по ней потом разбирают,
+    что произошло.
+    """
+    # Удалённая сделка приходит либо ничем (404), либо пустым телом ответа —
+    # amoCRM отвечает на неё 204 без содержимого. Оба случая — один и тот же
+    # «заказа нет», и называть их надо одинаково.
+    if not deal or not deal.get("id"):
+        return False, "заказа больше нет в CRM"
+    if int(deal.get("pipeline_id") or 0) != AMO_PIPELINE_REALIZATION:
+        return False, "сделка ушла из воронки реализации"
+    if int(deal.get("status_id") or 0) != AMO_STAGE_ORDER_CREATED:
+        return False, "сделка ушла с этапа «Заказ оформлен»"
+    return True, ""
 
 
 def should_move_deal(status_id: Optional[int]) -> bool:
@@ -271,13 +329,16 @@ __all__ = [
     "AMO_STAGE_CONFIRMED",
     "AMO_STAGE_ORDER_CREATED",
     "ASK_BEFORE",
+    "CONFIRM_REQUEST_EVENT",
     "PENDING_TTL_AFTER_ORDER",
     "SILENCE_LIMIT",
     "ConfirmationPlan",
     "OrderDetails",
     "child_deal_id",
     "decide_on_answer",
+    "is_question_letter",
     "letter_payload",
+    "may_ask_question",
     "pick_realization_deal",
     "order_from_lead",
     "parse_answer",

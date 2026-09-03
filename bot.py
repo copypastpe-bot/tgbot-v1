@@ -124,8 +124,11 @@ from dotenv import load_dotenv
 
 import asyncpg
 from notifications import (
+    PRE_SEND_OK,
+    NotificationOutboxEntry,
     NotificationRules,
     NotificationWorker,
+    PreSendVerdict,
     WahelpWebhookServer,
     extract_provider_message_id,
     ensure_notification_schema,
@@ -150,13 +153,16 @@ from notifications.client_messaging import (
     AMO_FIELD_ORDER_DATETIME,
     AMO_PIPELINE_REALIZATION,
     AMO_STAGE_CONFIRMED,
+    CONFIRM_REQUEST_EVENT,
     PENDING_TTL_AFTER_ORDER,
     SILENCE_LIMIT,
     ConfirmationPlan,
     OrderDetails,
     child_deal_id,
     decide_on_answer,
+    is_question_letter,
     letter_payload,
+    may_ask_question,
     order_from_lead,
     owner_alert_text,
     parse_answer,
@@ -169,6 +175,7 @@ from notifications.client_messaging import (
 from notifications.amocrm_api import (
     AmoCRMAPIAuthError,
     AmoCRMAPIClient,
+    AmoCRMAPIError,
     AmoCRMAPIRateLimitError,
     AmoCRMAlert,
     build_lead_link,
@@ -1027,24 +1034,49 @@ async def ensure_client_messaging_schema(conn: asyncpg.Connection) -> None:
     Репетиция сюда не пишет. Строка означает «этим заказом робот уже занялся»;
     появись она в репетиции — боевой запуск увидел бы её и промолчал, решив,
     что вопрос давно задан.
+
+    Времени в строке два, и путать их нельзя. `asked_at` — когда вопрос
+    *собирались* задать (за сутки до работы), `asked_sent_at` — когда письмо
+    действительно ушло клиенту. Ответом считается только то, что пришло после
+    второго: до него робот вопроса не задавал, и отвечать клиенту не на что.
     """
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS order_confirmations (
-            lead_id      bigint PRIMARY KEY,      -- лид воронки первичной обработки
-            deal_id      bigint,                  -- дочерняя сделка воронки реализации
-            client_id    bigint,                  -- clients.id, если клиент найден
-            phone_digits text NOT NULL,           -- по нему ищем ответ клиента
-            order_at     timestamptz,             -- когда работа
-            status       text NOT NULL,           -- planned|confirmed|refused|owner_notified
-            outbox_id    bigint,                  -- письмо-вопрос в очереди
-            asked_at     timestamptz,             -- плановое время вопроса; NULL — вопроса нет
-            answered_at  timestamptz,
-            answer_text  text,
-            notified_at  timestamptz,             -- когда позвали владельца
-            created_at   timestamptz NOT NULL DEFAULT NOW(),
-            updated_at   timestamptz NOT NULL DEFAULT NOW()
+            lead_id       bigint PRIMARY KEY,     -- лид воронки первичной обработки
+            deal_id       bigint,                 -- дочерняя сделка воронки реализации
+            client_id     bigint,                 -- clients.id, если клиент найден
+            phone_digits  text NOT NULL,          -- по нему ищем ответ клиента
+            order_at      timestamptz,            -- когда работа
+            status        text NOT NULL,          -- planned|confirmed|refused|owner_notified|dropped
+            outbox_id     bigint,                 -- письмо-вопрос в очереди
+            asked_at      timestamptz,            -- плановое время вопроса; NULL — вопроса не будет
+            asked_sent_at timestamptz,            -- когда вопрос ушёл клиенту; NULL — ещё не ушёл
+            answered_at   timestamptz,
+            answer_text   text,
+            notified_at   timestamptz,            -- когда позвали владельца
+            created_at    timestamptz NOT NULL DEFAULT NOW(),
+            updated_at    timestamptz NOT NULL DEFAULT NOW()
         );
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE order_confirmations
+        ADD COLUMN IF NOT EXISTS asked_sent_at timestamptz;
+        """
+    )
+    # Ожидания, заведённые до этой правки, факта отправки не знают. Берём его
+    # у самого письма: без этого живые заказы, по которым вопрос уже ушёл,
+    # разом перестали бы принимать ответы клиентов.
+    await conn.execute(
+        """
+        UPDATE order_confirmations oc
+        SET asked_sent_at = o.sent_at
+        FROM notification_outbox o
+        WHERE oc.outbox_id = o.id
+          AND oc.asked_sent_at IS NULL
+          AND o.sent_at IS NOT NULL;
         """
     )
     await conn.execute(
@@ -1053,10 +1085,21 @@ async def ensure_client_messaging_schema(conn: asyncpg.Connection) -> None:
         ON order_confirmations(phone_digits, status);
         """
     )
+    # Имя индекса, а не его состав, решает для `IF NOT EXISTS`: оставь мы старое
+    # имя — на проде так и жил бы индекс по плановому времени, а сторож молчунов
+    # ходил бы по нему вслепую.
     await conn.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_order_confirmations_asked
-        ON order_confirmations(status, asked_at);
+        CREATE INDEX IF NOT EXISTS idx_order_confirmations_asked_sent
+        ON order_confirmations(status, asked_sent_at);
+        """
+    )
+    await conn.execute("DROP INDEX IF EXISTS idx_order_confirmations_asked;")
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_confirmations_outbox
+        ON order_confirmations(outbox_id)
+        WHERE outbox_id IS NOT NULL;
         """
     )
 
@@ -2000,13 +2043,15 @@ async def _confirmation_apply(conn: asyncpg.Connection, *, lead_id: int,
     outbox_id: int | None = None
     if plan.ask_at is not None:
         outbox_id = await enqueue_notification(
-            conn, notification_rules, event_key="order_confirm_request",
+            conn, notification_rules, event_key=CONFIRM_REQUEST_EVENT,
             client_id=int(client_row["id"]), payload=payload,
             scheduled_at=plan.ask_at)
 
-    # `asked_at` — плановое время вопроса, а не факт отправки: владелец решил,
-    # что причина молчания роли не играет. Не ушло письмо или клиент его
-    # проигнорировал — через три часа владелец узнает в обоих случаях.
+    # `asked_at` — только плановое время вопроса. Факт отправки появится
+    # отдельно, в `asked_sent_at`, когда письмо действительно уйдёт клиенту:
+    # до этого момента ожидание спит и ответом ничего не считает.
+    # Строка заводится всё равно сразу — она держит связь письмо ↔ заказ ↔ сделка,
+    # без которой нечего было бы отменять и нечего двигать по ответу «да».
     await conn.execute(
         """
         INSERT INTO order_confirmations (
@@ -2179,11 +2224,114 @@ async def run_client_messaging_cycle() -> None:
         logger.info("Разговор с клиентом: %s", counters)
 
 
+async def _confirmation_before_send(entry: NotificationOutboxEntry) -> PreSendVerdict:
+    """Можно ли задавать вопрос по этому заказу прямо сейчас.
+
+    Между планированием вопроса и его отправкой проходят сутки, и за эти сутки
+    заказ мог исчезнуть. 2026-09-03 сделку удалили совсем — заказ завёлся по
+    ошибке из дублированной записи календаря, — а письмо-вопрос осталось ждать
+    своего часа. Решение владельца: по закрытой сделке вопросов не задаём.
+
+    Владельцу об отмене не пишем: это не событие, а несостоявшееся событие.
+    Счётчик уходит в суточную сводку разговора с клиентом.
+
+    Три разных «нет» здесь путать нельзя. «Сделки нет» — отменяем письмо
+    навсегда. «CRM не ответила» — откладываем: наказывать живого клиента
+    за сетевую заминку нечестно. «Сделка не наша забота» (связь не нашлась
+    ещё при заведении ожидания) — шлём: заказ, скорее всего, настоящий,
+    и молчание было бы хуже лишнего вопроса.
+    """
+    if not is_question_letter(entry.event_key):
+        return PRE_SEND_OK
+    if pool is None or not CLIENT_MESSAGING_ENABLED or not _amocrm_api_enabled():
+        return PRE_SEND_OK
+
+    async with pool.acquire() as conn:
+        pending = await conn.fetchrow(
+            "SELECT lead_id, deal_id FROM order_confirmations WHERE outbox_id = $1",
+            entry.id,
+        )
+    if pending is None or not pending["deal_id"]:
+        return PRE_SEND_OK
+
+    deal_id = int(pending["deal_id"])
+    try:
+        async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+            deal = await client.fetch_lead(deal_id)
+    except AmoCRMAPIError as exc:
+        if exc.status != 404:
+            return PreSendVerdict("retry",
+                                  f"amoCRM не ответила про сделку {deal_id}: {exc}")
+        deal = None
+    except Exception as exc:  # noqa: BLE001 — сеть моргнула, письмо подождёт
+        return PreSendVerdict("retry",
+                              f"сделку {deal_id} проверить не удалось: {exc}")
+
+    allowed, reason = may_ask_question(deal)
+    if allowed:
+        return PRE_SEND_OK
+
+    logger.info("Разговор с клиентом: вопрос по сделке %s отменён — %s",
+                deal_id, reason)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE order_confirmations
+            SET status = 'dropped',
+                updated_at = NOW()
+            WHERE outbox_id = $1
+              AND status = 'planned'
+            """,
+            entry.id,
+        )
+        await conn.execute(
+            """
+            INSERT INTO amocrm_api_events (
+                event_id, event_type, entity_id, payload, action, created_at
+            )
+            VALUES ($1, 'confirmation_status', $2, $3::jsonb, 'question_dropped', $4)
+            ON CONFLICT (event_id) DO NOTHING
+            """,
+            f"confirmation_dropped:{entry.id}",
+            str(pending["lead_id"]),
+            json.dumps({"deal_id": deal_id, "reason": reason}, ensure_ascii=False),
+            int(datetime.now(timezone.utc).timestamp()),
+        )
+    return PreSendVerdict("cancel", reason)
+
+
+async def _confirmation_after_send(conn: asyncpg.Connection,
+                                   entry: NotificationOutboxEntry) -> None:
+    """Вопрос ушёл клиенту — с этой секунды ожидание живое.
+
+    До этой отметки ответом не считается ничего: клиент мог написать по своему
+    делу, и робот не имеет права принять это за «да». Запись идёт той же
+    транзакцией, что и отметка «письмо отправлено», — разойдись они, робот
+    получил бы отправленный вопрос, про который не помнит, что задавал.
+    """
+    if not is_question_letter(entry.event_key):
+        return
+    await conn.execute(
+        """
+        UPDATE order_confirmations
+        SET asked_sent_at = NOW(),
+            updated_at = NOW()
+        WHERE outbox_id = $1
+          AND asked_sent_at IS NULL
+        """,
+        entry.id,
+    )
+
+
 async def run_confirmation_silence_watch() -> None:
     """Клиент молчит три часа после вопроса — зовём владельца, ровно один раз.
 
     Причина молчания роли не играет (решение владельца): не ответил, не увидел,
     нет мессенджера — владельцу в любом случае нужно позвонить самому.
+
+    Три часа отсчитываются от факта отправки. По плановому времени робот звал бы
+    владельца к молчанию по вопросу, которого ещё не задавал: между заведением
+    ожидания и самим вопросом проходят дни.
     """
     if not CLIENT_MESSAGING_ENABLED or pool is None:
         return
@@ -2192,15 +2340,15 @@ async def run_confirmation_silence_watch() -> None:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT oc.lead_id, oc.deal_id, oc.order_at, oc.asked_at, oc.notified_at,
-                   oc.phone_digits, c.full_name, c.phone
+            SELECT oc.lead_id, oc.deal_id, oc.order_at, oc.asked_sent_at,
+                   oc.notified_at, oc.phone_digits, c.full_name, c.phone
             FROM order_confirmations oc
             LEFT JOIN clients c ON c.id = oc.client_id
             WHERE oc.status = 'planned'
-              AND oc.asked_at IS NOT NULL
+              AND oc.asked_sent_at IS NOT NULL
               AND oc.notified_at IS NULL
-              AND oc.asked_at <= $1
-            ORDER BY oc.asked_at
+              AND oc.asked_sent_at <= $1
+            ORDER BY oc.asked_sent_at
             LIMIT 50
             """,
             now - SILENCE_LIMIT,
@@ -2210,7 +2358,7 @@ async def run_confirmation_silence_watch() -> None:
     for row in rows:
         # Запрос уже сузил выборку, но решение принимает правило: разойдись
         # они однажды — молчаливо победил бы SQL, а он тестами не покрыт.
-        if not should_call_owner(asked_at=row["asked_at"],
+        if not should_call_owner(asked_sent_at=row["asked_sent_at"],
                                  notified_at=row["notified_at"], now=now):
             continue
         await _confirmation_notify_owner(owner_alert_text(
@@ -3325,6 +3473,12 @@ def _confirmation_order_at_msk(pending: Mapping[str, Any]) -> datetime | None:
 async def _confirmation_pending_for(digits: str) -> asyncpg.Record | None:
     """Живое ожидание подтверждения по телефону клиента.
 
+    Живое — значит вопрос клиенту **уже ушёл** (`asked_sent_at`). Заведённое,
+    но ещё не отправленное ожидание сюда не попадает: пока вопроса не было,
+    любое письмо клиента — его собственное дело. Отбор идёт в запросе, а не
+    после него, ради редкого, но злого случая: у клиента два заказа подряд,
+    свежий ещё не спрошен, а ответ пришёл на предыдущий.
+
     Ожидание умирает через сутки после работы: «да», пришедшее через неделю,
     подтверждать уже нечего — мастер либо съездил, либо нет.
     """
@@ -3334,11 +3488,13 @@ async def _confirmation_pending_for(digits: str) -> asyncpg.Record | None:
         return await conn.fetchrow(
             """
             SELECT oc.lead_id, oc.deal_id, oc.client_id, oc.status, oc.order_at,
-                   oc.phone_digits, oc.notified_at, c.full_name, c.phone
+                   oc.phone_digits, oc.notified_at, oc.asked_sent_at,
+                   c.full_name, c.phone
             FROM order_confirmations oc
             LEFT JOIN clients c ON c.id = oc.client_id
             WHERE oc.phone_digits = $1
               AND oc.status IN ('planned', 'owner_notified')
+              AND oc.asked_sent_at IS NOT NULL
               AND (oc.order_at IS NULL OR oc.order_at >= NOW() - $2::interval)
             ORDER BY oc.created_at DESC
             LIMIT 1
@@ -3524,7 +3680,10 @@ async def handle_wahelp_inbound(payload: Mapping[str, Any]) -> bool:
     pending = await _confirmation_pending_for(digits) if CLIENT_MESSAGING_ENABLED else None
     if pending is not None:
         answer = parse_answer(normalized_text)
-        action = decide_on_answer(answer=answer, status=str(pending["status"]))
+        # Запрос уже отсеял неотправленные вопросы, но решение принимает правило:
+        # разойдись они однажды — молчаливо победил бы SQL, а он не покрыт тестами.
+        action = decide_on_answer(answer=answer, status=str(pending["status"]),
+                                  asked_sent_at=pending["asked_sent_at"])
         if action == "confirm":
             await _confirmation_accept(pending, normalized_text)
             return True
@@ -5879,6 +6038,7 @@ CLIENT_MESSAGING_ACTION_WORDS: dict[str, str] = {
     "no_phone": "заказов без телефона в сделке",
     "not_needed": "заказов без писем — нет даты или работа уже прошла",
     "already_planned": "повторных заходов сделки — писать второй раз не стал",
+    "question_dropped": "вопросов отменено — заказа больше нет",
     "error": "ошибок — повторю",
     "rehearsal_confirmation_sent": "репетиция: написал бы и спросил за сутки",
     "rehearsal_confirmation_only": "репетиция: написал бы только подтверждение",
@@ -5889,6 +6049,7 @@ CONFIRMATION_STATUS_WORDS: dict[str, str] = {
     "confirmed": "клиентов подтвердили заказ",
     "refused": "клиентов отказались",
     "owner_notified": "раз позвал вас — отказ, непонятный ответ или молчание",
+    "dropped": "ожиданий закрыто — вопрос не задавали",
 }
 
 
@@ -14388,6 +14549,8 @@ async def main():
             promo_texts_fn=get_promo_texts,
             birthday_texts_fn=get_birthday_texts,
             logs_chat_id=LOGS_CHAT_ID,
+            before_send=_confirmation_before_send,
+            after_send=_confirmation_after_send,
         )
         notification_worker.start()
     if WAHELP_WEBHOOK_PORT > 0:
