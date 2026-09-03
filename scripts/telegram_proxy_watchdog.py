@@ -125,10 +125,12 @@ def build_alert_text(action: str, state: dict[str, Any], now: float) -> str:
     return (
         "Бот не достучался до Telegram через голландский прокси.\n"
         f"Молчит {humanize_minutes(now - float(down_since))}.\n\n"
-        "Что проверить: сервер Contabo и контейнер telegram-proxy.\n"
-        "Быстрый откат: закомментировать TELEGRAM_PROXY_URL "
-        "в /opt/telegram-bot/.env и перезапустить бота — "
-        "он вернётся на прямой маршрут."
+        "Через прокси ходят все три бота: рабочий, клиентский и админский.\n"
+        "Что проверить: сервер Contabo и контейнер telegram-proxy.\n\n"
+        "Откат на прямой путь:\n"
+        "рабочий и клиентский — закомментировать TELEGRAM_PROXY_URL "
+        "в /opt/telegram-bot/.env и /opt/telegram-bot-v2/.env, перезапустить;\n"
+        "админский — sudo raketa-admin-bot-update --telegram-proxy-off"
     )
 
 
