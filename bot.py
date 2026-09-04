@@ -163,8 +163,11 @@ from notifications.client_messaging import (
     is_question_letter,
     letter_failure_words,
     letter_payload,
+    decide_on_order,
     may_ask_question,
     order_from_lead,
+    owner_handles,
+    should_keep_waiting,
     owner_alert_text,
     parse_answer,
     pick_realization_deal,
@@ -504,6 +507,7 @@ weekly_leads_task: asyncio.Task | None = None      # понедельничны�
 client_messaging_task: asyncio.Task | None = None  # письма клиенту до работы
 confirmation_watch_task: asyncio.Task | None = None  # сторож молчунов
 unasked_watch_task: asyncio.Task | None = None       # сторож незаданных вопросов
+deferred_retry_task: asyncio.Task | None = None      # добор заказов без дочерней сделки
 client_bot_health_task: asyncio.Task | None = None
 amocrm_api_task: asyncio.Task | None = None
 BONUS_CHANGE_NOTIFICATIONS_ENABLED = False
@@ -2092,13 +2096,26 @@ async def _confirmation_handle_lead(client: AmoCRMAPIClient, lead_id: int, *,
     # прямо из календаря. В лид те же поля попадают из карточки клиента и
     # приходят испорченными — 2026-08-28 вместо адреса там стояло слово «адрес».
     deal_id = await _confirmation_find_deal(client, lead_id, order)
+    deal: Mapping[str, Any] | None = None
     if deal_id:
         try:
             deal = await client.fetch_lead(int(deal_id))
-            order = prefer_deal_details(order_from_lead(deal, tz=MOSCOW_TZ), order)
-        except Exception as exc:  # noqa: BLE001 — письмо уйдёт по данным лида
-            logger.warning("Сделка %s не прочитана, беру данные из лида: %s",
-                           deal_id, exc)
+        except Exception as exc:  # noqa: BLE001 — решим на следующем проходе
+            # Раньше письмо уходило по данным лида. Но по непрочитанной карточке
+            # нельзя сказать, наш ли это заказ вообще, — а писать вслепую как раз
+            # и означает написать клиенту чужой воронки.
+            logger.warning("Сделка %s не прочитана, отложу заказ: %s", deal_id, exc)
+            deal = None
+
+    verdict, reason = decide_on_order(lead=lead, deal=deal)
+    if verdict != "take":
+        result = "deferred" if verdict == "wait" else "not_ours"
+        async with pool.acquire() as conn:
+            await _amocrm_mark_event_action(conn, journal_key, result, error=reason)
+        logger.info("Разговор с клиентом: лид %s — %s (%s)", lead_id, result, reason)
+        return result
+
+    order = prefer_deal_details(order_from_lead(deal, tz=MOSCOW_TZ), order)
 
     plan = plan_confirmation(order_at=order.order_at, now=datetime.now(MOSCOW_TZ))
 
@@ -2270,7 +2287,22 @@ async def _confirmation_before_send(entry: NotificationOutboxEntry) -> PreSendVe
         return PreSendVerdict("retry",
                               f"сделку {deal_id} проверить не удалось: {exc}")
 
-    allowed, reason = may_ask_question(deal)
+    if owner_handles(deal):
+        allowed, reason = False, "владелец ведёт заказ сам"
+    else:
+        allowed, reason = may_ask_question(deal)
+
+    # Галочку владелец мог поставить и на лиде — карточек в цепочке две, и
+    # обещание «ставьте где удобно» держится только если робот смотрит обе.
+    # Вопросов за сутки единицы, лишний запрос в CRM здесь ничего не стоит.
+    if allowed:
+        try:
+            async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+                if owner_handles(await client.fetch_lead(int(pending["lead_id"]))):
+                    allowed, reason = False, "владелец ведёт заказ сам"
+        except Exception as exc:  # noqa: BLE001 — сеть моргнула, письмо подождёт
+            return PreSendVerdict("retry",
+                                  f"лид {pending['lead_id']} проверить не удалось: {exc}")
     if allowed:
         return PRE_SEND_OK
 
@@ -2397,6 +2429,63 @@ async def run_unasked_question_watch() -> None:
     if called:
         logger.info("Разговор с клиентом: позвал владельца к %s незаданным вопросам",
                     called)
+
+
+async def run_confirmation_deferred_retry() -> None:
+    """Заказы, отложенные до появления дочерней сделки, — разобрать заново.
+
+    Сейлзбот amoCRM создаёт сделку через секунды после «Передано в работу»,
+    но наш проход иногда приходит раньше него. Раньше робот в этом случае писал
+    клиенту по данным лида и оставался без номера сделки: отменить такое письмо
+    потом было нечем (2026-08-31, гостиница «Заречная» — сделку удалили, а
+    вопрос клиенту продолжал ждать своего часа).
+
+    Ходит тем же ритмом, что и опрос. Час ожидания — примерно шесть попыток;
+    не появилась — бросаем и считаем в суточной сводке. Ждать дольше нечестно:
+    вопрос уходит за сутки до работы, и бесконечное ожидание молча съело бы
+    и письмо, и вопрос.
+    """
+    if not CLIENT_MESSAGING_ENABLED or pool is None or not _amocrm_api_enabled():
+        return
+
+    journal_type = ("confirmation_rehearsal" if CLIENT_MESSAGING_DRY_RUN
+                    else "confirmation_status")
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT event_id, entity_id, created_at
+            FROM amocrm_api_events
+            WHERE event_type = $1
+              AND action = 'deferred'
+            ORDER BY created_at
+            LIMIT 50
+            """,
+            journal_type,
+        )
+    if not rows:
+        return
+
+    async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+        for row in rows:
+            event_at = datetime.fromtimestamp(int(row["created_at"] or 0),
+                                              tz=timezone.utc)
+            if not should_keep_waiting(event_at=event_at, now=now):
+                async with pool.acquire() as conn:
+                    await _amocrm_mark_event_action(
+                        conn, row["event_id"], "deal_never_came",
+                        error="дочерняя сделка так и не появилась")
+                logger.info("Разговор с клиентом: лид %s брошен — сделки нет",
+                            row["entity_id"])
+                continue
+            try:
+                await _confirmation_handle_lead(
+                    client, int(row["entity_id"]),
+                    dry_run=CLIENT_MESSAGING_DRY_RUN,
+                    journal_key=str(row["event_id"]))
+            except Exception as exc:  # noqa: BLE001 — один заказ не роняет проход
+                logger.exception("Разговор с клиентом: отложенный лид %s "
+                                 "не разобран: %s", row["entity_id"], exc)
 
 
 async def run_confirmation_silence_watch() -> None:
@@ -3603,7 +3692,12 @@ async def _confirmation_accept(pending: Mapping[str, Any], answer_text: str) -> 
         try:
             async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
                 deal = await client.fetch_lead(int(deal_id))
-                if should_move_deal(deal.get("status_id")):
+                if owner_handles(deal):
+                    # Единственное место, где робот пишет в CRM, — и потому
+                    # единственное, где он способен затереть ручную работу.
+                    logger.info("Сделка %s: владелец ведёт заказ сам — не двигаю",
+                                deal_id)
+                elif should_move_deal(deal.get("status_id")):
                     await client.update_lead_status(int(deal_id), AMO_STAGE_CONFIRMED)
                 else:
                     # Сделку уже двинул человек — его работу робот не откатывает.
@@ -6119,6 +6213,9 @@ CLIENT_MESSAGING_ACTION_WORDS: dict[str, str] = {
     "not_needed": "заказов без писем — нет даты или работа уже прошла",
     "already_planned": "повторных заходов сделки — писать второй раз не стал",
     "question_dropped": "вопросов отменено — заказа больше нет",
+    "not_ours": "заказов пропущено — не наша воронка или вы ведёте их сами",
+    "deferred": "заказов отложено — жду, пока в CRM появится сделка",
+    "deal_never_came": "заказов брошено — сделка в CRM так и не появилась",
     "error": "ошибок — повторю",
     "rehearsal_confirmation_sent": "репетиция: написал бы и спросил за сутки",
     "rehearsal_confirmation_only": "репетиция: написал бы только подтверждение",
@@ -14526,7 +14623,7 @@ async def unknown(msg: Message, state: FSMContext):
     await msg.answer("Команда не распознана. Выберите действие на клавиатуре ниже.", reply_markup=kb)
 
 async def main():
-    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, exchange_task, weekly_leads_task, client_messaging_task, confirmation_watch_task, unasked_watch_task
+    global pool, daily_reports_task, birthday_task, promo_task, wire_reminder_task, notification_rules, notification_worker, wahelp_webhook, leads_promo_task, rewash_counter_task, sent_retry_task, dead_channels_cleanup_task, client_bot_health_task, amocrm_api_task, exchange_task, weekly_leads_task, client_messaging_task, confirmation_watch_task, unasked_watch_task, deferred_retry_task
     notification_rules = _load_notification_rules()
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=5)
     dp["pool"] = pool
@@ -14617,6 +14714,14 @@ async def main():
             schedule_periodic_job(CLIENT_MESSAGING_INTERVAL_SEC,
                                   run_unasked_question_watch,
                                   "confirmation_unasked")
+        )
+    if deferred_retry_task is None and CLIENT_MESSAGING_ENABLED:
+        # Тем же ритмом, что и опрос: дочерняя сделка появляется за секунды,
+        # так что за час ожидания набирается около шести попыток.
+        deferred_retry_task = asyncio.create_task(
+            schedule_periodic_job(CLIENT_MESSAGING_INTERVAL_SEC,
+                                  run_confirmation_deferred_retry,
+                                  "confirmation_deferred")
         )
     if client_bot_health_task is None:
         client_bot_health_task = asyncio.create_task(

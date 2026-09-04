@@ -15,6 +15,9 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
+
+from notifications import client_messaging as cm
 
 from notifications.client_messaging import (
     AMO_PIPELINE_REALIZATION,
@@ -533,3 +536,112 @@ class LetterTextsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TakeOrderRules(unittest.TestCase):
+    """Брать ли заказ в работу.
+
+    Проверка воронки задумывалась с самого начала — в модуле так и написано:
+    «воронку проверяем всегда, без этого робот написал бы клиентам чужих
+    сделок». Но дорог к дочерней сделке две (примечание в лиде и поиск по
+    времени), а забор стоял только на второй. 2026-08-31 заказ по коврам
+    прошёл по первой.
+    """
+
+    LEAD = {"id": 31581307, "pipeline_id": 4482751}
+
+    def _deal(self, pipeline_id, **extra):
+        return {"id": 31585339, "pipeline_id": pipeline_id, **extra}
+
+    def _flagged(self, entity):
+        """Та же карточка, но с галочкой «веду сам»."""
+        return {**entity, "custom_fields_values": [
+            {"field_id": cm.AMO_FIELD_OWNER_HANDLES, "values": [{"value": "1"}]}]}
+
+    def test_cleaning_order_is_taken(self):
+        verdict, _ = cm.decide_on_order(
+            lead=self.LEAD, deal=self._deal(AMO_PIPELINE_REALIZATION))
+        self.assertEqual(verdict, "take")
+
+    def test_carpet_order_is_skipped(self):
+        """Живой случай: сейлзбот увёл сделку в «Ковры Кристал» (4645519)."""
+        verdict, reason = cm.decide_on_order(
+            lead=self.LEAD, deal=self._deal(4645519))
+        self.assertEqual(verdict, "skip")
+        self.assertEqual(reason, "заказ не нашей воронки")
+
+    def test_missing_deal_waits_instead_of_writing_blind(self):
+        """Сделки нет — не «не наш заказ», а «сейлзбот ещё не успел»."""
+        verdict, reason = cm.decide_on_order(lead=self.LEAD, deal=None)
+        self.assertEqual(verdict, "wait")
+        self.assertIn("ещё нет", reason)
+
+    def test_owner_flag_on_deal_stops_the_robot(self):
+        with mock.patch.object(cm, "AMO_FIELD_OWNER_HANDLES", 999001):
+            verdict, reason = cm.decide_on_order(
+                lead=self.LEAD,
+                deal=self._flagged(self._deal(AMO_PIPELINE_REALIZATION)))
+        self.assertEqual(verdict, "skip")
+        self.assertEqual(reason, "владелец ведёт заказ сам")
+
+    def test_owner_flag_on_lead_stops_the_robot_before_waiting(self):
+        """Сказано «веду сам» — робот не ждёт сделку, а уходит совсем."""
+        with mock.patch.object(cm, "AMO_FIELD_OWNER_HANDLES", 999001):
+            verdict, reason = cm.decide_on_order(
+                lead=self._flagged(self.LEAD), deal=None)
+        self.assertEqual(verdict, "skip")
+        self.assertEqual(reason, "владелец ведёт заказ сам")
+
+
+class OwnerHandlesFlag(unittest.TestCase):
+    """Чтение галочки «заказ ведёт владелец» из карточки amoCRM."""
+
+    FIELD = 999001
+
+    def _card(self, value):
+        return {"custom_fields_values": [
+            {"field_id": self.FIELD, "values": [{"value": value}]}]}
+
+    def test_checked_box_is_read(self):
+        with mock.patch.object(cm, "AMO_FIELD_OWNER_HANDLES", self.FIELD):
+            self.assertTrue(cm.owner_handles(self._card(True)))
+            self.assertTrue(cm.owner_handles(self._card("1")))
+
+    def test_unchecked_box_is_not_read(self):
+        """amoCRM отдаёт снятую галочку пустым значением, но «0» тоже бывает."""
+        with mock.patch.object(cm, "AMO_FIELD_OWNER_HANDLES", self.FIELD):
+            self.assertFalse(cm.owner_handles(self._card("0")))
+            self.assertFalse(cm.owner_handles(self._card(False)))
+            self.assertFalse(cm.owner_handles({"custom_fields_values": []}))
+            self.assertFalse(cm.owner_handles(None))
+
+    def test_field_not_created_yet_means_no_flag(self):
+        """Пока номер поля не проставлен, метки нет — а не «есть у всех»."""
+        with mock.patch.object(cm, "AMO_FIELD_OWNER_HANDLES", 0):
+            self.assertFalse(cm.owner_handles(self._card("1")))
+
+    def test_other_field_is_not_mistaken_for_the_flag(self):
+        with mock.patch.object(cm, "AMO_FIELD_OWNER_HANDLES", self.FIELD):
+            self.assertFalse(cm.owner_handles(
+                {"custom_fields_values": [
+                    {"field_id": 18639, "values": [{"value": "Ленина 1"}]}]}))
+
+
+class WaitingForTheChildDeal(unittest.TestCase):
+    """Сколько ждать сделку, прежде чем сдаться."""
+
+    NOW = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+
+    def test_fresh_event_keeps_waiting(self):
+        self.assertTrue(cm.should_keep_waiting(
+            event_at=self.NOW - timedelta(minutes=10), now=self.NOW))
+
+    def test_old_event_gives_up(self):
+        self.assertFalse(cm.should_keep_waiting(
+            event_at=self.NOW - cm.DEAL_WAIT_LIMIT - timedelta(minutes=1),
+            now=self.NOW))
+
+    def test_boundary_belongs_to_giving_up(self):
+        """Ровно час — уже сдаёмся: иначе граница зависит от секунды прохода."""
+        self.assertFalse(cm.should_keep_waiting(
+            event_at=self.NOW - cm.DEAL_WAIT_LIMIT, now=self.NOW))
