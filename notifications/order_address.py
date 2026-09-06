@@ -6,7 +6,7 @@
 адрес стал свойством заказа: в момент проведения бот спрашивает у amoCRM
 адрес открытой сделки клиента и запоминает его в самом заказе.
 
-Два правила важнее остальных:
+Три правила важнее остальных:
 
 1. **Проведение заказа от amoCRM не зависит.** Недоступная CRM, медленный
    ответ, ненайденный контакт — всё это «адреса нет», а не ошибка мастеру.
@@ -17,6 +17,9 @@
    и сегодняшняя). Контакт сверяем по окончанию номера, сделку выбираем по
    близости даты работы к моменту проведения, а не по свежести: «самая новая»
    на второй заказ подряд указала бы не на ту.
+3. **Неверный адрес хуже отсутствующего.** «Адреса нет» честно откатывается на
+   карточку клиента, а неверный выглядит правдоподобно, и заметят его поздно.
+   Поэтому сомнительные сделки лучше выбросить, чем взять.
 
 Ни базы, ни `bot.py` модуль не знает: сюда приходит клиент amoCRM (любой объект
 с двумя нужными методами), отсюда уходит строка адреса или ничего.
@@ -40,7 +43,9 @@ from .client_messaging import AMO_FIELD_ORDER_DATETIME, AMO_PIPELINE_REALIZATION
 
 logger = logging.getLogger(__name__)
 
-LOOKUP_TIMEOUT = 8.0   # секунд на весь поход в amoCRM при проведении заказа
+LOOKUP_TIMEOUT = 8.0                 # секунд на весь поход в amoCRM при проведении заказа
+MAX_DEAL_DISTANCE = 2 * 24 * 3600    # двое суток вокруг проведения — дальше это другой заказ
+MAX_LEADS_TO_FETCH = 50              # столько самых новых сделок клиента успеваем прочитать
 
 
 def phone_query(phone: Optional[str]) -> Optional[str]:
@@ -108,25 +113,41 @@ def pick_open_deal(deals: list[Mapping[str, Any]], *,
     Старая «Заказ выполнен, ждёт оплаты» тоже открыта, но ездили не по ней,
     а заказ на следующую неделю уже заведён и тоже мешает.
 
+    Дальше `MAX_DEAL_DISTANCE` от момента проведения сделка выбывает совсем,
+    а не отходит в конец очереди: заказ на следующий месяц — это другой заказ
+    по другому адресу. Иначе ловушка выглядит так: сегодняшнюю сделку владелец
+    уже закрыл или завёл без даты, зато у постоянного клиента открыта сделка
+    на месяц вперёд — и она бы выиграла. Взять её значит напечатать в отчёте
+    правдоподобный, но неверный адрес; отсутствие адреса честнее — оно молча
+    откатывается на карточку клиента.
+
     При равном расстоянии выигрывает прошедшая: работу уже сделали, а не
     только собираются. Сделки без даты (или с датой, испорченной ручной
     правкой) — последняя надежда, среди них берём самую свежую.
+
+    `now` обязан быть с часовым поясом: сдвиг на три часа меняет выбор между
+    сделками одного дня, и ошибка эта была бы тихой.
     """
+    if now.tzinfo is None:
+        raise ValueError("pick_open_deal: now должен быть с часовым поясом")
     now_ts = now.timestamp()
     dated: list[tuple[float, int, Mapping[str, Any]]] = []
     undated: list[tuple[int, Mapping[str, Any]]] = []
     for deal in deals:
         if not isinstance(deal, Mapping):
             continue
-        if int(deal.get("pipeline_id") or 0) != AMO_PIPELINE_REALIZATION:
+        if _as_int(deal.get("pipeline_id")) != AMO_PIPELINE_REALIZATION:
             continue
-        if int(deal.get("status_id") or 0) in (AMO_STATUS_WON, AMO_STATUS_LOST):
+        if _as_int(deal.get("status_id")) in (AMO_STATUS_WON, AMO_STATUS_LOST):
             continue
         order_ts = _order_timestamp(deal)
         if order_ts is None:
             undated.append((_as_int(deal.get("created_at")), deal))
-        else:
-            dated.append((abs(order_ts - now_ts), 0 if order_ts <= now_ts else 1, deal))
+            continue
+        distance = abs(order_ts - now_ts)
+        if distance > MAX_DEAL_DISTANCE:
+            continue
+        dated.append((distance, 0 if order_ts <= now_ts else 1, deal))
     if dated:
         return min(dated, key=lambda item: (item[0], item[1]))[2]
     if undated:
@@ -134,7 +155,7 @@ def pick_open_deal(deals: list[Mapping[str, Any]], *,
     return None
 
 
-def deal_address(deal: Optional[Mapping[str, Any]]) -> Optional[str]:
+def address_of_deal(deal: Optional[Mapping[str, Any]]) -> Optional[str]:
     """Адрес из карточки сделки. Нет поля — нет адреса, гадать не о чем."""
     if not deal:
         return None
@@ -165,11 +186,14 @@ async def fetch_deal_address(client: Any, phone: Optional[str], *, now: datetime
     Исключений не бросает никогда: мастер ждёт «Готово ✅», и упавшая или
     задумавшаяся CRM не имеет права ни сломать проведение, ни задержать его
     дольше `timeout`. Всё, что пошло не так, — строка в журнале и «адреса нет».
+
+    В журнал уходит только тип ошибки и код ответа: тело ответа amoCRM
+    повторяет параметры запроса, а в них — телефон клиента.
     """
     phone10 = phone_query(phone)
     if not phone10:
-        logger.warning("адрес заказа: телефон %s не годится для поиска в amoCRM",
-                       _mask(phone))
+        logger.info("адрес заказа: телефон %s не годится для поиска в amoCRM",
+                    _mask(phone))
         return None
     try:
         return await asyncio.wait_for(_lookup(client, phone10, now=now), timeout)
@@ -178,29 +202,40 @@ async def fetch_deal_address(client: Any, phone: Optional[str], *, now: datetime
                        timeout, _mask(phone10))
         return None
     except Exception as err:  # noqa: BLE001
-        logger.warning("адрес заказа: amoCRM не дала ответа (%s): %s",
-                       _mask(phone10), err)
+        logger.warning("адрес заказа: amoCRM не дала ответа (%s): %s %s",
+                       _mask(phone10), type(err).__name__, getattr(err, "status", None))
         return None
 
 
 async def _lookup(client: Any, phone10: str, *,
                   now: datetime) -> Optional[str]:
-    """Два запроса: контакты по номеру, затем их сделки пачкой."""
+    """Два запроса: контакты по номеру, затем их сделки одной пачкой.
+
+    Сделок берём не больше `MAX_LEADS_TO_FETCH` самых новых (номера в amoCRM
+    растут): у клиента с тридцатью заказами полный список стоил бы трёх
+    запросов, а восьми секунд на это нет.
+    """
     contacts = [contact for contact in await client.find_contacts_by_phone(phone10)
                 if isinstance(contact, Mapping) and contact_matches_phone(contact, phone10)]
     if not contacts:
-        logger.warning("адрес заказа: контакта с номером %s в amoCRM нет", _mask(phone10))
+        logger.info("адрес заказа: контакта с номером %s в amoCRM нет", _mask(phone10))
         return None
     lead_ids: list[int] = []
     for contact in contacts:
         lead_ids.extend(contact_lead_ids(contact))
     if not lead_ids:
-        logger.warning("адрес заказа: у контакта %s нет сделок", _mask(phone10))
+        logger.info("адрес заказа: у контакта %s нет сделок", _mask(phone10))
         return None
+    if len(lead_ids) > MAX_LEADS_TO_FETCH:
+        newest = set(sorted(lead_ids, reverse=True)[:MAX_LEADS_TO_FETCH])
+        lead_ids = [lead_id for lead_id in lead_ids if lead_id in newest]
     deals = list(await client.fetch_leads_by_ids(lead_ids))
-    address = deal_address(pick_open_deal(deals, now=now))
+    deal = pick_open_deal(deals, now=now)
+    address = address_of_deal(deal)
     if not address:
-        logger.warning("адрес заказа: открытой сделки с адресом нет (%s)", _mask(phone10))
+        logger.info("адрес заказа: открытой сделки с адресом нет (%s)", _mask(phone10))
+        return None
+    logger.info("адрес заказа для %s: сделка %s", _mask(phone10), (deal or {}).get("id"))
     return address
 
 
@@ -230,9 +265,11 @@ def _mask(phone: Optional[str]) -> str:
 
 __all__ = [
     "LOOKUP_TIMEOUT",
+    "MAX_DEAL_DISTANCE",
+    "MAX_LEADS_TO_FETCH",
+    "address_of_deal",
     "contact_lead_ids",
     "contact_matches_phone",
-    "deal_address",
     "fetch_deal_address",
     "phone_query",
     "pick_open_deal",

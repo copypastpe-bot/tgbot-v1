@@ -515,8 +515,17 @@ class AmoCRMPhoneLookupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["with"], "leads")
 
     async def test_find_contacts_by_phone_without_embedded_is_empty(self):
-        """amoCRM отвечает 204 без тела, когда ничего не нашла."""
-        session = SequenceHTTPSession([FakeHTTPResponse(204, {})])
+        """amoCRM отвечает 204 без тела, когда ничего не нашла: разбирать
+        нечего, и клиент обязан вернуть пустой список, а не упасть."""
+
+        class EmptyBodyResponse(FakeHTTPResponse):
+            async def json(self):
+                raise ValueError("no body")
+
+            async def text(self):
+                return ""
+
+        session = SequenceHTTPSession([EmptyBodyResponse(204, {})])
         client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
 
         self.assertEqual(await client.find_contacts_by_phone("9001234567"), [])

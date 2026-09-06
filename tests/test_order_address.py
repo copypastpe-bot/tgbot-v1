@@ -18,9 +18,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from notifications.order_address import (
+    MAX_DEAL_DISTANCE,
+    address_of_deal,
     contact_lead_ids,
     contact_matches_phone,
-    deal_address,
     fetch_deal_address,
     phone_query,
     pick_open_deal,
@@ -158,7 +159,7 @@ class PickOpenDealTests(unittest.TestCase):
 
     def test_dated_deal_beats_undated(self):
         undated = _deal(1, created_at=999)
-        dated = _deal(2, order_at=NOW + timedelta(days=3), created_at=1)
+        dated = _deal(2, order_at=NOW + timedelta(days=1), created_at=1)
         self.assertEqual(pick_open_deal([undated, dated], now=NOW)["id"], 2)
 
     def test_among_undated_newest_wins(self):
@@ -173,6 +174,46 @@ class PickOpenDealTests(unittest.TestCase):
         self.assertEqual(pick_open_deal([broken, dated], now=NOW)["id"], 2)
         self.assertEqual(pick_open_deal([broken], now=NOW)["id"], 1)
 
+    def test_far_dated_deal_is_not_taken(self):
+        """Сделка на следующий месяц — другой заказ по другому адресу.
+        Неверный адрес хуже отсутствующего: «нет адреса» честно откатится
+        на карточку клиента, а неверный заметят поздно."""
+        deals = [_deal(1, order_at=NOW + timedelta(days=30), address="Другой адрес")]
+        self.assertIsNone(pick_open_deal(deals, now=NOW))
+
+    def test_todays_undated_deal_beats_far_dated(self):
+        """Сегодняшнюю сделку завели без даты, а на следующий месяц у клиента
+        уже открыта другая: ехали сегодня — и берём сегодняшнюю."""
+        undated_today = _deal(1, created_at=1_725_000_000)
+        far = _deal(2, order_at=NOW + timedelta(days=30), created_at=1)
+        self.assertEqual(pick_open_deal([far, undated_today], now=NOW)["id"], 1)
+
+    def test_month_old_dated_deal_loses_to_undated(self):
+        """Сделка месячной давности к сегодняшнему выезду отношения не имеет,
+        даже если у сегодняшней даты работы нет вовсе."""
+        old = _deal(1, order_at=NOW - timedelta(days=30), created_at=1)
+        undated = _deal(2, created_at=1_725_000_000)
+        self.assertEqual(pick_open_deal([old, undated], now=NOW)["id"], 2)
+
+    def test_window_edge_is_still_taken(self):
+        """Граница окна принадлежит окну, секунда за ней — уже нет."""
+        edge = _deal(1, order_at=NOW - timedelta(seconds=MAX_DEAL_DISTANCE))
+        self.assertEqual(pick_open_deal([edge], now=NOW)["id"], 1)
+        beyond = _deal(2, order_at=NOW - timedelta(seconds=MAX_DEAL_DISTANCE + 1))
+        self.assertIsNone(pick_open_deal([beyond], now=NOW))
+
+    def test_naive_now_is_refused(self):
+        """Без часового пояса сдвиг на три часа меняет выбор между сделками
+        одного дня — молча ошибиться здесь дороже, чем упасть."""
+        with self.assertRaises(ValueError):
+            pick_open_deal([_deal(1, order_at=NOW)], now=NOW.replace(tzinfo=None))
+
+    def test_broken_pipeline_does_not_break_choice(self):
+        """Мусор в поле воронки проход не роняет: сделка просто не подходит."""
+        broken = {"id": 1, "pipeline_id": "abc", "status_id": STAGE_CONFIRMED,
+                  "created_at": 500, "custom_fields_values": []}
+        self.assertIsNone(pick_open_deal([broken], now=NOW))
+
     def test_nothing_suitable_gives_none(self):
         self.assertIsNone(pick_open_deal([], now=NOW))
         self.assertIsNone(pick_open_deal([_deal(1, pipeline=OTHER_PIPELINE)], now=NOW))
@@ -181,14 +222,14 @@ class PickOpenDealTests(unittest.TestCase):
 class DealAddressTests(unittest.TestCase):
     def test_address_is_stripped(self):
         deal = _deal(1, address="  Менделеева д 15а, кв 99  ")
-        self.assertEqual(deal_address(deal), "Менделеева д 15а, кв 99")
+        self.assertEqual(address_of_deal(deal), "Менделеева д 15а, кв 99")
 
     def test_empty_field_gives_none(self):
-        self.assertIsNone(deal_address(_deal(1, address="")))
-        self.assertIsNone(deal_address(_deal(1)))
+        self.assertIsNone(address_of_deal(_deal(1, address="")))
+        self.assertIsNone(address_of_deal(_deal(1)))
 
     def test_missing_deal_gives_none(self):
-        self.assertIsNone(deal_address(None))
+        self.assertIsNone(address_of_deal(None))
 
 
 class ResolveOrderAddressTests(unittest.TestCase):
@@ -282,6 +323,18 @@ class FetchDealAddressTests(unittest.IsolatedAsyncioTestCase):
     async def test_crm_error_gives_none_and_does_not_raise(self):
         amo = FakeAmo(error=RuntimeError("amoCRM API error 500"))
         self.assertIsNone(await fetch_deal_address(amo, "+79001234567", now=NOW))
+
+    async def test_only_fifty_newest_deals_are_read(self):
+        """У постоянного клиента сделок десятки, а мастер ждёт: читаем только
+        полсотни самых новых (номера в amoCRM растут) и одним запросом."""
+        amo = FakeAmo(
+            contacts=[_contact(10, "+79001234567", leads=tuple(range(1, 61)))],
+            deals=[_deal(60, address="Менделеева д 15а", order_at=NOW)],
+        )
+        address = await fetch_deal_address(amo, "+79001234567", now=NOW)
+        self.assertEqual(address, "Менделеева д 15а")
+        self.assertEqual(len(amo.calls), 2)
+        self.assertEqual(sorted(amo.calls[1][1]), list(range(11, 61)))
 
     async def test_slow_crm_is_cut_by_timeout(self):
         """Мастер ждёт «Готово ✅» — зависшая CRM не должна держать его минуту."""
