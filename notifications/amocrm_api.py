@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import aiohttp
 
@@ -83,7 +83,12 @@ class AmoCRMAPIClient:
         if self._owns_session and self.session is not None:
             await self.session.close()
 
-    async def get(self, path: str, *, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    async def get(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, Any] | Sequence[tuple[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         if self.session is None:
             self.session = aiohttp.ClientSession()
             self._owns_session = True
@@ -92,7 +97,10 @@ class AmoCRMAPIClient:
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
         }
-        async with self.session.get(url, headers=headers, params=dict(params or {}), timeout=self.timeout_sec) as resp:
+        # Список пар — для повторяющихся ключей вроде filter[id][]: в словарь
+        # они не укладываются, второй такой ключ затёр бы первый.
+        query: Any = list(params) if isinstance(params, (list, tuple)) else dict(params or {})
+        async with self.session.get(url, headers=headers, params=query, timeout=self.timeout_sec) as resp:
             try:
                 payload = await resp.json()
             except Exception:
@@ -177,6 +185,47 @@ class AmoCRMAPIClient:
             params["filter[pipeline_id]"] = pipeline_id
         payload = await self.get("/api/v4/leads", params=params)
         return list(((payload.get("_embedded") or {}).get("leads") or []))
+
+    async def find_contacts_by_phone(self, phone10: str) -> list[dict[str, Any]]:
+        """Контакты по десяти цифрам номера — сразу со списком их сделок.
+
+        Поиск у amoCRM подстрочный по всем полям карточки, поэтому среди
+        ответа может оказаться чужой контакт: сверять номер обязан вызывающий.
+        """
+        payload = await self.get(
+            "/api/v4/contacts",
+            params={"query": phone10, "with": "leads", "limit": 50},
+        )
+        return list(((payload.get("_embedded") or {}).get("contacts") or []))
+
+    async def fetch_leads_by_ids(self, lead_ids: Iterable[int]) -> list[dict[str, Any]]:
+        """Сделки по их номерам — пачками, повторяющимся ключом filter[id][].
+
+        Сделки клиента берутся именно так, через номера из его контакта:
+        фильтр `filter[contacts][id]` amoCRM молча игнорирует и отдаёт чужие
+        сделки (проверено админ-ботом 2026-08-25).
+        """
+        batch_size = 50
+        unique: list[int] = []
+        seen: set[int] = set()
+        for raw_id in lead_ids:
+            try:
+                lead_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if lead_id in seen:
+                continue
+            seen.add(lead_id)
+            unique.append(lead_id)
+        leads: list[dict[str, Any]] = []
+        for start in range(0, len(unique), batch_size):
+            params: list[tuple[str, Any]] = [
+                ("filter[id][]", lead_id) for lead_id in unique[start:start + batch_size]
+            ]
+            params.append(("limit", 250))
+            payload = await self.get("/api/v4/leads", params=params)
+            leads.extend((payload.get("_embedded") or {}).get("leads") or [])
+        return leads
 
     async def fetch_lead_notes(self, lead_id: int) -> list[dict[str, Any]]:
         payload = await self.get(f"/api/v4/leads/{lead_id}/notes", params={"limit": 100})

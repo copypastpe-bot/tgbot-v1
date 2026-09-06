@@ -495,5 +495,80 @@ class AmoCRMIncomingMessageTests(unittest.TestCase):
         self.assertEqual(alert.phone, "+79991234567")
 
 
+class AmoCRMPhoneLookupTests(unittest.IsolatedAsyncioTestCase):
+    """Поиск сделок клиента по телефону — через контакт, а не через фильтр
+    сделок по контакту: тот фильтр amoCRM молча игнорирует и отдаёт чужие
+    сделки (проверено админ-ботом 2026-08-25)."""
+
+    async def test_find_contacts_by_phone_asks_contacts_with_leads(self):
+        session = SequenceHTTPSession([
+            FakeHTTPResponse(200, {"_embedded": {"contacts": [{"id": 10}]}})
+        ])
+        client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
+
+        contacts = await client.find_contacts_by_phone("9001234567")
+
+        self.assertEqual(contacts, [{"id": 10}])
+        url, params = session.calls[0]
+        self.assertEqual(url, "https://example.amocrm.ru/api/v4/contacts")
+        self.assertEqual(params["query"], "9001234567")
+        self.assertEqual(params["with"], "leads")
+
+    async def test_find_contacts_by_phone_without_embedded_is_empty(self):
+        """amoCRM отвечает 204 без тела, когда ничего не нашла."""
+        session = SequenceHTTPSession([FakeHTTPResponse(204, {})])
+        client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
+
+        self.assertEqual(await client.find_contacts_by_phone("9001234567"), [])
+
+    async def test_fetch_leads_by_ids_without_ids_makes_no_request(self):
+        session = SequenceHTTPSession([])
+        client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
+
+        self.assertEqual(await client.fetch_leads_by_ids([]), [])
+        self.assertEqual(session.calls, [])
+
+    async def test_fetch_leads_by_ids_drops_duplicates_and_keeps_order(self):
+        session = SequenceHTTPSession([
+            FakeHTTPResponse(200, {"_embedded": {"leads": [{"id": 1}, {"id": 2}]}})
+        ])
+        client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
+
+        leads = await client.fetch_leads_by_ids([1, 2, 1])
+
+        self.assertEqual([lead["id"] for lead in leads], [1, 2])
+        url, params = session.calls[0]
+        self.assertEqual(url, "https://example.amocrm.ru/api/v4/leads")
+        self.assertEqual([value for key, value in params if key == "filter[id][]"], [1, 2])
+
+    async def test_fetch_leads_by_ids_batches_by_fifty(self):
+        session = SequenceHTTPSession([
+            FakeHTTPResponse(200, {"_embedded": {"leads": [{"id": i} for i in range(50)]}}),
+            FakeHTTPResponse(200, {"_embedded": {"leads": [{"id": 50}]}}),
+        ])
+        client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
+
+        leads = await client.fetch_leads_by_ids(range(51))
+
+        self.assertEqual(len(leads), 51)
+        self.assertEqual(len(session.calls), 2)
+        first_ids = [value for key, value in session.calls[0][1] if key == "filter[id][]"]
+        second_ids = [value for key, value in session.calls[1][1] if key == "filter[id][]"]
+        self.assertEqual(len(first_ids), 50)
+        self.assertEqual(second_ids, [50])
+
+    async def test_get_passes_pair_list_to_session_as_is(self):
+        """Повторяющиеся ключи вида filter[id][] в словарь не уложить —
+        список пар должен дойти до aiohttp нетронутым."""
+        session = FakeHTTPSession(FakeHTTPResponse(200, {"ok": True}))
+        client = AmoCRMAPIClient("https://example.amocrm.ru", "token", session=session)
+        pairs = [("filter[id][]", 1), ("filter[id][]", 2)]
+
+        await client.get("/api/v4/leads", params=pairs)
+
+        _url, _headers, params, _timeout = session.calls[0]
+        self.assertEqual(params, pairs)
+
+
 if __name__ == "__main__":
     unittest.main()
