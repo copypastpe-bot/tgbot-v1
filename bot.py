@@ -14003,6 +14003,11 @@ async def commit_order(msg: Message, state: FSMContext):
     notify_label: str | None = None
     street_label: str | None = None
 
+    # Первый ответ мастеру — до похода в CRM: он может занять до восьми секунд,
+    # а на «подтвердить» без ответа тапают второй раз, и второй тап приходит
+    # в этот же хендлер параллельно — вторым заказом, второй зарплатой
+    # и второй записью в кассе.
+    await msg.answer("⏳ Провожу заказ…")
     deal_address_val = await _order_address_from_amo(phone_in)
 
     async with pool.acquire() as conn:
