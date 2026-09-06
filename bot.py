@@ -177,6 +177,7 @@ from notifications.client_messaging import (
     should_move_deal,
     should_report_unasked,
 )
+from notifications.order_address import fetch_deal_address, resolve_order_address
 from notifications.amocrm_api import (
     AmoCRMAPIAuthError,
     AmoCRMAPIClient,
@@ -3325,6 +3326,15 @@ async def ensure_orders_wire_schema(conn: asyncpg.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_promo_reeng_next
         ON promo_reengagements(next_send_at)
+        """
+    )
+
+
+async def ensure_orders_address_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        ALTER TABLE orders
+        ADD COLUMN IF NOT EXISTS address text;
         """
     )
 
@@ -13934,6 +13944,23 @@ async def cancel_order(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("Отменено.", reply_markup=master_kb)
 
+async def _order_address_from_amo(phone: str | None) -> str | None:
+    """Адрес открытой сделки реализации по телефону клиента.
+
+    В CRM ходим до открытия транзакции: сетевой вызов внутри неё держал бы
+    соединение пула всё время, пока amoCRM думает, а думать она может долго.
+    Проведение заказа от CRM не зависит — любая осечка означает «адреса нет».
+    """
+    if not AMOCRM_API_BASE or not AMOCRM_API_TOKEN:
+        return None
+    try:
+        async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
+            return await fetch_deal_address(client, phone, now=datetime.now(MOSCOW_TZ))
+    except Exception as e:  # noqa: BLE001
+        logging.warning("order address lookup failed for %s: %s", mask_phone_last4(phone), e)
+        return None
+
+
 @dp.message(OrderFSM.confirm, F.text.lower() == "подтвердить")
 async def commit_order(msg: Message, state: FSMContext):
     data = await state.get_data()
@@ -13971,10 +13998,12 @@ async def commit_order(msg: Message, state: FSMContext):
     master_db_id: int | None = None
     client_full_name_val: str | None = None
     client_phone_val: str | None = phone_in
-    client_address_val: str | None = None
+    order_address_val: str | None = None
     client_display_masked: str | None = None
     notify_label: str | None = None
     street_label: str | None = None
+
+    deal_address_val = await _order_address_from_amo(phone_in)
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -13990,28 +14019,39 @@ async def commit_order(msg: Message, state: FSMContext):
                 "           THEN COALESCE(EXCLUDED.address, clients.address) "
                 "      ELSE clients.address "
                 "  END "
-                "RETURNING id, bonus_balance, full_name, phone, address, birthday",
+                "RETURNING id, bonus_balance, full_name, phone, address, birthday, last_order_addr",
                 name, phone_in, new_bday, (manual_address or None)
             )
             client_id = client["id"]
             client_full_name_val = (client["full_name"] or name or "").strip() or None
             client_phone_val = client["phone"] or phone_in
-            client_address_val = client.get("address")
+            order_address_val = resolve_order_address(
+                deal_address=deal_address_val,
+                card_address=client.get("address"),
+                last_order_addr=client.get("last_order_addr"),
+            )
             client_birthday_val = client.get("birthday") or client_birthday_val or new_bday
             current_bonus_balance = int(client.get("bonus_balance") or 0)
 
             order = await conn.fetchrow(
                 "INSERT INTO orders (client_id, master_id, phone_digits, amount_total, amount_cash, amount_upsell, "
-                " bonus_spent, bonus_earned, payment_method) "
+                " bonus_spent, bonus_earned, payment_method, address) "
                 "VALUES ($1, "
                 "       (SELECT id FROM staff WHERE tg_user_id=$2 AND is_active LIMIT 1), "
-                "       regexp_replace($3,'[^0-9]+','','g'), $4, $5, $6, $7, $8, $9) "
+                "       regexp_replace($3,'[^0-9]+','','g'), $4, $5, $6, $7, $8, $9, $10) "
                 "RETURNING id, master_id",
                 client_id, msg.from_user.id, phone_in, amount_total, cash_payment, upsell,
-                bonus_spent, bonus_earned, payment_method
+                bonus_spent, bonus_earned, payment_method, order_address_val
             )
             order_id = order["id"]
             master_db_id = order["master_id"]
+            if order_address_val:
+                await conn.execute(
+                    "UPDATE clients SET last_order_addr=$1, last_updated=NOW() "
+                    "WHERE id=$2 AND last_order_addr IS DISTINCT FROM $1",
+                    order_address_val,
+                    client_id,
+                )
             if is_wire_payment:
                 await conn.execute(
                     "UPDATE orders SET awaiting_wire_payment = TRUE WHERE id=$1",
@@ -14155,7 +14195,7 @@ async def commit_order(msg: Message, state: FSMContext):
                 )
             non_wire_entries = [(label, amount_value) for label, amount_value in payment_rows if label != "р/с" and amount_value > 0]
 
-            street_label = extract_street(client_address_val)
+            street_label = extract_street(order_address_val)
             base_name_for_label = (client_full_name_val or name or "Клиент").strip() or "Клиент"
             masked_phone = mask_phone_last4(client_phone_val)
             client_display_masked = f"{base_name_for_label} {masked_phone}".strip()
@@ -14219,8 +14259,8 @@ async def commit_order(msg: Message, state: FSMContext):
                 f"🧾 <b>Заказ №{order_id}</b>",
                 f"👤 Клиент: {_bold_html(client_display_masked)}",
             ]
-            if client_address_val:
-                lines.append(f"📍 Адрес: {_escape_html(client_address_val)}")
+            if order_address_val:
+                lines.append(f"📍 Адрес: {_escape_html(order_address_val)}")
             lines.append(f"🎂 ДР: {_escape_html(birthday_display)}")
             payment_summary = f"{format_money(cash_payment)}₽"
             if payment_parts_text:
@@ -14638,6 +14678,7 @@ async def main():
         await ensure_service_heartbeat_schema(_conn)
         await ensure_order_masters_schema(_conn)
         await ensure_orders_wire_schema(_conn)
+        await ensure_orders_address_schema(_conn)
         await ensure_cashbook_wire_schema(_conn)
         await ensure_orders_rating_schema(_conn)
         await ensure_order_payments_schema(_conn)
