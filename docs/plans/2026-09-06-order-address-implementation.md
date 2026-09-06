@@ -28,6 +28,17 @@
 - ожидание amoCRM при проведении ограничено 8 секундами суммарно;
 - заказы задним числом не переписываем; колонка заполняется только для новых.
 
+Поправки после проверки качества кода (2026-09-06, контролёр):
+- **предел дальности**: датированная сделка дальше двух суток от момента
+  проведения (`MAX_DEAL_DISTANCE`) выбывает совсем. Сделка на следующий месяц —
+  другой заказ; неверный адрес хуже отсутствующего, потому что отсутствие
+  честно откатывается на карточку;
+- перед походом в CRM мастер получает «⏳ Провожу заказ…»: восемь секунд без
+  реакции провоцируют повторный тап, а он даёт второй заказ и вторую зарплату;
+- у контакта берём не больше 50 самых новых сделок (`MAX_LEADS_TO_FETCH`);
+- штатные исходы поиска пишутся в лог как `info`, сбои CRM — `warning`;
+  тело ответа CRM в лог не попадает (может отражать телефон из запроса).
+
 ## 3. Порядок источников адреса заказа
 
 1. поле «Адрес» открытой сделки реализации в amoCRM;
@@ -48,6 +59,8 @@
 
 ```python
 LOOKUP_TIMEOUT = 8.0   # секунд на весь поход в amoCRM при проведении заказа
+MAX_DEAL_DISTANCE = 2 * 24 * 3600   # дальше двух суток — это другой заказ
+MAX_LEADS_TO_FETCH = 50             # самых новых сделок контакта (id растут)
 
 def phone_query(phone: str | None) -> str | None:
     """Десять цифр для поиска контакта в amoCRM.
@@ -69,13 +82,14 @@ def pick_open_deal(deals: list[Mapping], *, now: datetime) -> Mapping | None:
     Берём только pipeline_id == AMO_PIPELINE_REALIZATION и
     status_id не в (AMO_STATUS_WON, AMO_STATUS_LOST).
     Порядок предпочтения:
-      1) сделки с датой работы (18701, unix) — ближайшая к now по модулю;
-         при равном расстоянии — прошедшая (дата <= now) раньше будущей;
+      1) сделки с датой работы (18701, unix) не дальше MAX_DEAL_DISTANCE
+         от now — ближайшая по модулю; при равном расстоянии — прошедшая
+         (дата <= now) раньше будущей; дальше окна — выбывают совсем;
       2) сделки без даты (или с испорченной датой) — после всех с датой,
          среди них самая свежая по created_at.
-    Нет подходящих → None. `now` — aware datetime."""
+    Нет подходящих → None. `now` — aware datetime, наивное → ValueError."""
 
-def deal_address(deal: Mapping | None) -> str | None:
+def address_of_deal(deal: Mapping | None) -> str | None:
     """Первое непустое значение поля 18639, обрезанное. Нет → None."""
 
 def resolve_order_address(*, deal_address: str | None,
@@ -93,9 +107,11 @@ async def fetch_deal_address(client, phone: str | None, *, now: datetime,
       2) contacts = await client.find_contacts_by_phone(phone10);
          оставляем только contact_matches_phone;
       3) ids = contact_lead_ids по всем подходящим контактам; пусто → None,
-         fetch_leads_by_ids не вызываем;
+         fetch_leads_by_ids не вызываем; оставляем MAX_LEADS_TO_FETCH
+         наибольших id;
       4) deals = await client.fetch_leads_by_ids(ids);
-      5) deal_address(pick_open_deal(deals, now=now))."""
+      5) address_of_deal(pick_open_deal(deals, now=now)).
+    Штатные исходы → info, таймаут и ошибка CRM → warning без тела ответа."""
 ```
 
 `client` — утиный тип: объект с `async find_contacts_by_phone(phone10)` и
@@ -117,7 +133,8 @@ async def fetch_deal_address(client, phone: str | None, *, now: datetime,
 - **Не использовать** `filter[contacts][id]` — amoCRM молча игнорирует его и
   отдаёт чужие сделки (проверено админ-ботом 2026-08-25). Существующий
   `fetch_contact_leads` не трогать: это отдельная задача.
-- Новые имена добавить в `__all__`.
+- `__all__` не меняется: новые имена — методы класса `AmoCRMAPIClient`,
+  который там уже есть.
 
 ## 6. Контракт: `bot.py`
 
@@ -135,6 +152,8 @@ async def fetch_deal_address(client, phone: str | None, *, now: datetime,
    любое исключение → `logging.warning` и None. Ходить в amoCRM **до**
    открытия транзакции БД, не внутри неё.
 4. В `commit_order`:
+   - перед походом в CRM: `await msg.answer("⏳ Провожу заказ…")` — иначе
+     мастер до восьми секунд не видит реакции и тапает второй раз;
    - перед `async with pool.acquire()`: `deal_address_val = await _order_address_from_amo(phone_in)`;
    - в RETURNING upsert-а клиента добавить `last_order_addr`;
    - переменную `client_address_val` переименовать в `order_address_val`
@@ -172,6 +191,9 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS address text;
   контакт без телефона → False; несколько значений PHONE — достаточно одного.
 - `contact_lead_ids`: обычный случай, пустой `_embedded`, мусор в списке.
 - `pick_open_deal`: чужая воронка пропускается; 142 и 143 пропускаются;
+  дальняя датированная сделка выбывает, сегодняшняя без даты её обыгрывает;
+  граница окна включительно; наивное `now` → ValueError; мусор в
+  `pipeline_id` не роняет выбор;
   из двух открытых берётся ближайшая по дате к now (старая «ждёт оплаты»
   против сегодняшней); при равном расстоянии — прошедшая; сделка без даты
   проигрывает сделке с датой; из двух без даты — свежая по created_at;
@@ -184,7 +206,8 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS address text;
   не разбирается → None и ни одного вызова; контакт с чужим номером →
   None и `fetch_leads_by_ids` не вызван; контакты без сделок → то же;
   `find_contacts_by_phone` бросает → None, исключение наружу не выходит;
-  таймаут (фейк спит 5 с, `timeout=0.05`) → None быстро.
+  таймаут (фейк спит 5 с, `timeout=0.05`) → None быстро; из 60 сделок
+  контакта запрашиваются 50 самых новых.
 
 `tests/test_amocrm_api.py` (дописать, фейки `FakeHTTPResponse`,
 `SequenceHTTPSession` уже есть):
