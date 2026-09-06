@@ -75,6 +75,26 @@ Read and update only these registered files:
 - Record environment-sensitive changes clearly because webhook and token settings matter to runtime behavior.
 - This is an old repository: verify whether a directory is still live before editing it.
 
+## Model Routing
+
+Hard rule set by the owner on 2026-09-06. Sessions open on Fable by default unless the owner picks another model.
+
+First line of every reply to a new task: the task type and how it will be run, in the owner's language.
+
+- Discussion, architecture, solution search, brainstorming, writing a spec or a plan: Fable, in the current session.
+- Writing code, executing a spec, implementation: Opus.
+- The simplest operations: Sonnet.
+- Hard bugs, non-standard situations, heavy analysis: stop and discuss the model choice with the owner before starting.
+
+Execution rules:
+
+- Small edits (a few lines, one file, no design decisions): Fable does them itself in the current session.
+- Large edits or a feature: Fable writes the spec to `docs/plans/<YYYY-MM-DD>-<name>.md` (create the folder if missing), then asks the owner how to run it: subagents from this session, or a new session on Opus with the spec. The owner decides; never pick for them.
+- Fable does not write code from a finished spec. The only exception is the owner saying "do it here".
+- Subagents run on Opus (implementation) or Sonnet (mechanical work). Never spawn a Fable subagent unless the owner explicitly asks for one: it burns the usage limit for nothing.
+- A subagent has no memory of this conversation: hand it the spec file, not a retelling.
+- The executor verifies its own result and records it in the session log. Fable reviews the diff only when the owner asks.
+
 ## Skill Usage
 
 - Do not load or invoke Superpowers or other optional skills automatically at session start.
