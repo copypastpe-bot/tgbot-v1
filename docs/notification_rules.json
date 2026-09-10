@@ -43,6 +43,19 @@
       ]
     },
     {
+      "key": "order_cancelled_no_need",
+      "name": "Отмена заказа: сделка закрыта с причиной «Пропала потребность»",
+      "recipient": "client",
+      "condition": null,
+      "timing": {
+        "delay_minutes": 0
+      },
+      "template": "Ваш заказ на {{date}} отменён. Если это ошибка или захотите записаться снова, просто свяжитесь удобным способом. Ваша raketaclean.ru",
+      "variables": [
+        "date"
+      ]
+    },
+    {
       "key": "order_confirmed_thanks",
       "name": "Ответ клиенту на подтверждение заказа",
       "recipient": "client",

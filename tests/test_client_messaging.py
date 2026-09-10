@@ -12,12 +12,14 @@
    и то же сообщение каждые десять минут до самой работы.
 """
 
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 from notifications import client_messaging as cm
+from notifications.amo_exchange import field_enum_ids
 
 from notifications.client_messaging import (
     AMO_PIPELINE_REALIZATION,
@@ -40,6 +42,7 @@ from notifications.client_messaging import (
     prefer_deal_details,
     should_call_owner,
     should_move_deal,
+    should_notify_cancel,
     should_report_unasked,
 )
 
@@ -645,3 +648,158 @@ class WaitingForTheChildDeal(unittest.TestCase):
         """Ровно час — уже сдаёмся: иначе граница зависит от секунды прохода."""
         self.assertFalse(cm.should_keep_waiting(
             event_at=self.NOW - cm.DEAL_WAIT_LIMIT, now=self.NOW))
+
+
+class ReadingEnumIds(unittest.TestCase):
+    """Вариант списочного поля читаем по номеру, а не по подписи.
+
+    Подпись «Пропала потребность» владелец может переименовать в амо одним
+    кликом, и робот тут же перестал бы узнавать причину. Номер варианта живёт
+    вечно — по нему и сверяемся.
+    """
+
+    FIELD = 19215
+
+    def _deal(self, values):
+        return {"custom_fields_values": [
+            {"field_id": self.FIELD, "values": values}]}
+
+    def test_enum_id_is_read_from_amo_format(self):
+        deal = self._deal([{"value": "Пропала потребность", "enum_id": 8299}])
+        self.assertEqual(field_enum_ids(deal, self.FIELD), [8299])
+
+    def test_other_field_is_not_read(self):
+        deal = self._deal([{"value": "Пропала потребность", "enum_id": 8299}])
+        self.assertEqual(field_enum_ids(deal, 18639), [])
+
+    def test_text_field_without_enum_gives_nothing(self):
+        deal = self._deal([{"value": "Ленина 1"}])
+        self.assertEqual(field_enum_ids(deal, self.FIELD), [])
+
+    def test_empty_card_gives_nothing(self):
+        self.assertEqual(field_enum_ids({}, self.FIELD), [])
+
+
+class CancelLetterDecision(unittest.TestCase):
+    """Письмо «заказ отменён»: слать или нет.
+
+    Условий шесть, и каждое проверяется отдельно, потому что цена ошибки
+    у них разная. Пропустить письмо — клиент не узнает об отмене. Послать
+    лишнее — клиент получит «ваш заказ отменён» по живому заказу.
+    """
+
+    NOW = datetime(2026, 9, 10, 12, 0, tzinfo=MSK)
+
+    def _deal(self, *, status_id=cm.AMO_STATUS_CLOSED_LOST,
+              enum_id=cm.AMO_CLOSE_REASON_NO_NEED):
+        deal = {"id": 777, "status_id": status_id, "custom_fields_values": []}
+        if enum_id is not None:
+            deal["custom_fields_values"] = [
+                {"field_id": cm.AMO_FIELD_CLOSE_REASON,
+                 "values": [{"value": "Пропала потребность", "enum_id": enum_id}]}]
+        return deal
+
+    def _row(self, **over):
+        row = {"client_id": 42, "order_at": self.NOW + timedelta(hours=6),
+               "cancel_notified_at": None}
+        row.update(over)
+        return row
+
+    def test_everything_matches_means_send(self):
+        send, _ = should_notify_cancel(deal=self._deal(), row=self._row(),
+                                       now=self.NOW)
+        self.assertTrue(send)
+
+    def test_open_deal_is_not_a_cancellation(self):
+        """Сделка в работе: причину закрытия могли проставить заранее."""
+        send, reason = should_notify_cancel(
+            deal=self._deal(status_id=cm.AMO_STAGE_ORDER_CREATED),
+            row=self._row(), now=self.NOW)
+        self.assertFalse(send)
+        self.assertIn("не закрыт", reason)
+
+    def test_closed_without_reason_is_not_our_case(self):
+        """Закрыта без причины — почему, робот не знает и молчит."""
+        send, reason = should_notify_cancel(
+            deal=self._deal(enum_id=None), row=self._row(), now=self.NOW)
+        self.assertFalse(send)
+        self.assertIn("Пропала потребность", reason)
+
+    def test_another_reason_is_not_our_case(self):
+        """«Дорого» или «не дозвонились» — разговор владельца, не письмо робота."""
+        send, reason = should_notify_cancel(
+            deal=self._deal(enum_id=8301), row=self._row(), now=self.NOW)
+        self.assertFalse(send)
+        self.assertIn("Пропала потребность", reason)
+
+    def test_already_notified_stays_silent(self):
+        """Одно письмо на сделку: проход ходит раз в десять минут."""
+        send, reason = should_notify_cancel(
+            deal=self._deal(),
+            row=self._row(cancel_notified_at=self.NOW - timedelta(hours=1)),
+            now=self.NOW)
+        self.assertFalse(send)
+        self.assertIn("уже сообщили", reason)
+
+    def test_client_outside_the_bot_database_gets_nothing(self):
+        """Очередь умеет писать только записям `clients`."""
+        send, reason = should_notify_cancel(
+            deal=self._deal(), row=self._row(client_id=None), now=self.NOW)
+        self.assertFalse(send)
+        self.assertIn("клиента нет", reason)
+
+    def test_work_day_already_passed_stays_silent(self):
+        """Позавчерашний заказ закрывают для отчётности, а не отменяют."""
+        send, reason = should_notify_cancel(
+            deal=self._deal(),
+            row=self._row(order_at=self.NOW - timedelta(days=2)), now=self.NOW)
+        self.assertFalse(send)
+        self.assertIn("прошёл", reason)
+
+    def test_yesterday_is_still_within_the_window(self):
+        """Порог — сутки: заказ сегодняшнего утра отменить ещё можно."""
+        send, _ = should_notify_cancel(
+            deal=self._deal(),
+            row=self._row(order_at=self.NOW - cm.CANCEL_LETTER_MAX_AGE
+                          + timedelta(minutes=1)),
+            now=self.NOW)
+        self.assertTrue(send)
+
+    def test_order_without_date_stays_silent(self):
+        """Без даты работы письмо получилось бы «ваш заказ на  отменён»."""
+        send, reason = should_notify_cancel(
+            deal=self._deal(), row=self._row(order_at=None), now=self.NOW)
+        self.assertFalse(send)
+        self.assertIn("нет даты", reason)
+
+    def test_deal_gone_from_crm_stays_silent(self):
+        """Удалённую карточку читать нечем — причины закрытия там нет."""
+        for deal in (None, {}, {"id": None}):
+            send, reason = should_notify_cancel(deal=deal, row=self._row(),
+                                                now=self.NOW)
+            self.assertFalse(send, deal)
+            self.assertIn("нет в CRM", reason)
+
+
+class CancelLetterText(unittest.TestCase):
+    """Текст письма — дословно из решения владельца 2026-09-10."""
+
+    def test_rule_exists_with_the_owner_text(self):
+        rules = json.loads(
+            (Path(__file__).resolve().parents[1]
+             / "docs" / "notification_rules.json").read_text(encoding="utf-8"))
+        event = next((item for item in rules["events"]
+                      if item["key"] == cm.CANCEL_LETTER_EVENT), None)
+        self.assertIsNotNone(event, "события отмены нет в правилах уведомлений")
+        self.assertEqual(
+            event["template"],
+            "Ваш заказ на {{date}} отменён. Если это ошибка или захотите "
+            "записаться снова, просто свяжитесь удобным способом. "
+            "Ваша raketaclean.ru")
+        self.assertEqual(event["recipient"], "client")
+        self.assertEqual(event["variables"], ["date"])
+
+    def test_letter_payload_gives_the_date_the_template_asks_for(self):
+        payload = letter_payload(
+            order_at=datetime(2026, 9, 11, 10, 0, tzinfo=MSK), address=None)
+        self.assertEqual(payload["date"], "11.09.2026")

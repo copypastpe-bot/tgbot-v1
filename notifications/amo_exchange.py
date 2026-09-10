@@ -165,6 +165,32 @@ def field_values(entity: dict, field_id: int) -> list[str]:
     return []
 
 
+def field_enum_ids(entity: dict, field_id: int) -> list[int]:
+    """Номера выбранных вариантов списочного поля.
+
+    Рядом с `field_values` и по той же причине: разбор полей сделки один
+    на весь проект. Но сверяться с вариантом списка надо по номеру, а не по
+    подписи: подпись владелец переименовывает в амо одним кликом, и робот
+    тут же перестал бы узнавать причину закрытия. Номер живёт вечно.
+
+    У текстовых полей номера нет — такие значения просто пропускаем.
+    """
+    for field_data in entity.get("custom_fields_values") or []:
+        if int(field_data.get("field_id") or 0) != field_id:
+            continue
+        ids: list[int] = []
+        for value in field_data.get("values") or []:
+            enum_id = (value or {}).get("enum_id")
+            if enum_id is None:
+                continue
+            try:
+                ids.append(int(enum_id))
+            except (TypeError, ValueError):
+                continue
+        return ids
+    return []
+
+
 def _contact_phone(contact: dict) -> str:
     for field_data in (contact or {}).get("custom_fields_values") or []:
         if field_data.get("field_code") != "PHONE":
@@ -231,6 +257,7 @@ __all__ = [
     "IncomingClient",
     "decide_exchange",
     "WEEKLY_LEADS_PERIOD_DAYS",
+    "field_enum_ids",
     "field_values",
     "incoming_from_amo",
     "is_weekly_leads_day",

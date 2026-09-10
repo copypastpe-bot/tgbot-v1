@@ -424,17 +424,39 @@ async def mark_outbox_failure(
 
 
 async def cancel_outbox_entry(conn: asyncpg.Connection, entry: NotificationOutboxEntry, reason: str) -> None:
-    await conn.execute(
-        """
+    await _cancel_outbox_row(conn, entry.id, reason, pending_only=False)
+
+
+async def cancel_pending_outbox(conn: asyncpg.Connection, outbox_id: int,
+                                reason: str) -> bool:
+    """Отменить письмо, которое ещё не ушло. Отвечает, удалось ли.
+
+    Отличается от `cancel_outbox_entry` одним, но важным: письмо, уже
+    отправленное клиенту, не трогает. Работник очереди отменяет письмо,
+    которое сам только что достал из очереди, и знает, что оно на месте.
+    Здесь номер письма приходит из чужой таблицы, записанный сутки назад,
+    и за эти сутки письмо могло уйти. Пометить ушедшее «отменено» —
+    значит соврать в суточной сводке.
+    """
+    return await _cancel_outbox_row(conn, outbox_id, reason, pending_only=True)
+
+
+async def _cancel_outbox_row(conn: asyncpg.Connection, outbox_id: int, reason: str,
+                             *, pending_only: bool) -> bool:
+    cancelled = await conn.fetchval(
+        f"""
         UPDATE notification_outbox
         SET status='cancelled',
             last_error=$2,
             updated_at=NOW()
         WHERE id=$1
+          {"AND status='pending'" if pending_only else ""}
+        RETURNING id
         """,
-        entry.id,
+        outbox_id,
         reason,
     )
+    return cancelled is not None
 
 
 _MESSAGE_ID_KEYS: tuple[str, ...] = (

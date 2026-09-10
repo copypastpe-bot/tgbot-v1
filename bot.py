@@ -130,6 +130,7 @@ from notifications import (
     NotificationWorker,
     PreSendVerdict,
     WahelpWebhookServer,
+    cancel_pending_outbox,
     extract_provider_message_id,
     ensure_notification_schema,
     enqueue_notification,
@@ -153,6 +154,8 @@ from notifications.client_messaging import (
     AMO_FIELD_ORDER_DATETIME,
     AMO_PIPELINE_REALIZATION,
     AMO_STAGE_CONFIRMED,
+    CANCEL_LETTER_EVENT,
+    CANCEL_LETTER_MAX_AGE,
     CONFIRM_REQUEST_EVENT,
     PENDING_TTL_AFTER_ORDER,
     SILENCE_LIMIT,
@@ -175,6 +178,7 @@ from notifications.client_messaging import (
     prefer_deal_details,
     should_call_owner,
     should_move_deal,
+    should_notify_cancel,
     should_report_unasked,
 )
 from notifications.order_address import fetch_deal_address, resolve_order_address
@@ -1087,6 +1091,16 @@ async def ensure_client_messaging_schema(conn: asyncpg.Connection) -> None:
           AND o.sent_at IS NOT NULL;
         """
     )
+    # Отметка «об отмене клиенту сообщили». Она и есть гарантия «одно письмо
+    # на сделку»: проход ходит раз в десять минут, а сделка остаётся закрытой
+    # навсегда — без отметки клиент получал бы «заказ отменён» каждые десять
+    # минут до самого дня работы.
+    await conn.execute(
+        """
+        ALTER TABLE order_confirmations
+        ADD COLUMN IF NOT EXISTS cancel_notified_at timestamptz;
+        """
+    )
     await conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_order_confirmations_phone
@@ -1108,6 +1122,16 @@ async def ensure_client_messaging_schema(conn: asyncpg.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_order_confirmations_outbox
         ON order_confirmations(outbox_id)
         WHERE outbox_id IS NOT NULL;
+        """
+    )
+    # Проход отмен ходит по одной и той же горстке строк раз в десять минут:
+    # те, о чьей отмене ещё не сообщали. Частичный индекс держит выборку
+    # маленькой и не растёт вместе с историей заказов.
+    await conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_order_confirmations_cancel_watch
+        ON order_confirmations(order_at)
+        WHERE cancel_notified_at IS NULL AND client_id IS NOT NULL;
         """
     )
 
@@ -2227,6 +2251,154 @@ async def _amocrm_poll_confirmations_once(client: AmoCRMAPIClient, *,
     return counters
 
 
+async def _confirmation_poll_cancellations(client: AmoCRMAPIClient, *,
+                                           dry_run: bool = True) -> dict[str, int]:
+    """Проход по отменённым заказам: закрытая сделка → письмо «заказ отменён».
+
+    Заказ отменяется руками: владелец удаляет запись из календаря, а сделку
+    в amoCRM закрывают как «Закрыто и не реализовано» с причиной «Пропала
+    потребность». Клиент об этом до сих пор не узнавал ничего, хотя письмо
+    «Ваш заказ принят» ему уже приходило.
+
+    Сигнал идёт через карточку CRM, а не через базу: админ-бот в таблицы
+    рабочего бота не пишет — это его жёсткое правило. Поэтому смотрим сами.
+
+    Ходим только по свежим ожиданиям: где об отмене ещё не сообщали, клиент
+    известен и день работы не прошёл. Их единицы — столько же запросов
+    в CRM за проход.
+    """
+    if pool is None:
+        return {}
+
+    counters: dict[str, int] = {}
+
+    def count(key: str) -> None:
+        counters[key] = counters.get(key, 0) + 1
+
+    now = datetime.now(MOSCOW_TZ)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT lead_id, deal_id, client_id, order_at, status, outbox_id,
+                   asked_sent_at, cancel_notified_at
+            FROM order_confirmations
+            WHERE cancel_notified_at IS NULL
+              AND client_id IS NOT NULL
+              AND order_at >= $1
+            ORDER BY order_at
+            """,
+            now - CANCEL_LETTER_MAX_AGE,
+        )
+
+    crm_silent: str | None = None
+    for row in rows:
+        # Причину закрытия ставят на той карточке, которую закрывают. Дочерней
+        # сделки может не быть вовсе — тогда закрывают сам лид.
+        card_id = int(row["deal_id"] or row["lead_id"])
+        try:
+            deal: Mapping[str, Any] | None = await client.fetch_lead(card_id)
+        except AmoCRMAPIError as exc:
+            if exc.status == 404:
+                deal = None                   # карточку удалили — это не отмена
+            else:
+                crm_silent = crm_silent or f"сделка {card_id}: {exc}"
+                count("отмен не проверено — CRM не ответила")
+                continue
+        except Exception as exc:  # noqa: BLE001 — сеть моргнула, вернёмся через 10 минут
+            crm_silent = crm_silent or f"сделка {card_id}: {exc}"
+            count("отмен не проверено — CRM не ответила")
+            continue
+
+        send, reason = should_notify_cancel(deal=deal, row=row,
+                                            now=datetime.now(MOSCOW_TZ))
+        if not send:
+            continue
+
+        if dry_run:
+            # Репетиция ничего не пишет: поставь она отметку, боевой запуск
+            # решил бы, что клиенту уже сообщили, и промолчал бы.
+            count("cancel_rehearsal")
+            logger.info("Отмена заказа (репетиция): сделка %s — написал бы клиенту",
+                        card_id)
+            continue
+
+        try:
+            await _confirmation_enqueue_cancel(row, reason=reason)
+        except Exception as exc:  # noqa: BLE001 — одна сделка не роняет проход
+            logger.exception("Отмена заказа: сделка %s не разобрана: %s",
+                             card_id, exc)
+            count("ошибка")
+            continue
+        count("cancel_notified")
+        logger.info("Отмена заказа: сделка %s — клиенту сообщили", card_id)
+
+    if crm_silent:
+        logger.warning("Отмены заказов: CRM ответила не на всё (%s)", crm_silent)
+    return counters
+
+
+async def _confirmation_enqueue_cancel(row: Mapping[str, Any], *,
+                                       reason: str) -> None:
+    """Поставить письмо об отмене в очередь — одной транзакцией.
+
+    Разойдись письмо и отметка — клиент получал бы «заказ отменён» каждые
+    десять минут до самого дня работы.
+    """
+    # Дата работы приходит из базы в UTC, а печатать её надо по-московски:
+    # заказ на 00:30 иначе ушёл бы клиенту вчерашним числом.
+    payload = letter_payload(
+        order_at=row["order_at"].astimezone(MOSCOW_TZ), address=None)
+    lead_id = int(row["lead_id"])
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await enqueue_notification(
+                conn, notification_rules, event_key=CANCEL_LETTER_EVENT,
+                client_id=int(row["client_id"]),
+                payload={"date": payload["date"]})
+            await conn.execute(
+                """
+                UPDATE order_confirmations
+                SET cancel_notified_at = NOW(),
+                    updated_at = NOW()
+                WHERE lead_id = $1
+                """,
+                lead_id,
+            )
+            # Вопрос «подтверждаете заказ?» ещё лежит в очереди и уйдёт
+            # своим часом. Отменяем его здесь же: получить вопрос после
+            # «заказ отменён» — худшее, что робот может сделать с клиентом.
+            if (row["status"] == "planned" and row["asked_sent_at"] is None
+                    and row["outbox_id"]):
+                dropped = await cancel_pending_outbox(
+                    conn, int(row["outbox_id"]), "заказ отменён")
+                if dropped:
+                    await conn.execute(
+                        """
+                        UPDATE order_confirmations
+                        SET status = 'dropped',
+                            updated_at = NOW()
+                        WHERE lead_id = $1
+                          AND status = 'planned'
+                        """,
+                        lead_id,
+                    )
+            await conn.execute(
+                """
+                INSERT INTO amocrm_api_events (
+                    event_id, event_type, entity_id, payload, action, created_at
+                )
+                VALUES ($1, 'confirmation_status', $2, $3::jsonb,
+                        'cancel_notified', $4)
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+                f"confirmation_cancelled:{lead_id}",
+                str(lead_id),
+                json.dumps({"deal_id": row["deal_id"], "reason": reason},
+                           ensure_ascii=False),
+                int(datetime.now(timezone.utc).timestamp()),
+            )
+
+
 async def run_client_messaging_cycle() -> None:
     """Проход разговора с клиентом: раз в 10 минут, как и обмен.
 
@@ -2241,6 +2413,11 @@ async def run_client_messaging_cycle() -> None:
     async with AmoCRMAPIClient(AMOCRM_API_BASE, AMOCRM_API_TOKEN) as client:
         counters = await _amocrm_poll_confirmations_once(
             client, dry_run=CLIENT_MESSAGING_DRY_RUN)
+        # Отмены разбираются тем же проходом и под тем же выключателем:
+        # письмо об отмене — часть того же разговора с клиентом.
+        for key, total in (await _confirmation_poll_cancellations(
+                client, dry_run=CLIENT_MESSAGING_DRY_RUN)).items():
+            counters[key] = counters.get(key, 0) + total
     if counters:
         logger.info("Разговор с клиентом: %s", counters)
 
@@ -6223,6 +6400,7 @@ CLIENT_MESSAGING_ACTION_WORDS: dict[str, str] = {
     "not_needed": "заказов без писем — нет даты или работа уже прошла",
     "already_planned": "повторных заходов сделки — писать второй раз не стал",
     "question_dropped": "вопросов отменено — заказа больше нет",
+    "cancel_notified": "отмен сообщено — написал клиенту, что заказ отменён",
     "not_ours": "заказов пропущено — не наша воронка или вы ведёте их сами",
     "deferred": "заказов отложено — жду, пока в CRM появится сделка",
     "deal_never_came": "заказов брошено — сделка в CRM так и не появилась",

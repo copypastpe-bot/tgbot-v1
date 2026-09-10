@@ -204,3 +204,53 @@ class AfterSendTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CancellingALetterByItsNumber(unittest.TestCase):
+    """Отмена письма, номер которого пришёл из чужой таблицы.
+
+    Ожидание подтверждения помнит номер письма-вопроса сутками. За эти сутки
+    письмо могло уйти клиенту, и пометить ушедшее «отменено» — значит соврать
+    в суточной сводке владельца. Поэтому отмена по номеру трогает только те
+    письма, что ещё лежат в очереди.
+    """
+
+    def setUp(self):
+        self.queries: list[str] = []
+
+    def _conn(self, result):
+        queries = self.queries
+
+        class Conn:
+            async def fetchval(self, query, *args):
+                queries.append(query)
+                return result
+
+        return Conn()
+
+    def test_only_pending_letters_are_cancelled(self):
+        import asyncio
+
+        from notifications.outbox import cancel_pending_outbox
+
+        done = asyncio.run(cancel_pending_outbox(self._conn(17), 17, "заказ отменён"))
+        self.assertTrue(done)
+        self.assertIn("status='pending'", self.queries[0].replace(" ", ""))
+
+    def test_letter_already_sent_reports_nothing_done(self):
+        import asyncio
+
+        from notifications.outbox import cancel_pending_outbox
+
+        done = asyncio.run(cancel_pending_outbox(self._conn(None), 17, "заказ отменён"))
+        self.assertFalse(done)
+
+    def test_worker_cancellation_still_touches_any_status(self):
+        """Работник очереди отменяет письмо, которое сам держит в руках."""
+        import asyncio
+
+        from notifications.outbox import cancel_outbox_entry
+
+        entry = mock.Mock(id=17)
+        asyncio.run(cancel_outbox_entry(self._conn(17), entry, "заказа больше нет"))
+        self.assertNotIn("status='pending'", self.queries[0].replace(" ", ""))

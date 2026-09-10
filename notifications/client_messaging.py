@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from typing import Any, Mapping, Optional
 
-from .amo_exchange import AMO_FIELD_ADDRESS, field_values
+from .amo_exchange import AMO_FIELD_ADDRESS, field_enum_ids, field_values
 
 ASK_BEFORE = timedelta(days=1)        # за сутки от времени заказа (решение владельца)
 SILENCE_LIMIT = timedelta(hours=3)    # столько ждём ответа, потом зовём владельца
@@ -51,6 +51,20 @@ DEAL_WAIT_LIMIT = timedelta(hours=1)
 # не сразу, а через сутки после планирования, — потому и проверяется перед
 # отправкой отдельно от всех прочих.
 CONFIRM_REQUEST_EVENT = "order_confirm_request"
+
+# Письмо «заказ отменён». Сигнал к нему приходит не из базы, а из карточки
+# amoCRM: админ-бот в таблицы рабочего бота не пишет, и единственный общий
+# язык у двух роботов — поля сделки. Ровно как с галочкой «веду сам».
+CANCEL_LETTER_EVENT = "order_cancelled_no_need"
+
+AMO_STATUS_CLOSED_LOST = 143      # «Закрыто и не реализовано», общий для всех воронок
+AMO_FIELD_CLOSE_REASON = 19215    # «Причина закрытия», список
+AMO_CLOSE_REASON_NO_NEED = 8299   # «Пропала потребность» — она и есть команда
+
+# Сколько письмо об отмене имеет смысл. Сделку, закрытую с этой причиной уже
+# после дня работы, считаем бухгалтерией, а не отменой: «ваш заказ на вчера
+# отменён» клиента только запутает (допущение агента, порог за владельцем).
+CANCEL_LETTER_MAX_AGE = timedelta(days=1)
 
 # Ответ клиента владельцу показывается целиком, а не пересказом. Предел стоит
 # только против случайной простыни на сотни строк: телеграм её всё равно
@@ -361,6 +375,45 @@ def owner_handles(entity: Optional[Mapping[str, Any]]) -> bool:
     return False
 
 
+def should_notify_cancel(*, deal: Optional[Mapping[str, Any]],
+                         row: Mapping[str, Any],
+                         now: datetime) -> tuple[bool, str]:
+    """Слать ли клиенту письмо «заказ отменён». И почему, если нет.
+
+    Решение владельца 2026-09-10: причина «Пропала потребность» в закрытой
+    сделке и есть команда «сообщи клиенту» — неважно, закрыл сделку робот
+    по кнопке или сам владелец руками в амо.
+
+    Пишем только тем, с кем робот про этот заказ уже разговаривал: `row` —
+    строка ожидания `order_confirmations`, и её отсутствие означает, что
+    клиент ни «заказ принят», ни вопроса от нас не получал.
+
+    Причину сверяем по номеру варианта, а не по подписи: подпись в амо
+    переименовывается одним кликом.
+
+    Воронку здесь не проверяем намеренно. Причину ставят на той карточке,
+    которую закрывают, а это либо сделка реализации, либо — когда дочерней
+    сделки не завелось — сам лид первичной воронки. Статус 143 в амо общий.
+    """
+    if not deal or not deal.get("id"):
+        return False, "заказа больше нет в CRM"
+    if int(deal.get("status_id") or 0) != AMO_STATUS_CLOSED_LOST:
+        return False, "сделка не закрыта"
+    if AMO_CLOSE_REASON_NO_NEED not in field_enum_ids(dict(deal),
+                                                      AMO_FIELD_CLOSE_REASON):
+        return False, "закрыта не по причине «Пропала потребность»"
+    if row.get("cancel_notified_at") is not None:
+        return False, "об отмене уже сообщили"
+    if not row.get("client_id"):
+        return False, "клиента нет в базе бота"
+    order_at = row.get("order_at")
+    if order_at is None:
+        return False, "в ожидании нет даты работы"
+    if now - order_at > CANCEL_LETTER_MAX_AGE:
+        return False, "день работы уже прошёл"
+    return True, "заказ отменён — сообщаем клиенту"
+
+
 def decide_on_order(*, lead: Mapping[str, Any],
                     deal: Optional[Mapping[str, Any]]) -> tuple[str, str]:
     """Брать ли заказ в работу: `take`, `wait` или `skip`. И почему.
@@ -460,6 +513,11 @@ __all__ = [
     "AMO_STAGE_CONFIRMED",
     "AMO_STAGE_ORDER_CREATED",
     "ASK_BEFORE",
+    "CANCEL_LETTER_EVENT",
+    "CANCEL_LETTER_MAX_AGE",
+    "AMO_CLOSE_REASON_NO_NEED",
+    "AMO_FIELD_CLOSE_REASON",
+    "AMO_STATUS_CLOSED_LOST",
     "CONFIRM_REQUEST_EVENT",
     "PENDING_TTL_AFTER_ORDER",
     "SILENCE_LIMIT",
@@ -483,5 +541,6 @@ __all__ = [
     "plan_confirmation",
     "should_call_owner",
     "should_move_deal",
+    "should_notify_cancel",
     "should_report_unasked",
 ]
